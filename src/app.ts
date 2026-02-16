@@ -4,7 +4,11 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import pino from "pino";
 import pinoHttp from "pino-http";
-import { getTelegramMenu, requireTelegramSecret } from "./controllers/telegramController";
+import {
+  getTelegramMenu,
+  handleTelegramMenuWebhook,
+  requireTelegramSecret,
+} from "./controllers/telegramController";
 
 export function createApp() {
   const app = express();
@@ -41,7 +45,7 @@ export function createApp() {
   });
 
   app.get("/api/telegram/menu", requireTelegramSecret, getTelegramMenu);
-  app.post("/api/telegram/menu", requireTelegramSecret, getTelegramMenu);
+  app.post("/api/telegram/menu", requireTelegramSecret, handleTelegramMenuWebhook);
 
   return app;
 }
