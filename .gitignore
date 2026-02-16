@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local env and secrets
+.env
+.env.*
+src/config/.env
+
+# Logs and runtime files
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+pids/
+*.pid
+*.seed
+*.pid.lock
+report.*.json
+
+# Tooling caches
+.cache/
+.npm/
+.nyc_output/
+.eslintcache
+.prettier-cache
+.tmp/
+.bun-cache/
+
+# Editors and OS
+.idea/
+.vscode/
+!.vscode/extensions.json
+.DS_Store
