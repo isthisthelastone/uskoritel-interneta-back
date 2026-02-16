@@ -17,7 +17,8 @@ export function requireTelegramSecret(req: Request, res: Response, next: NextFun
     return;
   }
 
-  const providedSecret = req.header("x-telegram-secret");
+  const providedSecret =
+    req.header("x-telegram-secret") ?? req.header("x-telegram-bot-api-secret-token");
 
   if (providedSecret !== expectedSecret) {
     res.status(401).json({

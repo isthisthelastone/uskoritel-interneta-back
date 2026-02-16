@@ -41,6 +41,7 @@ export function createApp() {
   });
 
   app.get("/api/telegram/menu", requireTelegramSecret, getTelegramMenu);
+  app.post("/api/telegram/menu", requireTelegramSecret, getTelegramMenu);
 
   return app;
 }
