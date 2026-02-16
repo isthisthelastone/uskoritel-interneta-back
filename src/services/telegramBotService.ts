@@ -1,13 +1,28 @@
-interface TelegramSendMessageResult {
+import type { TelegramInlineButton } from "./telegramMenuService";
+
+interface TelegramApiResult {
   ok: boolean;
   statusCode: number;
   error?: string;
 }
 
-interface SendTelegramMenuMessageParams {
+interface SendTelegramInlineMenuMessageParams {
   chatId: number;
   text: string;
-  keyboardRows: string[][];
+  inlineKeyboardRows: TelegramInlineButton[][];
+}
+
+interface EditTelegramInlineMenuMessageParams {
+  chatId: number;
+  messageId: number;
+  text: string;
+  inlineKeyboardRows: TelegramInlineButton[][];
+}
+
+interface AnswerTelegramCallbackQueryParams {
+  callbackQueryId: string;
+  text?: string;
+  showAlert?: boolean;
 }
 
 function buildTelegramApiUrl(method: string): string | null {
@@ -20,10 +35,11 @@ function buildTelegramApiUrl(method: string): string | null {
   return "https://api.telegram.org/bot" + botToken + "/" + method;
 }
 
-export async function sendTelegramMenuMessage(
-  params: SendTelegramMenuMessageParams,
-): Promise<TelegramSendMessageResult> {
-  const endpoint = buildTelegramApiUrl("sendMessage");
+async function postTelegramApi(
+  method: string,
+  payload: Record<string, boolean | number | string | Record<string, unknown> | unknown[]>,
+): Promise<TelegramApiResult> {
+  const endpoint = buildTelegramApiUrl(method);
 
   if (endpoint === null) {
     return {
@@ -38,16 +54,7 @@ export async function sendTelegramMenuMessage(
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({
-      chat_id: params.chatId,
-      text: params.text,
-      reply_markup: {
-        keyboard: params.keyboardRows.map((row) => row.map((label) => ({ text: label }))),
-        resize_keyboard: true,
-        one_time_keyboard: false,
-        is_persistent: true,
-      },
-    }),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
@@ -62,4 +69,49 @@ export async function sendTelegramMenuMessage(
     ok: true,
     statusCode: response.status,
   };
+}
+
+export async function sendTelegramInlineMenuMessage(
+  params: SendTelegramInlineMenuMessageParams,
+): Promise<TelegramApiResult> {
+  return postTelegramApi("sendMessage", {
+    chat_id: params.chatId,
+    text: params.text,
+    reply_markup: {
+      inline_keyboard: params.inlineKeyboardRows.map((row) =>
+        row.map((button) => ({
+          text: button.text,
+          callback_data: button.callbackData,
+        })),
+      ),
+    },
+  });
+}
+
+export async function editTelegramInlineMenuMessage(
+  params: EditTelegramInlineMenuMessageParams,
+): Promise<TelegramApiResult> {
+  return postTelegramApi("editMessageText", {
+    chat_id: params.chatId,
+    message_id: params.messageId,
+    text: params.text,
+    reply_markup: {
+      inline_keyboard: params.inlineKeyboardRows.map((row) =>
+        row.map((button) => ({
+          text: button.text,
+          callback_data: button.callbackData,
+        })),
+      ),
+    },
+  });
+}
+
+export async function answerTelegramCallbackQuery(
+  params: AnswerTelegramCallbackQueryParams,
+): Promise<TelegramApiResult> {
+  return postTelegramApi("answerCallbackQuery", {
+    callback_query_id: params.callbackQueryId,
+    text: params.text ?? "",
+    show_alert: params.showAlert ?? false,
+  });
 }
