@@ -6,6 +6,10 @@ import {
   sendTelegramInlineMenuMessage,
 } from "../services/telegramBotService";
 import { buildTelegramMenu, type TelegramMenuKey } from "../services/telegramMenuService";
+import {
+  ensureTelegramUser,
+  mapTelegramUserToMenuSubscriptionStatus,
+} from "../services/telegramUserService";
 
 const telegramMenuQuerySchema = z.object({
   status: z.enum(["active", "trial", "expired", "unknown"]).optional(),
@@ -15,13 +19,23 @@ const telegramMessageSchema = z.object({
   message_id: z.number().optional(),
   chat: z.object({
     id: z.number(),
+    type: z.enum(["private", "group", "supergroup", "channel"]).optional(),
   }),
+  from: z
+    .object({
+      id: z.number(),
+      username: z.string().optional(),
+    })
+    .optional(),
   text: z.string().optional(),
 });
 
 const telegramCallbackQuerySchema = z.object({
   id: z.string(),
   data: z.string().optional(),
+  from: z.object({
+    id: z.number(),
+  }),
   message: telegramMessageSchema.optional(),
 });
 
@@ -42,21 +56,79 @@ const telegramMenuKeySchema = z.enum([
   "countries",
 ]);
 
-function getTelegramCommand(text: string | undefined): string | null {
+const suspiciousCommandPattern =
+  /\b(?:id|user_id|chat_id|admin_id|target_id|uid)\s*[:=]\s*\d+\b|tg:\/\/user\?id=|\b\d{8,}\b/iu;
+
+interface ParsedTelegramCommand {
+  command: string | null;
+  isSuspicious: boolean;
+  reason?: string;
+}
+
+function getTelegramCommand(text: string | undefined): ParsedTelegramCommand {
   if (text === undefined) {
-    return null;
+    return {
+      command: null,
+      isSuspicious: false,
+    };
   }
 
   const normalizedText = text.trim();
 
   if (!normalizedText.startsWith("/")) {
-    return null;
+    return {
+      command: null,
+      isSuspicious: false,
+    };
   }
 
-  const firstToken = normalizedText.split(/\s+/u)[0] ?? "";
-  const commandPart = firstToken.split("@")[0] ?? "";
+  if (normalizedText.length > 64 || suspiciousCommandPattern.test(normalizedText)) {
+    return {
+      command: null,
+      isSuspicious: true,
+      reason: "Potential ID injection payload detected.",
+    };
+  }
 
-  return commandPart.toLowerCase();
+  const tokens = normalizedText.split(/\s+/u).filter((token) => token.length > 0);
+  const firstToken = tokens[0] ?? "";
+  const commandMatch = /^\/([a-z_]+)(?:@([a-z0-9_]{3,}))?$/iu.exec(firstToken);
+
+  if (commandMatch === null) {
+    return {
+      command: null,
+      isSuspicious: true,
+      reason: "Malformed Telegram command.",
+    };
+  }
+
+  if (tokens.length > 1) {
+    return {
+      command: null,
+      isSuspicious: true,
+      reason: "Command arguments are blocked for security.",
+    };
+  }
+
+  const botMention = commandMatch.at(2)?.toLowerCase() ?? "";
+  const expectedBotUsername = (process.env.BOT_USERNAME ?? "").replace(/^@/u, "").toLowerCase();
+
+  if (
+    botMention.length > 0 &&
+    expectedBotUsername.length > 0 &&
+    botMention !== expectedBotUsername
+  ) {
+    return {
+      command: null,
+      isSuspicious: false,
+      reason: "Command is addressed to a different bot.",
+    };
+  }
+
+  return {
+    command: "/" + commandMatch[1].toLowerCase(),
+    isSuspicious: false,
+  };
 }
 
 function getMenuKeyFromCallbackData(data: string | undefined): TelegramMenuKey | null {
@@ -150,6 +222,23 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
   if (callbackQuery !== undefined) {
     const menuKey = getMenuKeyFromCallbackData(callbackQuery.data);
+    const callbackChatId = callbackQuery.message?.chat.id;
+    const callbackMessageId = callbackQuery.message?.message_id;
+    const callbackChatType = callbackQuery.message?.chat.type;
+
+    if (
+      callbackChatId !== undefined &&
+      callbackChatType === "private" &&
+      callbackQuery.from.id !== callbackChatId
+    ) {
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: false,
+        reason: "Callback ownership mismatch.",
+      });
+      return;
+    }
 
     const callbackAnswerResult = await answerTelegramCallbackQuery({
       callbackQueryId: callbackQuery.id,
@@ -165,7 +254,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       );
     }
 
-    if (menuKey === null || callbackQuery.message?.message_id === undefined) {
+    if (menuKey === null || callbackChatId === undefined || callbackMessageId === undefined) {
       res.status(200).json({
         ok: true,
         processed: true,
@@ -176,8 +265,8 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
     const menuPayload = buildTelegramMenu("unknown");
     const editResult = await editTelegramInlineMenuMessage({
-      chatId: callbackQuery.message.chat.id,
-      messageId: callbackQuery.message.message_id,
+      chatId: callbackChatId,
+      messageId: callbackMessageId,
       text: getMenuSectionText(menuKey),
       inlineKeyboardRows: menuPayload.inlineKeyboardRows,
     });
@@ -210,7 +299,37 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     return;
   }
 
-  const command = getTelegramCommand(message.text);
+  if (message.chat.type !== undefined && message.chat.type !== "private") {
+    res.status(200).json({
+      ok: true,
+      processed: false,
+      reason: "Only private chat commands are handled.",
+    });
+    return;
+  }
+
+  if (message.from !== undefined && message.from.id !== message.chat.id) {
+    res.status(200).json({
+      ok: true,
+      processed: false,
+      reason: "Sender/chat mismatch detected.",
+    });
+    return;
+  }
+
+  const parsedCommand = getTelegramCommand(message.text);
+
+  if (parsedCommand.isSuspicious) {
+    res.status(200).json({
+      ok: true,
+      processed: false,
+      blocked: true,
+      reason: parsedCommand.reason ?? "Blocked by security policy.",
+    });
+    return;
+  }
+
+  const command = parsedCommand.command;
 
   if (command !== "/start" && command !== "/menu") {
     res.status(200).json({
@@ -221,12 +340,43 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     return;
   }
 
-  const menuPayload = buildTelegramMenu("unknown");
+  if (message.from === undefined) {
+    res.status(200).json({
+      ok: true,
+      processed: false,
+      reason: "Telegram user context is missing.",
+    });
+    return;
+  }
+
+  let userSyncResult: Awaited<ReturnType<typeof ensureTelegramUser>>;
+
+  try {
+    userSyncResult = await ensureTelegramUser({
+      tgId: String(message.from.id),
+      tgNickname: message.from.username ?? null,
+    });
+  } catch (error) {
+    console.error("Failed to sync Telegram user:", error);
+    res.status(200).json({
+      ok: true,
+      processed: false,
+      reason: "Failed to sync user profile.",
+    });
+    return;
+  }
+
+  const menuSubscriptionStatus = mapTelegramUserToMenuSubscriptionStatus(userSyncResult.user);
+  const menuPayload = buildTelegramMenu(menuSubscriptionStatus);
   const isStartCommand = command === "/start";
 
   const telegramSendResult = await sendTelegramInlineMenuMessage({
     chatId: message.chat.id,
-    text: isStartCommand ? "Welcome to Uskoritel Interneta VPN. Use the menu below." : "Main menu:",
+    text: isStartCommand
+      ? userSyncResult.created
+        ? "Welcome to Uskoritel Interneta VPN. Your profile is created."
+        : "Welcome back to Uskoritel Interneta VPN."
+      : "Main menu:",
     inlineKeyboardRows: menuPayload.inlineKeyboardRows,
   });
 
