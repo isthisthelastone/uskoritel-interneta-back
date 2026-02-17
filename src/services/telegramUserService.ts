@@ -26,6 +26,12 @@ interface EnsureTelegramUserResult {
   created: boolean;
 }
 
+interface ActivateTelegramSubscriptionInput {
+  tgId: string;
+  tgNickname: string | null;
+  months: 1 | 3 | 6 | 12;
+}
+
 const telegramUserSelectFields = [
   "internal_uuid",
   "tg_nickname",
@@ -40,6 +46,31 @@ const telegramUserSelectFields = [
 
 function parseTelegramUserRow(rawRow: unknown): TelegramUserRecord {
   return telegramUserRowSchema.parse(rawRow);
+}
+
+function parseDateOnly(value: string): Date | null {
+  const date = new Date(value + "T00:00:00Z");
+
+  if (!Number.isFinite(date.getTime())) {
+    return null;
+  }
+
+  date.setUTCHours(0, 0, 0, 0);
+  return date;
+}
+
+function addMonths(baseDate: Date, months: number): Date {
+  const result = new Date(baseDate);
+  result.setUTCMonth(result.getUTCMonth() + months);
+  return result;
+}
+
+function formatDateOnly(date: Date): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+
+  return String(year) + "-" + month + "-" + day;
 }
 
 export async function getTelegramUserByTgId(tgId: string): Promise<TelegramUserRecord | null> {
@@ -147,4 +178,44 @@ export function mapTelegramUserToMenuSubscriptionStatus(
   }
 
   return "expired";
+}
+
+export async function activateTelegramSubscription(
+  input: ActivateTelegramSubscriptionInput,
+): Promise<TelegramUserRecord> {
+  const ensuredUser = await ensureTelegramUser({
+    tgId: input.tgId,
+    tgNickname: input.tgNickname,
+  });
+  const currentUser = ensuredUser.user;
+
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+
+  const currentUntil = currentUser.subscription_untill
+    ? parseDateOnly(currentUser.subscription_untill)
+    : null;
+
+  const baseDate =
+    currentUntil !== null && currentUntil.getTime() > today.getTime() ? currentUntil : today;
+  const newUntilDate = addMonths(baseDate, input.months);
+  const newUntil = formatDateOnly(newUntilDate);
+
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      subscription_active: true,
+      subscription_status: "live",
+      subscription_untill: newUntil,
+    })
+    .eq("tg_id", input.tgId)
+    .select(telegramUserSelectFields)
+    .single();
+
+  if (error !== null) {
+    throw new Error("Failed to activate Telegram subscription: " + error.message);
+  }
+
+  return parseTelegramUserRow(data);
 }

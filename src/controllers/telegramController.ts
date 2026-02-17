@@ -2,12 +2,17 @@ import type { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 import {
   answerTelegramCallbackQuery,
+  answerTelegramPreCheckoutQuery,
   editTelegramInlineMenuMessage,
   sendTelegramInlineMenuMessage,
+  sendTelegramStarsInvoice,
+  sendTelegramTextMessage,
 } from "../services/telegramBotService";
 import { buildTelegramMenu, type TelegramMenuKey } from "../services/telegramMenuService";
 import {
+  activateTelegramSubscription,
   ensureTelegramUser,
+  getTelegramUserByTgId,
   mapTelegramUserToMenuSubscriptionStatus,
 } from "../services/telegramUserService";
 
@@ -28,6 +33,13 @@ const telegramMessageSchema = z.object({
     })
     .optional(),
   text: z.string().optional(),
+  successful_payment: z
+    .object({
+      currency: z.string(),
+      total_amount: z.number(),
+      invoice_payload: z.string(),
+    })
+    .optional(),
 });
 
 const telegramCallbackQuerySchema = z.object({
@@ -39,11 +51,22 @@ const telegramCallbackQuerySchema = z.object({
   message: telegramMessageSchema.optional(),
 });
 
+const telegramPreCheckoutQuerySchema = z.object({
+  id: z.string(),
+  from: z.object({
+    id: z.number(),
+  }),
+  currency: z.string(),
+  total_amount: z.number(),
+  invoice_payload: z.string(),
+});
+
 const telegramUpdateSchema = z.object({
   update_id: z.number().optional(),
   message: telegramMessageSchema.optional(),
   edited_message: telegramMessageSchema.optional(),
   callback_query: telegramCallbackQuerySchema.optional(),
+  pre_checkout_query: telegramPreCheckoutQuerySchema.optional(),
 });
 
 const telegramMenuKeySchema = z.enum([
@@ -56,6 +79,19 @@ const telegramMenuKeySchema = z.enum([
   "countries",
 ]);
 
+const purchaseMethodSchema = z.enum(["tg_stars", "tbd_1", "tbd_2"]);
+const subscriptionPlanMonthsSchema = z.union([
+  z.literal(1),
+  z.literal(3),
+  z.literal(6),
+  z.literal(12),
+]);
+const invoicePayloadSchema = z.object({
+  action: z.literal("subscription"),
+  months: subscriptionPlanMonthsSchema,
+  tgId: z.string(),
+});
+
 const suspiciousCommandPattern =
   /\b(?:id|user_id|chat_id|admin_id|target_id|uid)\s*[:=]\s*\d+\b|tg:\/\/user\?id=|\b\d{8,}\b/iu;
 
@@ -64,6 +100,11 @@ interface ParsedTelegramCommand {
   isSuspicious: boolean;
   reason?: string;
 }
+
+type PurchaseAction =
+  | { kind: "open" }
+  | { kind: "method"; method: z.infer<typeof purchaseMethodSchema> }
+  | { kind: "plan"; months: z.infer<typeof subscriptionPlanMonthsSchema> };
 
 function getTelegramCommand(text: string | undefined): ParsedTelegramCommand {
   if (text === undefined) {
@@ -146,6 +187,74 @@ function getMenuKeyFromCallbackData(data: string | undefined): TelegramMenuKey |
   return parsedMenuKey.data;
 }
 
+function getPurchaseActionFromCallbackData(data: string | undefined): PurchaseAction | null {
+  if (data === undefined) {
+    return null;
+  }
+
+  if (data === "buy:open") {
+    return { kind: "open" };
+  }
+
+  if (data.startsWith("buy:method:")) {
+    const methodRaw = data.slice("buy:method:".length);
+    const parsedMethod = purchaseMethodSchema.safeParse(methodRaw);
+
+    if (!parsedMethod.success) {
+      return null;
+    }
+
+    return {
+      kind: "method",
+      method: parsedMethod.data,
+    };
+  }
+
+  if (data.startsWith("buy:plan:")) {
+    const monthsRaw = Number.parseInt(data.slice("buy:plan:".length), 10);
+    const parsedMonths = subscriptionPlanMonthsSchema.safeParse(monthsRaw);
+
+    if (!parsedMonths.success) {
+      return null;
+    }
+
+    return {
+      kind: "plan",
+      months: parsedMonths.data,
+    };
+  }
+
+  return null;
+}
+
+function buildSubscriptionInvoicePayload(
+  tgId: number,
+  months: z.infer<typeof subscriptionPlanMonthsSchema>,
+): string {
+  return JSON.stringify({
+    action: "subscription",
+    months,
+    tgId: String(tgId),
+  });
+}
+
+function parseSubscriptionInvoicePayload(
+  payload: string,
+): z.infer<typeof invoicePayloadSchema> | null {
+  try {
+    const parsedJson: unknown = JSON.parse(payload);
+    const parsedPayload = invoicePayloadSchema.safeParse(parsedJson);
+
+    if (!parsedPayload.success) {
+      return null;
+    }
+
+    return parsedPayload.data;
+  } catch {
+    return null;
+  }
+}
+
 function getMenuSectionText(menuKey: TelegramMenuKey): string {
   const menuSectionTextMap: Record<TelegramMenuKey, string> = {
     subscription_status: "Subscription status: ⚪ Unknown. We will sync your real status soon.",
@@ -158,6 +267,31 @@ function getMenuSectionText(menuKey: TelegramMenuKey): string {
   };
 
   return menuSectionTextMap[menuKey];
+}
+
+function buildSubscriptionStatusTextFromDb(
+  subscriptionStatus: "live" | "ending" | null,
+  subscriptionUntill: string | null,
+): string {
+  if (subscriptionStatus === "live") {
+    return [
+      "🟢 SUBSCRIPTION STATUS: LIVE",
+      subscriptionUntill !== null ? "Valid until: " + subscriptionUntill : null,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n");
+  }
+
+  if (subscriptionStatus === "ending") {
+    return [
+      "🟠 SUBSCRIPTION STATUS: ENDING",
+      subscriptionUntill !== null ? "Valid until: " + subscriptionUntill : null,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n");
+  }
+
+  return "🔴 SUBSCRIPTION STATUS: NOT FOUND";
 }
 
 export function requireTelegramSecret(req: Request, res: Response, next: NextFunction): void {
@@ -218,10 +352,43 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     return;
   }
 
+  const preCheckoutQuery = parsedUpdate.data.pre_checkout_query;
+
+  if (preCheckoutQuery !== undefined) {
+    const invoicePayload = parseSubscriptionInvoicePayload(preCheckoutQuery.invoice_payload);
+    const isValidPayload =
+      invoicePayload !== null &&
+      preCheckoutQuery.currency === "XTR" &&
+      preCheckoutQuery.total_amount === invoicePayload.months &&
+      invoicePayload.tgId === String(preCheckoutQuery.from.id);
+
+    const preCheckoutAnswerResult = await answerTelegramPreCheckoutQuery({
+      preCheckoutQueryId: preCheckoutQuery.id,
+      ok: isValidPayload,
+      errorMessage: "Payment validation failed. Please retry from bot menu.",
+    });
+
+    if (!preCheckoutAnswerResult.ok) {
+      console.error(
+        "Failed to answer pre-checkout query:",
+        preCheckoutAnswerResult.statusCode,
+        preCheckoutAnswerResult.error,
+      );
+    }
+
+    res.status(200).json({
+      ok: true,
+      processed: true,
+      preCheckoutValidated: isValidPayload,
+    });
+    return;
+  }
+
   const callbackQuery = parsedUpdate.data.callback_query;
 
   if (callbackQuery !== undefined) {
     const menuKey = getMenuKeyFromCallbackData(callbackQuery.data);
+    const purchaseAction = getPurchaseActionFromCallbackData(callbackQuery.data);
     const callbackChatId = callbackQuery.message?.chat.id;
     const callbackMessageId = callbackQuery.message?.message_id;
     const callbackChatType = callbackQuery.message?.chat.type;
@@ -242,7 +409,16 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
     const callbackAnswerResult = await answerTelegramCallbackQuery({
       callbackQueryId: callbackQuery.id,
-      text: menuKey === null ? "Unknown action." : "Opening section...",
+      text:
+        purchaseAction !== null
+          ? purchaseAction.kind === "plan"
+            ? "Opening payment..."
+            : "Opening section..."
+          : menuKey === null
+            ? "Unknown action."
+            : menuKey === "subscription_status"
+              ? "Fetching subscription status..."
+              : "Opening section...",
       showAlert: false,
     });
 
@@ -254,11 +430,201 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       );
     }
 
-    if (menuKey === null || callbackChatId === undefined || callbackMessageId === undefined) {
+    if (menuKey === null && purchaseAction === null) {
       res.status(200).json({
         ok: true,
         processed: true,
-        callbackHandled: menuKey !== null,
+        callbackHandled: false,
+      });
+      return;
+    }
+
+    if (callbackChatId === undefined) {
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: false,
+        reason: "Callback chat is missing.",
+      });
+      return;
+    }
+
+    if (purchaseAction !== null) {
+      if (purchaseAction.kind === "open") {
+        const paymentOptionsResult = await sendTelegramInlineMenuMessage({
+          chatId: callbackChatId,
+          text: "Choose payment method:",
+          inlineKeyboardRows: [
+            [{ text: "⭐ Telegram Stars", callbackData: "buy:method:tg_stars" }],
+            [{ text: "TBD", callbackData: "buy:method:tbd_1" }],
+            [{ text: "TBD", callbackData: "buy:method:tbd_2" }],
+          ],
+        });
+
+        if (!paymentOptionsResult.ok) {
+          console.error(
+            "Failed to send payment methods message:",
+            paymentOptionsResult.statusCode,
+            paymentOptionsResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: paymentOptionsResult.ok,
+        });
+        return;
+      }
+
+      if (purchaseAction.kind === "method") {
+        if (purchaseAction.method === "tg_stars") {
+          const planOptionsResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: "Choose Telegram Stars plan:",
+            inlineKeyboardRows: [
+              [{ text: "1 month • 1 ⭐", callbackData: "buy:plan:1" }],
+              [{ text: "3 months • 3 ⭐", callbackData: "buy:plan:3" }],
+              [{ text: "6 months • 6 ⭐", callbackData: "buy:plan:6" }],
+              [{ text: "12 months • 12 ⭐", callbackData: "buy:plan:12" }],
+            ],
+          });
+
+          if (!planOptionsResult.ok) {
+            console.error(
+              "Failed to send stars plan options:",
+              planOptionsResult.statusCode,
+              planOptionsResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: planOptionsResult.ok,
+          });
+          return;
+        }
+
+        const tbdResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "This payment method is not implemented yet.",
+        });
+
+        if (!tbdResult.ok) {
+          console.error(
+            "Failed to send TBD payment method message:",
+            tbdResult.statusCode,
+            tbdResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: tbdResult.ok,
+        });
+        return;
+      }
+
+      const invoiceResult = await sendTelegramStarsInvoice({
+        chatId: callbackChatId,
+        title: "VPN " + String(purchaseAction.months) + " month plan",
+        description:
+          "Telegram Stars payment for " +
+          String(purchaseAction.months) +
+          " month VPN subscription.",
+        payload: buildSubscriptionInvoicePayload(callbackQuery.from.id, purchaseAction.months),
+        amount: purchaseAction.months,
+      });
+
+      if (!invoiceResult.ok) {
+        console.error(
+          "Failed to send Telegram Stars invoice:",
+          invoiceResult.statusCode,
+          invoiceResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        invoiceSent: invoiceResult.ok,
+      });
+      return;
+    }
+
+    if (menuKey === "subscription_status") {
+      try {
+        const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+        const isSubscriptionMissing =
+          telegramUser === null ||
+          (telegramUser.subscription_status === null && !telegramUser.subscription_active);
+        const statusText = isSubscriptionMissing
+          ? "🔴 SUBSCRIPTION STATUS: NOT FOUND\nYou can purchase subscription below."
+          : buildSubscriptionStatusTextFromDb(
+              telegramUser.subscription_status,
+              telegramUser.subscription_untill,
+            );
+
+        const statusMessageResult = isSubscriptionMissing
+          ? await sendTelegramInlineMenuMessage({
+              chatId: callbackChatId,
+              text: statusText,
+              inlineKeyboardRows: [
+                [{ text: "🛒 Purchase subscription", callbackData: "buy:open" }],
+              ],
+            })
+          : await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: statusText,
+            });
+
+        if (!statusMessageResult.ok) {
+          console.error(
+            "Failed to send subscription status message:",
+            statusMessageResult.statusCode,
+            statusMessageResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: statusMessageResult.ok,
+        });
+        return;
+      } catch (error) {
+        console.error("Failed to fetch subscription status from DB:", error);
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: false,
+        });
+        return;
+      }
+    }
+
+    if (callbackMessageId === undefined) {
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: false,
+      });
+      return;
+    }
+
+    if (menuKey === null) {
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: false,
       });
       return;
     }
@@ -297,6 +663,118 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       reason: "No message in update.",
     });
     return;
+  }
+
+  if (message.successful_payment !== undefined) {
+    if (message.from === undefined) {
+      res.status(200).json({
+        ok: true,
+        processed: false,
+        reason: "Payment update is missing sender.",
+      });
+      return;
+    }
+
+    const paymentPayload = parseSubscriptionInvoicePayload(
+      message.successful_payment.invoice_payload,
+    );
+    if (paymentPayload === null) {
+      const invalidPaymentResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Payment received but validation failed. Please contact support.",
+      });
+
+      if (!invalidPaymentResult.ok) {
+        console.error(
+          "Failed to send invalid payment message:",
+          invalidPaymentResult.statusCode,
+          invalidPaymentResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        paymentApplied: false,
+      });
+      return;
+    }
+
+    const paymentIsValid =
+      message.successful_payment.currency === "XTR" &&
+      message.successful_payment.total_amount === paymentPayload.months &&
+      paymentPayload.tgId === String(message.from.id);
+
+    if (!paymentIsValid) {
+      const invalidPaymentResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Payment received but validation failed. Please contact support.",
+      });
+
+      if (!invalidPaymentResult.ok) {
+        console.error(
+          "Failed to send invalid payment message:",
+          invalidPaymentResult.statusCode,
+          invalidPaymentResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        paymentApplied: false,
+      });
+      return;
+    }
+
+    try {
+      const updatedUser = await activateTelegramSubscription({
+        tgId: String(message.from.id),
+        tgNickname: message.from.username ?? null,
+        months: paymentPayload.months,
+      });
+
+      const paymentSuccessResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: [
+          "✅ Payment successful via Telegram Stars.",
+          "Plan: " +
+            String(paymentPayload.months) +
+            " month" +
+            (paymentPayload.months === 1 ? "" : "s") +
+            ".",
+          "🟢 SUBSCRIPTION STATUS: LIVE",
+          updatedUser.subscription_untill
+            ? "Valid until: " + updatedUser.subscription_untill
+            : null,
+        ]
+          .filter((line): line is string => line !== null)
+          .join("\n"),
+      });
+
+      if (!paymentSuccessResult.ok) {
+        console.error(
+          "Failed to send successful payment confirmation:",
+          paymentSuccessResult.statusCode,
+          paymentSuccessResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        paymentApplied: true,
+      });
+      return;
+    } catch (error) {
+      console.error("Failed to activate subscription after payment:", error);
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        paymentApplied: false,
+      });
+      return;
+    }
   }
 
   if (message.chat.type !== undefined && message.chat.type !== "private") {

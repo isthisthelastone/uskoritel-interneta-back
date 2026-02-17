@@ -6,7 +6,16 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist", "node_modules", "coverage", "eslint.config.mjs", ".env.d.ts"],
+    ignores: [
+      "dist",
+      "node_modules",
+      "coverage",
+      ".bun-cache",
+      ".tmp",
+      "eslint.config.mjs",
+      ".env.d.ts",
+      "src/types/supabase.generated.ts",
+    ],
   },
   {
     files: ["**/*.{ts,mts,cts,d.ts}"],

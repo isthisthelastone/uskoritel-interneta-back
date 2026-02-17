@@ -12,6 +12,19 @@ interface SendTelegramInlineMenuMessageParams {
   inlineKeyboardRows: TelegramInlineButton[][];
 }
 
+interface SendTelegramTextMessageParams {
+  chatId: number;
+  text: string;
+}
+
+interface SendTelegramStarsInvoiceParams {
+  chatId: number;
+  title: string;
+  description: string;
+  payload: string;
+  amount: number;
+}
+
 interface EditTelegramInlineMenuMessageParams {
   chatId: number;
   messageId: number;
@@ -23,6 +36,12 @@ interface AnswerTelegramCallbackQueryParams {
   callbackQueryId: string;
   text?: string;
   showAlert?: boolean;
+}
+
+interface AnswerTelegramPreCheckoutQueryParams {
+  preCheckoutQueryId: string;
+  ok: boolean;
+  errorMessage?: string;
 }
 
 function buildTelegramApiUrl(method: string): string | null {
@@ -88,6 +107,35 @@ export async function sendTelegramInlineMenuMessage(
   });
 }
 
+export async function sendTelegramTextMessage(
+  params: SendTelegramTextMessageParams,
+): Promise<TelegramApiResult> {
+  return postTelegramApi("sendMessage", {
+    chat_id: params.chatId,
+    text: params.text,
+  });
+}
+
+export async function sendTelegramStarsInvoice(
+  params: SendTelegramStarsInvoiceParams,
+): Promise<TelegramApiResult> {
+  return postTelegramApi("sendInvoice", {
+    chat_id: params.chatId,
+    title: params.title,
+    description: params.description,
+    payload: params.payload,
+    provider_token: "",
+    currency: "XTR",
+    prices: [
+      {
+        label: params.title,
+        amount: params.amount,
+      },
+    ],
+    start_parameter: "vpn-subscription",
+  });
+}
+
 export async function editTelegramInlineMenuMessage(
   params: EditTelegramInlineMenuMessageParams,
 ): Promise<TelegramApiResult> {
@@ -114,4 +162,19 @@ export async function answerTelegramCallbackQuery(
     text: params.text ?? "",
     show_alert: params.showAlert ?? false,
   });
+}
+
+export async function answerTelegramPreCheckoutQuery(
+  params: AnswerTelegramPreCheckoutQueryParams,
+): Promise<TelegramApiResult> {
+  const payload: Record<string, boolean | string> = {
+    pre_checkout_query_id: params.preCheckoutQueryId,
+    ok: params.ok,
+  };
+
+  if (!params.ok) {
+    payload.error_message = params.errorMessage ?? "Payment can't be processed right now.";
+  }
+
+  return postTelegramApi("answerPreCheckoutQuery", payload);
 }

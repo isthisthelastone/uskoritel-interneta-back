@@ -29,7 +29,7 @@ export interface TelegramMenuResponse {
 
 const subscriptionStatusEmojiMap: Record<TelegramSubscriptionStatus, string> = {
   active: "🟢",
-  trial: "🟡",
+  trial: "🟠",
   expired: "🔴",
   unknown: "⚪",
 };
