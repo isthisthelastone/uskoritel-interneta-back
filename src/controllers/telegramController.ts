@@ -39,6 +39,7 @@ const telegramMenuKeySchema = z.enum([
   "referals",
   "gifts",
   "settings",
+  "countries",
 ]);
 
 function getTelegramCommand(text: string | undefined): string | null {
@@ -81,6 +82,7 @@ function getMenuSectionText(menuKey: TelegramMenuKey): string {
     referals: "Referals: invite friends and receive bonus days after successful activation.",
     gifts: "Gifts: seasonal promo codes and gift subscriptions will appear here.",
     settings: "Settings: language, notifications, and account preferences.",
+    countries: "Список стран",
   };
 
   return menuSectionTextMap[menuKey];

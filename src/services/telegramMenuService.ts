@@ -5,7 +5,8 @@ export type TelegramMenuKey =
   | "faq"
   | "referals"
   | "gifts"
-  | "settings";
+  | "settings"
+  | "countries";
 
 export interface TelegramMenuItem {
   key: TelegramMenuKey;
@@ -41,43 +42,49 @@ export function buildTelegramMenu(
   const menu: TelegramMenuItem[] = [
     {
       key: "subscription_status",
-      label: `${statusEmoji} SUBSCRIPTION STATUS`,
+      label: `${statusEmoji} Статус подписки`,
       sizeFr: 1,
       callbackData: "menu:subscription_status",
     },
     {
       key: "how_to_use",
-      label: "📘 HOW TO USE",
+      label: "📘 Как пользоваться",
       sizeFr: 0.5,
       callbackData: "menu:how_to_use",
     },
     {
       key: "faq",
-      label: "❓ FAQ",
+      label: "❓ Вопросы",
       sizeFr: 0.5,
       callbackData: "menu:faq",
     },
     {
       key: "referals",
-      label: "🤝 REFERALS",
+      label: "🤝 Рефералка",
       sizeFr: 0.5,
       callbackData: "menu:referals",
     },
     {
       key: "gifts",
-      label: "🎁 GIFTS",
+      label: "🎁 Подарки",
       sizeFr: 0.5,
       callbackData: "menu:gifts",
     },
     {
       key: "settings",
-      label: "⚙️ SETTINGS",
-      sizeFr: 1,
+      label: "⚙️ Настройки",
+      sizeFr: 0.5,
       callbackData: "menu:settings",
+    },
+    {
+      key: "countries",
+      label: "Список стран 🇭🇷 🇷🇸🇨🇿",
+      sizeFr: 0.5,
+      callbackData: "menu:countries",
     },
   ];
 
-  const keyboardRows = [[menu[0]], [menu[1], menu[2]], [menu[3], menu[4]], [menu[5]]];
+  const keyboardRows = [[menu[0]], [menu[1], menu[2]], [menu[3], menu[4]], [menu[5], menu[6]]];
 
   return {
     subscriptionStatus,
