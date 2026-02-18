@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import { syncVpsCurrentConnections } from "../services/vpsConnectionsSyncService";
 import { runVpsSshCommand } from "../services/vpsSshService";
 
 export function requireAdminSecret(req: Request, res: Response, next: NextFunction): void {
@@ -44,6 +45,25 @@ export async function testVpsSshConnection(_req: Request, res: Response): Promis
     res.status(500).json({
       ok: false,
       message: "VPS SSH connection failed.",
+      error: message,
+    });
+  }
+}
+
+export async function syncVpsConnectionsNow(_req: Request, res: Response): Promise<void> {
+  try {
+    const result = await syncVpsCurrentConnections();
+
+    res.status(200).json({
+      ok: true,
+      data: result,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown sync error.";
+
+    res.status(500).json({
+      ok: false,
+      message: "VPS connections sync failed.",
       error: message,
     });
   }

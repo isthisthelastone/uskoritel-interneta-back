@@ -9,7 +9,11 @@ import {
   handleTelegramMenuWebhook,
   requireTelegramSecret,
 } from "./controllers/telegramController";
-import { requireAdminSecret, testVpsSshConnection } from "./controllers/vpsController";
+import {
+  requireAdminSecret,
+  syncVpsConnectionsNow,
+  testVpsSshConnection,
+} from "./controllers/vpsController";
 
 export function createApp() {
   const app = express();
@@ -48,6 +52,7 @@ export function createApp() {
   app.get("/api/telegram/menu", requireTelegramSecret, getTelegramMenu);
   app.post("/api/telegram/menu", requireTelegramSecret, handleTelegramMenuWebhook);
   app.get("/api/vps/ssh/test", requireAdminSecret, testVpsSshConnection);
+  app.post("/api/vps/connections/sync", requireAdminSecret, syncVpsConnectionsNow);
 
   return app;
 }
