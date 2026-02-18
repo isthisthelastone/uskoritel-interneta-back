@@ -59,11 +59,13 @@ export type Database = {
           created_at: string;
           domain: string;
           internal_uuid: string;
+          nickname: string | null;
           number_of_connections: number;
           optional_passsword: string | null;
           password: string;
           ssh_key: string;
           updated_at: string;
+          users_kv_map: Json;
         };
         Insert: {
           api_address: string;
@@ -73,11 +75,13 @@ export type Database = {
           created_at?: string;
           domain: string;
           internal_uuid?: string;
+          nickname?: string | null;
           number_of_connections?: number;
           optional_passsword?: string | null;
           password: string;
           ssh_key: string;
           updated_at?: string;
+          users_kv_map?: Json;
         };
         Update: {
           api_address?: string;
@@ -87,11 +91,13 @@ export type Database = {
           created_at?: string;
           domain?: string;
           internal_uuid?: string;
+          nickname?: string | null;
           number_of_connections?: number;
           optional_passsword?: string | null;
           password?: string;
           ssh_key?: string;
           updated_at?: string;
+          users_kv_map?: Json;
         };
         Relationships: [];
       };

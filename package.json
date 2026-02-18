@@ -8,6 +8,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier . --check",
     "format:fix": "prettier . --write",
+    "supabase:types": "set -a && . ./src/config/.env && set +a && bunx supabase gen types typescript --project-id \"$SUPABASE_PROJECT_ID\" --schema public > ./src/types/supabase.generated.ts",
     "fix": "bun run typecheck && bun run lint:fix && bun run format:fix"
   },
   "devDependencies": {

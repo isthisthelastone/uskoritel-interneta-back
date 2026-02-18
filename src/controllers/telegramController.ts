@@ -15,6 +15,11 @@ import {
   getTelegramUserByTgId,
   mapTelegramUserToMenuSubscriptionStatus,
 } from "../services/telegramUserService";
+import {
+  getVpsConfigByInternalUuid,
+  listUniqueVpsCountries,
+  listVpsByCountry,
+} from "../services/vpsCatalogService";
 
 const telegramMenuQuerySchema = z.object({
   status: z.enum(["active", "trial", "expired", "unknown"]).optional(),
@@ -105,6 +110,20 @@ type PurchaseAction =
   | { kind: "open" }
   | { kind: "method"; method: z.infer<typeof purchaseMethodSchema> }
   | { kind: "plan"; months: z.infer<typeof subscriptionPlanMonthsSchema> };
+
+type CountriesAction = { kind: "country"; country: string } | { kind: "vps"; internalUuid: string };
+
+function encodeCallbackValue(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
+}
+
+function decodeCallbackValue(value: string): string | null {
+  try {
+    return Buffer.from(value, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+}
 
 function getTelegramCommand(text: string | undefined): ParsedTelegramCommand {
   if (text === undefined) {
@@ -221,6 +240,42 @@ function getPurchaseActionFromCallbackData(data: string | undefined): PurchaseAc
     return {
       kind: "plan",
       months: parsedMonths.data,
+    };
+  }
+
+  return null;
+}
+
+function getCountriesActionFromCallbackData(data: string | undefined): CountriesAction | null {
+  if (data === undefined) {
+    return null;
+  }
+
+  if (data.startsWith("countries:country:")) {
+    const encodedCountry = data.slice("countries:country:".length);
+    const decodedCountry = decodeCallbackValue(encodedCountry)?.trim();
+
+    if (decodedCountry === undefined || decodedCountry.length === 0 || decodedCountry.length > 64) {
+      return null;
+    }
+
+    return {
+      kind: "country",
+      country: decodedCountry,
+    };
+  }
+
+  if (data.startsWith("countries:vps:")) {
+    const internalUuidRaw = data.slice("countries:vps:".length);
+    const parsedUuid = z.uuid().safeParse(internalUuidRaw);
+
+    if (!parsedUuid.success) {
+      return null;
+    }
+
+    return {
+      kind: "vps",
+      internalUuid: parsedUuid.data,
     };
   }
 
@@ -389,6 +444,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   if (callbackQuery !== undefined) {
     const menuKey = getMenuKeyFromCallbackData(callbackQuery.data);
     const purchaseAction = getPurchaseActionFromCallbackData(callbackQuery.data);
+    const countriesAction = getCountriesActionFromCallbackData(callbackQuery.data);
     const callbackChatId = callbackQuery.message?.chat.id;
     const callbackMessageId = callbackQuery.message?.message_id;
     const callbackChatType = callbackQuery.message?.chat.type;
@@ -414,11 +470,17 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           ? purchaseAction.kind === "plan"
             ? "Opening payment..."
             : "Opening section..."
-          : menuKey === null
-            ? "Unknown action."
-            : menuKey === "subscription_status"
-              ? "Fetching subscription status..."
-              : "Opening section...",
+          : countriesAction !== null
+            ? countriesAction.kind === "country"
+              ? "Loading VPS list..."
+              : "Sending configs..."
+            : menuKey === null
+              ? "Unknown action."
+              : menuKey === "subscription_status"
+                ? "Fetching subscription status..."
+                : menuKey === "countries"
+                  ? "Loading countries..."
+                  : "Opening section...",
       showAlert: false,
     });
 
@@ -430,7 +492,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       );
     }
 
-    if (menuKey === null && purchaseAction === null) {
+    if (menuKey === null && purchaseAction === null && countriesAction === null) {
       res.status(200).json({
         ok: true,
         processed: true,
@@ -556,6 +618,150 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         invoiceSent: invoiceResult.ok,
       });
       return;
+    }
+
+    if (menuKey === "countries") {
+      try {
+        const countries = await listUniqueVpsCountries();
+
+        const countriesResult =
+          countries.length === 0
+            ? await sendTelegramTextMessage({
+                chatId: callbackChatId,
+                text: "Список стран пока пуст.",
+              })
+            : await sendTelegramInlineMenuMessage({
+                chatId: callbackChatId,
+                text: "Список стран:",
+                inlineKeyboardRows: countries.map((countryOption) => [
+                  {
+                    text: countryOption.country + " " + countryOption.countryEmoji,
+                    callbackData: "countries:country:" + encodeCallbackValue(countryOption.country),
+                  },
+                ]),
+              });
+
+        if (!countriesResult.ok) {
+          console.error(
+            "Failed to send countries list message:",
+            countriesResult.statusCode,
+            countriesResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: countriesResult.ok,
+        });
+        return;
+      } catch (error) {
+        console.error("Failed to fetch countries list from DB:", error);
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: false,
+        });
+        return;
+      }
+    }
+
+    if (countriesAction !== null) {
+      if (countriesAction.kind === "country") {
+        try {
+          const vpsList = await listVpsByCountry(countriesAction.country);
+
+          const vpsListResult =
+            vpsList.length === 0
+              ? await sendTelegramTextMessage({
+                  chatId: callbackChatId,
+                  text: "Для страны " + countriesAction.country + " серверы пока не добавлены.",
+                })
+              : await sendTelegramInlineMenuMessage({
+                  chatId: callbackChatId,
+                  text: "Серверы в " + countriesAction.country + ":",
+                  inlineKeyboardRows: vpsList.map((vpsItem) => [
+                    {
+                      text:
+                        vpsItem.nickname ?? "VPS " + vpsItem.internalUuid.slice(0, 8).toUpperCase(),
+                      callbackData: "countries:vps:" + vpsItem.internalUuid,
+                    },
+                  ]),
+                });
+
+          if (!vpsListResult.ok) {
+            console.error(
+              "Failed to send VPS list for country:",
+              vpsListResult.statusCode,
+              vpsListResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: vpsListResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to fetch VPS by country:", error);
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: false,
+          });
+          return;
+        }
+      }
+
+      try {
+        const vpsConfig = await getVpsConfigByInternalUuid(countriesAction.internalUuid);
+
+        const configResult =
+          vpsConfig === null
+            ? await sendTelegramTextMessage({
+                chatId: callbackChatId,
+                text: "Конфигурация сервера не найдена.",
+              })
+            : vpsConfig.configList.length === 0
+              ? await sendTelegramTextMessage({
+                  chatId: callbackChatId,
+                  text: "Для этого сервера пока нет конфигов.",
+                })
+              : await sendTelegramTextMessage({
+                  chatId: callbackChatId,
+                  text: vpsConfig.configList.join("\n\n"),
+                });
+
+        if (!configResult.ok) {
+          console.error(
+            "Failed to send VPS config list:",
+            configResult.statusCode,
+            configResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: configResult.ok,
+        });
+        return;
+      } catch (error) {
+        console.error("Failed to fetch VPS config list:", error);
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: false,
+        });
+        return;
+      }
     }
 
     if (menuKey === "subscription_status") {
