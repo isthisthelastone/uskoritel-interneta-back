@@ -349,6 +349,25 @@ function buildSubscriptionStatusTextFromDb(
   return "🔴 SUBSCRIPTION STATUS: NOT FOUND";
 }
 
+function hasAccessToServers(
+  subscriptionStatus: "live" | "ending" | null,
+  subscriptionActive: boolean,
+): boolean {
+  return subscriptionActive || subscriptionStatus === "live" || subscriptionStatus === "ending";
+}
+
+async function sendSubscriptionRequiredForServersMessage(chatId: number) {
+  return sendTelegramInlineMenuMessage({
+    chatId,
+    text: "ЧТОБЫ ПОСМОТРЕТЬ СЕРВЕРА НУЖНО КУПИТЬ ПОДПИСКУ, ВОТ КАК ЭТО МОЖНО СДЕЛАТЬ:",
+    inlineKeyboardRows: [
+      [{ text: "⭐ Telegram Stars", callbackData: "buy:method:tg_stars" }],
+      [{ text: "TBD", callbackData: "buy:method:tbd_1" }],
+      [{ text: "TBD", callbackData: "buy:method:tbd_2" }],
+    ],
+  });
+}
+
 export function requireTelegramSecret(req: Request, res: Response, next: NextFunction): void {
   const expectedSecret = process.env.TG_SECRET;
 
@@ -622,6 +641,32 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
     if (menuKey === "countries") {
       try {
+        const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+        const hasServersAccess =
+          telegramUser !== null &&
+          hasAccessToServers(telegramUser.subscription_status, telegramUser.subscription_active);
+
+        if (!hasServersAccess) {
+          const purchaseOptionsResult =
+            await sendSubscriptionRequiredForServersMessage(callbackChatId);
+
+          if (!purchaseOptionsResult.ok) {
+            console.error(
+              "Failed to send subscription required message for countries:",
+              purchaseOptionsResult.statusCode,
+              purchaseOptionsResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: purchaseOptionsResult.ok,
+          });
+          return;
+        }
+
         const countries = await listUniqueVpsCountries();
 
         const countriesResult =
@@ -669,6 +714,32 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     if (countriesAction !== null) {
+      const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+      const hasServersAccess =
+        telegramUser !== null &&
+        hasAccessToServers(telegramUser.subscription_status, telegramUser.subscription_active);
+
+      if (!hasServersAccess) {
+        const purchaseOptionsResult =
+          await sendSubscriptionRequiredForServersMessage(callbackChatId);
+
+        if (!purchaseOptionsResult.ok) {
+          console.error(
+            "Failed to send subscription required message for countries action:",
+            purchaseOptionsResult.statusCode,
+            purchaseOptionsResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: purchaseOptionsResult.ok,
+        });
+        return;
+      }
+
       if (countriesAction.kind === "country") {
         try {
           const vpsList = await listVpsByCountry(countriesAction.country);
@@ -734,7 +805,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                 })
               : await sendTelegramTextMessage({
                   chatId: callbackChatId,
-                  text: vpsConfig.configList.join("\n\n"),
+                  text: ["Ссылки для приложения:", vpsConfig.configList.join("\n\n")].join("\n\n"),
                 });
 
         if (!configResult.ok) {
