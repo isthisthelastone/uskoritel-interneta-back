@@ -712,6 +712,59 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     if (howToAction !== null) {
+      if (howToAction.platform === "ios") {
+        const iosGuideCaption = [
+          "Скачай приложение для айфона по ссылке:",
+          "https://apps.apple.com/ge/app/fair-vpn/id1533873488",
+          "",
+          "И подключись по инструкции с картинки.",
+          "Или воспользуйся запасным приложением:",
+          "https://apps.apple.com/ge/app/v2raytun/id6476628951",
+        ].join("\n");
+        const iosGuideImageUrl = "https://ibb.co/LXrq7Z0w";
+        const iosGuideResult = await sendTelegramPhotoMessage({
+          chatId: callbackChatId,
+          photoUrl: iosGuideImageUrl,
+          caption: iosGuideCaption,
+        });
+
+        if (!iosGuideResult.ok) {
+          console.error(
+            "Failed to send ios how-to image:",
+            iosGuideResult.statusCode,
+            iosGuideResult.error,
+          );
+          const iosGuideFallbackResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: [iosGuideImageUrl, "", iosGuideCaption].join("\n"),
+          });
+
+          if (!iosGuideFallbackResult.ok) {
+            console.error(
+              "Failed to send ios how-to fallback message:",
+              iosGuideFallbackResult.statusCode,
+              iosGuideFallbackResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: iosGuideFallbackResult.ok,
+          });
+          return;
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: true,
+        });
+        return;
+      }
+
       if (howToAction.platform === "android") {
         const androidGuideCaption = [
           "Скачай приложение для андроида по ссылке:",
