@@ -112,6 +112,8 @@ type PurchaseAction =
   | { kind: "plan"; months: z.infer<typeof subscriptionPlanMonthsSchema> };
 
 type CountriesAction = { kind: "country"; country: string } | { kind: "vps"; internalUuid: string };
+const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
+type HowToAction = { platform: z.infer<typeof howToPlatformSchema> };
 
 function encodeCallbackValue(value: string): string {
   return Buffer.from(value, "utf8").toString("base64url");
@@ -282,6 +284,23 @@ function getCountriesActionFromCallbackData(data: string | undefined): Countries
   return null;
 }
 
+function getHowToActionFromCallbackData(data: string | undefined): HowToAction | null {
+  if (data === undefined || !data.startsWith("howto:")) {
+    return null;
+  }
+
+  const rawPlatform = data.slice("howto:".length);
+  const parsedPlatform = howToPlatformSchema.safeParse(rawPlatform);
+
+  if (!parsedPlatform.success) {
+    return null;
+  }
+
+  return {
+    platform: parsedPlatform.data,
+  };
+}
+
 function buildSubscriptionInvoicePayload(
   tgId: number,
   months: z.infer<typeof subscriptionPlanMonthsSchema>,
@@ -366,6 +385,18 @@ async function sendSubscriptionRequiredForServersMessage(chatId: number) {
       [{ text: "TBD", callbackData: "buy:method:tbd_2" }],
     ],
   });
+}
+
+function getHowToPlatformLabel(platform: z.infer<typeof howToPlatformSchema>): string {
+  const labels: Record<z.infer<typeof howToPlatformSchema>, string> = {
+    ios: "🍎 iOS",
+    android: "🤖 Android",
+    macos: "💻 macOS",
+    windows: "🪟 Windows",
+    android_tv: "📺 Android TV",
+  };
+
+  return labels[platform];
 }
 
 export function requireTelegramSecret(req: Request, res: Response, next: NextFunction): void {
@@ -464,6 +495,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const menuKey = getMenuKeyFromCallbackData(callbackQuery.data);
     const purchaseAction = getPurchaseActionFromCallbackData(callbackQuery.data);
     const countriesAction = getCountriesActionFromCallbackData(callbackQuery.data);
+    const howToAction = getHowToActionFromCallbackData(callbackQuery.data);
     const callbackChatId = callbackQuery.message?.chat.id;
     const callbackMessageId = callbackQuery.message?.message_id;
     const callbackChatType = callbackQuery.message?.chat.type;
@@ -493,13 +525,17 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             ? countriesAction.kind === "country"
               ? "Loading VPS list..."
               : "Sending configs..."
-            : menuKey === null
-              ? "Unknown action."
-              : menuKey === "subscription_status"
-                ? "Fetching subscription status..."
-                : menuKey === "countries"
-                  ? "Loading countries..."
-                  : "Opening section...",
+            : howToAction !== null
+              ? "Opening guide..."
+              : menuKey === null
+                ? "Unknown action."
+                : menuKey === "subscription_status"
+                  ? "Fetching subscription status..."
+                  : menuKey === "countries"
+                    ? "Loading countries..."
+                    : menuKey === "how_to_use"
+                      ? "Opening platforms..."
+                      : "Opening section...",
       showAlert: false,
     });
 
@@ -511,7 +547,12 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       );
     }
 
-    if (menuKey === null && purchaseAction === null && countriesAction === null) {
+    if (
+      menuKey === null &&
+      purchaseAction === null &&
+      countriesAction === null &&
+      howToAction === null
+    ) {
       res.status(200).json({
         ok: true,
         processed: true,
@@ -635,6 +676,62 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         processed: true,
         callbackHandled: true,
         invoiceSent: invoiceResult.ok,
+      });
+      return;
+    }
+
+    if (menuKey === "how_to_use") {
+      const howToMenuResult = await sendTelegramInlineMenuMessage({
+        chatId: callbackChatId,
+        text: "Выберите устройство:",
+        inlineKeyboardRows: [
+          [{ text: "🍎 iOS", callbackData: "howto:ios" }],
+          [{ text: "🤖 Android", callbackData: "howto:android" }],
+          [{ text: "💻 macOS", callbackData: "howto:macos" }],
+          [{ text: "🪟 Windows", callbackData: "howto:windows" }],
+          [{ text: "📺 Android TV", callbackData: "howto:android_tv" }],
+        ],
+      });
+
+      if (!howToMenuResult.ok) {
+        console.error(
+          "Failed to send how-to platform buttons:",
+          howToMenuResult.statusCode,
+          howToMenuResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: howToMenuResult.ok,
+      });
+      return;
+    }
+
+    if (howToAction !== null) {
+      const guideResult = await sendTelegramTextMessage({
+        chatId: callbackChatId,
+        text:
+          "Инструкция для " +
+          getHowToPlatformLabel(howToAction.platform) +
+          " скоро будет доступна.",
+      });
+
+      if (!guideResult.ok) {
+        console.error(
+          "Failed to send how-to platform message:",
+          guideResult.statusCode,
+          guideResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: guideResult.ok,
       });
       return;
     }
