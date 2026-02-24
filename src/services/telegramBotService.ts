@@ -17,6 +17,12 @@ interface SendTelegramTextMessageParams {
   text: string;
 }
 
+interface SendTelegramPhotoMessageParams {
+  chatId: number;
+  photoUrl: string;
+  caption?: string;
+}
+
 interface SendTelegramStarsInvoiceParams {
   chatId: number;
   title: string;
@@ -113,6 +119,16 @@ export async function sendTelegramTextMessage(
   return postTelegramApi("sendMessage", {
     chat_id: params.chatId,
     text: params.text,
+  });
+}
+
+export async function sendTelegramPhotoMessage(
+  params: SendTelegramPhotoMessageParams,
+): Promise<TelegramApiResult> {
+  return postTelegramApi("sendPhoto", {
+    chat_id: params.chatId,
+    photo: params.photoUrl,
+    caption: params.caption ?? "",
   });
 }
 

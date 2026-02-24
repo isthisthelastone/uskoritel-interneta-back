@@ -5,6 +5,7 @@ import {
   answerTelegramPreCheckoutQuery,
   editTelegramInlineMenuMessage,
   sendTelegramInlineMenuMessage,
+  sendTelegramPhotoMessage,
   sendTelegramStarsInvoice,
   sendTelegramTextMessage,
 } from "../services/telegramBotService";
@@ -711,6 +712,61 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     if (howToAction !== null) {
+      if (howToAction.platform === "android") {
+        const androidGuideCaption = [
+          "Скачай приложение для андроида по ссылке:",
+          "https://play.google.com/store/apps/details?id=com.v2raytun.android",
+          "",
+          "Если у тебя нет PlayMarket - скачай приложение здесь:",
+          "https://apkpure.com/ru/v2raytun/com.v2raytun.android",
+          "",
+          "Скопируй свою ссылку на VPN",
+          "И подключись по инструкции с картинки",
+        ].join("\n");
+        const androidGuideImageUrl = "https://ibb.co/TDF1rD6F";
+        const androidGuideResult = await sendTelegramPhotoMessage({
+          chatId: callbackChatId,
+          photoUrl: androidGuideImageUrl,
+          caption: androidGuideCaption,
+        });
+
+        if (!androidGuideResult.ok) {
+          console.error(
+            "Failed to send android how-to image:",
+            androidGuideResult.statusCode,
+            androidGuideResult.error,
+          );
+          const androidGuideFallbackResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: [androidGuideImageUrl, "", androidGuideCaption].join("\n"),
+          });
+
+          if (!androidGuideFallbackResult.ok) {
+            console.error(
+              "Failed to send android how-to fallback message:",
+              androidGuideFallbackResult.statusCode,
+              androidGuideFallbackResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: androidGuideFallbackResult.ok,
+          });
+          return;
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: true,
+        });
+        return;
+      }
+
       const guideResult = await sendTelegramTextMessage({
         chatId: callbackChatId,
         text:
