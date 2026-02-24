@@ -388,18 +388,6 @@ async function sendSubscriptionRequiredForServersMessage(chatId: number) {
   });
 }
 
-function getHowToPlatformLabel(platform: z.infer<typeof howToPlatformSchema>): string {
-  const labels: Record<z.infer<typeof howToPlatformSchema>, string> = {
-    ios: "🍎 iOS",
-    android: "🤖 Android",
-    macos: "💻 macOS",
-    windows: "🪟 Windows",
-    android_tv: "📺 Android TV",
-  };
-
-  return labels[platform];
-}
-
 export function requireTelegramSecret(req: Request, res: Response, next: NextFunction): void {
   const expectedSecret = process.env.TG_SECRET;
 
@@ -875,82 +863,135 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
-      if (howToAction.platform === "android") {
-        const androidGuideCaption = [
-          "Скачай приложение для андроида по ссылке:",
-          "https://play.google.com/store/apps/details?id=com.v2raytun.android",
-          "",
-          "Если у тебя нет PlayMarket - скачай приложение здесь:",
-          "https://apkpure.com/ru/v2raytun/com.v2raytun.android",
-          "",
-          "Скопируй свою ссылку на VPN",
-          "И подключись по инструкции с картинки",
-        ].join("\n");
-        const androidGuideImageUrl = "https://ibb.co/TDF1rD6F";
-        const androidGuideResult = await sendTelegramPhotoMessage({
-          chatId: callbackChatId,
-          photoUrl: androidGuideImageUrl,
-          caption: androidGuideCaption,
-        });
+      if (howToAction.platform === "android_tv") {
+        const androidTvSteps = [
+          {
+            imageUrl: "https://ibb.co/8ndc1NBL",
+            text: "Качаем приложение v2RayTun на телевизор",
+          },
+          {
+            imageUrl: "https://ibb.co/27HGxF5B",
+            text: "Устанавливаем v2RayTun",
+          },
+          {
+            imageUrl: "https://ibb.co/v43g1zGW",
+            text: "Открываем приложение v2RayTun после установки",
+          },
+          {
+            imageUrl: "https://ibb.co/qLRpJ50w",
+            text: 'В приложении v2RayTun нажимаем на "Управление"',
+          },
+          {
+            imageUrl: "https://ibb.co/cKHBCzxJ",
+            text: "Выбираем ручной ввод",
+          },
+          {
+            imageUrl: "https://ibb.co/KpnwQSMc",
+            text: [
+              "Открываем приложение Google TV на телефоне и подключаемся к телевизору.",
+              "",
+              "(скачать из App Store / Google если его нет - с его помощью вы легко сможете вставить текст на телевизор с телефона и использовать свой телефон как пульт)",
+            ].join("\n"),
+          },
+          {
+            imageUrl: "https://ibb.co/ybVfbZ3",
+            text: "Вставляем конфигурацию на телефоне и жмём ок",
+          },
+        ];
 
-        if (!androidGuideResult.ok) {
-          console.error(
-            "Failed to send android how-to image:",
-            androidGuideResult.statusCode,
-            androidGuideResult.error,
-          );
-          const androidGuideFallbackResult = await sendTelegramTextMessage({
+        let allStepsSent = true;
+
+        for (const step of androidTvSteps) {
+          const stepPhotoResult = await sendTelegramPhotoMessage({
             chatId: callbackChatId,
-            text: [androidGuideImageUrl, "", androidGuideCaption].join("\n"),
+            photoUrl: step.imageUrl,
+            caption: step.text,
           });
 
-          if (!androidGuideFallbackResult.ok) {
-            console.error(
-              "Failed to send android how-to fallback message:",
-              androidGuideFallbackResult.statusCode,
-              androidGuideFallbackResult.error,
-            );
+          if (stepPhotoResult.ok) {
+            continue;
           }
 
-          res.status(200).json({
-            ok: true,
-            processed: true,
-            callbackHandled: true,
-            sent: androidGuideFallbackResult.ok,
+          console.error(
+            "Failed to send android tv step image:",
+            stepPhotoResult.statusCode,
+            stepPhotoResult.error,
+          );
+
+          const stepFallbackResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: [step.imageUrl, "", step.text].join("\n"),
           });
-          return;
+
+          if (!stepFallbackResult.ok) {
+            console.error(
+              "Failed to send android tv step fallback message:",
+              stepFallbackResult.statusCode,
+              stepFallbackResult.error,
+            );
+            allStepsSent = false;
+          }
         }
 
         res.status(200).json({
           ok: true,
           processed: true,
           callbackHandled: true,
-          sent: true,
+          sent: allStepsSent,
         });
         return;
       }
 
-      const guideResult = await sendTelegramTextMessage({
+      const androidGuideCaption = [
+        "Скачай приложение для андроида по ссылке:",
+        "https://play.google.com/store/apps/details?id=com.v2raytun.android",
+        "",
+        "Если у тебя нет PlayMarket - скачай приложение здесь:",
+        "https://apkpure.com/ru/v2raytun/com.v2raytun.android",
+        "",
+        "Скопируй свою ссылку на VPN",
+        "И подключись по инструкции с картинки",
+      ].join("\n");
+      const androidGuideImageUrl = "https://ibb.co/TDF1rD6F";
+      const androidGuideResult = await sendTelegramPhotoMessage({
         chatId: callbackChatId,
-        text:
-          "Инструкция для " +
-          getHowToPlatformLabel(howToAction.platform) +
-          " скоро будет доступна.",
+        photoUrl: androidGuideImageUrl,
+        caption: androidGuideCaption,
       });
 
-      if (!guideResult.ok) {
+      if (!androidGuideResult.ok) {
         console.error(
-          "Failed to send how-to platform message:",
-          guideResult.statusCode,
-          guideResult.error,
+          "Failed to send android how-to image:",
+          androidGuideResult.statusCode,
+          androidGuideResult.error,
         );
+        const androidGuideFallbackResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: [androidGuideImageUrl, "", androidGuideCaption].join("\n"),
+        });
+
+        if (!androidGuideFallbackResult.ok) {
+          console.error(
+            "Failed to send android how-to fallback message:",
+            androidGuideFallbackResult.statusCode,
+            androidGuideFallbackResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: androidGuideFallbackResult.ok,
+        });
+        return;
       }
 
       res.status(200).json({
         ok: true,
         processed: true,
         callbackHandled: true,
-        sent: guideResult.ok,
+        sent: true,
       });
       return;
     }
