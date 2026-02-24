@@ -765,6 +765,59 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
+      if (howToAction.platform === "windows") {
+        const windowsGuideCaption = [
+          "Для установки VPN windows приложения откройте ссылку:",
+          "https://github.com/2dust/v2rayN/releases/latest",
+          "",
+          "1) Далее пролистайте вниз страницы и выберите версию программы “v2rayN-windows-64-SelfContained.zip”",
+          "2) нажмите вверхнем левом углу программы “Servers” и “Import Share Links from clipboard (Ctrl +V)”",
+          "3) осталось только включить VPN нажав кнопку “Enable Tun”",
+        ].join("\n");
+        const windowsGuideImageUrl = "https://ibb.co/TxDvSjvw";
+        const windowsGuideResult = await sendTelegramPhotoMessage({
+          chatId: callbackChatId,
+          photoUrl: windowsGuideImageUrl,
+          caption: windowsGuideCaption,
+        });
+
+        if (!windowsGuideResult.ok) {
+          console.error(
+            "Failed to send windows how-to image:",
+            windowsGuideResult.statusCode,
+            windowsGuideResult.error,
+          );
+          const windowsGuideFallbackResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: [windowsGuideImageUrl, "", windowsGuideCaption].join("\n"),
+          });
+
+          if (!windowsGuideFallbackResult.ok) {
+            console.error(
+              "Failed to send windows how-to fallback message:",
+              windowsGuideFallbackResult.statusCode,
+              windowsGuideFallbackResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: windowsGuideFallbackResult.ok,
+          });
+          return;
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: true,
+        });
+        return;
+      }
+
       if (howToAction.platform === "android") {
         const androidGuideCaption = [
           "Скачай приложение для андроида по ссылке:",
