@@ -818,6 +818,63 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
+      if (howToAction.platform === "macos") {
+        const macosGuideCaption = [
+          "1. Скачайте v2RayTun из AppStore:",
+          "https://apps.apple.com/ge/app/v2raytun/id6476628951",
+          "или запасное приложение:",
+          "https://apps.apple.com/ge/app/fair-vpn/id1533873488",
+          "",
+          "2. Откройте приложение v2RayTun и нажмите + в правом верхнем углу.",
+          "",
+          "3. Выберите опцию Import from clipboard (Импорт из буфера обмена).",
+          "",
+          "4. Для подключения нажмите кнопку питания и разрешите добавить конфигурацию VPN в настройках устройства.",
+        ].join("\n");
+        const macosGuideImageUrl = "https://ibb.co/67qgyc9L";
+        const macosGuideResult = await sendTelegramPhotoMessage({
+          chatId: callbackChatId,
+          photoUrl: macosGuideImageUrl,
+          caption: macosGuideCaption,
+        });
+
+        if (!macosGuideResult.ok) {
+          console.error(
+            "Failed to send macos how-to image:",
+            macosGuideResult.statusCode,
+            macosGuideResult.error,
+          );
+          const macosGuideFallbackResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: [macosGuideImageUrl, "", macosGuideCaption].join("\n"),
+          });
+
+          if (!macosGuideFallbackResult.ok) {
+            console.error(
+              "Failed to send macos how-to fallback message:",
+              macosGuideFallbackResult.statusCode,
+              macosGuideFallbackResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: macosGuideFallbackResult.ok,
+          });
+          return;
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: true,
+        });
+        return;
+      }
+
       if (howToAction.platform === "android") {
         const androidGuideCaption = [
           "Скачай приложение для андроида по ссылке:",
