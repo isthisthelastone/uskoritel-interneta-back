@@ -65,6 +65,20 @@ interface ClearTrackedTelegramChatHistoryResult {
 const trackedMessageIdsByChat = new Map<number, number[]>();
 const maxTrackedMessagesPerChat = 500;
 
+function buildTelegramInlineButtonPayload(button: TelegramInlineButton): Record<string, string> {
+  if (button.url !== undefined && button.url.length > 0) {
+    return {
+      text: button.text,
+      url: button.url,
+    };
+  }
+
+  return {
+    text: button.text,
+    callback_data: button.callbackData ?? "noop",
+  };
+}
+
 function trackMessageId(chatId: number, messageId: number): void {
   const trackedIds = trackedMessageIdsByChat.get(chatId) ?? [];
 
@@ -214,10 +228,7 @@ export async function sendTelegramInlineMenuMessage(
     text: params.text,
     reply_markup: {
       inline_keyboard: params.inlineKeyboardRows.map((row) =>
-        row.map((button) => ({
-          text: button.text,
-          callback_data: button.callbackData,
-        })),
+        row.map((button) => buildTelegramInlineButtonPayload(button)),
       ),
     },
   });
@@ -295,10 +306,7 @@ export async function editTelegramInlineMenuMessage(
     text: params.text,
     reply_markup: {
       inline_keyboard: params.inlineKeyboardRows.map((row) =>
-        row.map((button) => ({
-          text: button.text,
-          callback_data: button.callbackData,
-        })),
+        row.map((button) => buildTelegramInlineButtonPayload(button)),
       ),
     },
   });

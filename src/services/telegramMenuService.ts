@@ -17,7 +17,8 @@ export interface TelegramMenuItem {
 
 export interface TelegramInlineButton {
   text: string;
-  callbackData: string;
+  callbackData?: string;
+  url?: string;
 }
 
 export interface TelegramMenuResponse {
