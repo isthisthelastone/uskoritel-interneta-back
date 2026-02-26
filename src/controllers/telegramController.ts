@@ -3,6 +3,8 @@ import { z } from "zod";
 import {
   answerTelegramCallbackQuery,
   answerTelegramPreCheckoutQuery,
+  clearTrackedTelegramChatHistory,
+  deleteTelegramMessage,
   editTelegramInlineMenuMessage,
   sendTelegramInlineMenuMessage,
   sendTelegramPhotoMessage,
@@ -1443,11 +1445,40 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
   const command = parsedCommand.command;
 
-  if (command !== "/start" && command !== "/menu") {
+  if (command !== "/start" && command !== "/menu" && command !== "/clear") {
     res.status(200).json({
       ok: true,
       processed: false,
       reason: "Command is not handled.",
+    });
+    return;
+  }
+
+  if (command === "/clear") {
+    const clearResult = await clearTrackedTelegramChatHistory(message.chat.id);
+
+    if (message.message_id !== undefined) {
+      const deleteCommandMessageResult = await deleteTelegramMessage({
+        chatId: message.chat.id,
+        messageId: message.message_id,
+      });
+
+      if (!deleteCommandMessageResult.ok) {
+        console.error(
+          "Failed to delete /clear command message:",
+          deleteCommandMessageResult.statusCode,
+          deleteCommandMessageResult.error,
+        );
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
+      processed: true,
+      command,
+      historyCleared: true,
+      deletedCount: clearResult.deletedCount,
+      failedCount: clearResult.failedCount,
     });
     return;
   }

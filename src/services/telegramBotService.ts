@@ -4,6 +4,7 @@ interface TelegramApiResult {
   ok: boolean;
   statusCode: number;
   error?: string;
+  messageId?: number;
 }
 
 interface SendTelegramInlineMenuMessageParams {
@@ -50,6 +51,93 @@ interface AnswerTelegramPreCheckoutQueryParams {
   errorMessage?: string;
 }
 
+interface DeleteTelegramMessageParams {
+  chatId: number;
+  messageId: number;
+}
+
+interface ClearTrackedTelegramChatHistoryResult {
+  ok: boolean;
+  deletedCount: number;
+  failedCount: number;
+}
+
+const trackedMessageIdsByChat = new Map<number, number[]>();
+const maxTrackedMessagesPerChat = 500;
+
+function trackMessageId(chatId: number, messageId: number): void {
+  const trackedIds = trackedMessageIdsByChat.get(chatId) ?? [];
+
+  if (trackedIds.includes(messageId)) {
+    return;
+  }
+
+  trackedIds.push(messageId);
+
+  if (trackedIds.length > maxTrackedMessagesPerChat) {
+    trackedIds.splice(0, trackedIds.length - maxTrackedMessagesPerChat);
+  }
+
+  trackedMessageIdsByChat.set(chatId, trackedIds);
+}
+
+function untrackMessageId(chatId: number, messageId: number): void {
+  const trackedIds = trackedMessageIdsByChat.get(chatId);
+
+  if (trackedIds === undefined) {
+    return;
+  }
+
+  const nextTrackedIds = trackedIds.filter((trackedId) => trackedId !== messageId);
+
+  if (nextTrackedIds.length === 0) {
+    trackedMessageIdsByChat.delete(chatId);
+    return;
+  }
+
+  trackedMessageIdsByChat.set(chatId, nextTrackedIds);
+}
+
+function readErrorFromTelegramResponse(parsedBody: unknown): string | null {
+  if (typeof parsedBody !== "object" || parsedBody === null) {
+    return null;
+  }
+
+  const body = parsedBody as Record<string, unknown>;
+  if (body.ok !== false) {
+    return null;
+  }
+
+  const description =
+    typeof body.description === "string" && body.description.length > 0
+      ? body.description
+      : "Telegram API returned ok=false.";
+  const errorCode = typeof body.error_code === "number" ? String(body.error_code) + " " : "";
+
+  return errorCode + description;
+}
+
+function readMessageIdFromTelegramResponse(parsedBody: unknown): number | undefined {
+  if (typeof parsedBody !== "object" || parsedBody === null) {
+    return undefined;
+  }
+
+  const body = parsedBody as Record<string, unknown>;
+  const result = body.result;
+
+  if (typeof result !== "object" || result === null) {
+    return undefined;
+  }
+
+  const messageId = (result as Record<string, unknown>).message_id;
+
+  if (typeof messageId === "number" && Number.isInteger(messageId)) {
+    return messageId;
+  }
+
+  return undefined;
+}
+
 function buildTelegramApiUrl(method: string): string | null {
   const botToken = process.env.BOT_TOKEN;
 
@@ -82,24 +170,46 @@ async function postTelegramApi(
     body: JSON.stringify(payload),
   });
 
+  const responseText = await response.text();
+  let parsedBody: unknown = null;
+
+  if (responseText.length > 0) {
+    try {
+      parsedBody = JSON.parse(responseText);
+    } catch {
+      parsedBody = null;
+    }
+  }
+
   if (!response.ok) {
     return {
       ok: false,
       statusCode: response.status,
-      error: await response.text(),
+      error: responseText,
+    };
+  }
+
+  const telegramApiError = readErrorFromTelegramResponse(parsedBody);
+
+  if (telegramApiError !== null) {
+    return {
+      ok: false,
+      statusCode: response.status,
+      error: telegramApiError,
     };
   }
 
   return {
     ok: true,
     statusCode: response.status,
+    messageId: readMessageIdFromTelegramResponse(parsedBody),
   };
 }
 
 export async function sendTelegramInlineMenuMessage(
   params: SendTelegramInlineMenuMessageParams,
 ): Promise<TelegramApiResult> {
-  return postTelegramApi("sendMessage", {
+  const result = await postTelegramApi("sendMessage", {
     chat_id: params.chatId,
     text: params.text,
     reply_markup: {
@@ -111,31 +221,49 @@ export async function sendTelegramInlineMenuMessage(
       ),
     },
   });
+
+  if (result.ok && result.messageId !== undefined) {
+    trackMessageId(params.chatId, result.messageId);
+  }
+
+  return result;
 }
 
 export async function sendTelegramTextMessage(
   params: SendTelegramTextMessageParams,
 ): Promise<TelegramApiResult> {
-  return postTelegramApi("sendMessage", {
+  const result = await postTelegramApi("sendMessage", {
     chat_id: params.chatId,
     text: params.text,
   });
+
+  if (result.ok && result.messageId !== undefined) {
+    trackMessageId(params.chatId, result.messageId);
+  }
+
+  return result;
 }
 
 export async function sendTelegramPhotoMessage(
   params: SendTelegramPhotoMessageParams,
 ): Promise<TelegramApiResult> {
-  return postTelegramApi("sendPhoto", {
+  const result = await postTelegramApi("sendPhoto", {
     chat_id: params.chatId,
     photo: params.photoUrl,
     caption: params.caption ?? "",
   });
+
+  if (result.ok && result.messageId !== undefined) {
+    trackMessageId(params.chatId, result.messageId);
+  }
+
+  return result;
 }
 
 export async function sendTelegramStarsInvoice(
   params: SendTelegramStarsInvoiceParams,
 ): Promise<TelegramApiResult> {
-  return postTelegramApi("sendInvoice", {
+  const result = await postTelegramApi("sendInvoice", {
     chat_id: params.chatId,
     title: params.title,
     description: params.description,
@@ -150,6 +278,12 @@ export async function sendTelegramStarsInvoice(
     ],
     start_parameter: "vpn-subscription",
   });
+
+  if (result.ok && result.messageId !== undefined) {
+    trackMessageId(params.chatId, result.messageId);
+  }
+
+  return result;
 }
 
 export async function editTelegramInlineMenuMessage(
@@ -193,4 +327,57 @@ export async function answerTelegramPreCheckoutQuery(
   }
 
   return postTelegramApi("answerPreCheckoutQuery", payload);
+}
+
+export async function deleteTelegramMessage(
+  params: DeleteTelegramMessageParams,
+): Promise<TelegramApiResult> {
+  const result = await postTelegramApi("deleteMessage", {
+    chat_id: params.chatId,
+    message_id: params.messageId,
+  });
+
+  if (result.ok) {
+    untrackMessageId(params.chatId, params.messageId);
+  }
+
+  return result;
+}
+
+export async function clearTrackedTelegramChatHistory(
+  chatId: number,
+): Promise<ClearTrackedTelegramChatHistoryResult> {
+  const trackedIds = trackedMessageIdsByChat.get(chatId);
+
+  if (trackedIds === undefined || trackedIds.length === 0) {
+    return {
+      ok: true,
+      deletedCount: 0,
+      failedCount: 0,
+    };
+  }
+
+  let deletedCount = 0;
+  let failedCount = 0;
+
+  const idsToDelete = [...trackedIds].sort((left, right) => right - left);
+
+  for (const messageId of idsToDelete) {
+    const deleteResult = await deleteTelegramMessage({
+      chatId,
+      messageId,
+    });
+
+    if (deleteResult.ok) {
+      deletedCount += 1;
+    } else {
+      failedCount += 1;
+    }
+  }
+
+  return {
+    ok: failedCount === 0,
+    deletedCount,
+    failedCount,
+  };
 }
