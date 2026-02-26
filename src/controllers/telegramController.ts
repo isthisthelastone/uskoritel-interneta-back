@@ -3,8 +3,7 @@ import { z } from "zod";
 import {
   answerTelegramCallbackQuery,
   answerTelegramPreCheckoutQuery,
-  clearTrackedTelegramChatHistory,
-  deleteTelegramMessage,
+  clearTelegramChatHistoryBySweep,
   editTelegramInlineMenuMessage,
   sendTelegramInlineMenuMessage,
   sendTelegramPhotoMessage,
@@ -353,12 +352,14 @@ function parseSubscriptionInvoicePayload(
 
 function getMenuSectionText(menuKey: TelegramMenuKey): string {
   const menuSectionTextMap: Record<TelegramMenuKey, string> = {
-    subscription_status: "Subscription status: ⚪ Unknown. We will sync your real status soon.",
-    how_to_use: "How to use: choose a VPN location, connect, and keep this bot for quick controls.",
-    faq: "FAQ: we will add common VPN setup and troubleshooting answers here.",
-    referals: "Referals: invite friends and receive bonus days after successful activation.",
-    gifts: "Gifts: seasonal promo codes and gift subscriptions will appear here.",
-    settings: "Settings: language, notifications, and account preferences.",
+    subscription_status:
+      "Статус подписки: ⚪ Неизвестно. Скоро мы синхронизируем ваш реальный статус.",
+    how_to_use:
+      "Как пользоваться: выберите VPN локацию, подключитесь и держите этого бота под рукой для быстрых команд.",
+    faq: "FAQ: здесь мы добавим частые ответы по настройке VPN и решению проблем.",
+    referals: "Рефералы: приглашайте друзей и получайте бонусные дни после успешной активации.",
+    gifts: "Подарки: здесь будут появляться сезонные промокоды и подарочные подписки.",
+    settings: "Настройки: язык, уведомления и параметры аккаунта.",
     countries: "Список стран",
   };
 
@@ -371,8 +372,8 @@ function buildSubscriptionStatusTextFromDb(
 ): string {
   if (subscriptionStatus === "live") {
     return [
-      "🟢 SUBSCRIPTION STATUS: LIVE",
-      subscriptionUntill !== null ? "Valid until: " + subscriptionUntill : null,
+      "🟢 Статус подписки: LIVE",
+      subscriptionUntill !== null ? "Подписка до: " + subscriptionUntill : null,
     ]
       .filter((line): line is string => line !== null)
       .join("\n");
@@ -380,14 +381,14 @@ function buildSubscriptionStatusTextFromDb(
 
   if (subscriptionStatus === "ending") {
     return [
-      "🟠 SUBSCRIPTION STATUS: ENDING",
-      subscriptionUntill !== null ? "Valid until: " + subscriptionUntill : null,
+      "🟠 Статус подписки: ENDING",
+      subscriptionUntill !== null ? "Подписка до: " + subscriptionUntill : null,
     ]
       .filter((line): line is string => line !== null)
       .join("\n");
   }
 
-  return "🔴 SUBSCRIPTION STATUS: NOT FOUND";
+  return "🔴 Статус подписки: Отсутствует";
 }
 
 function hasAccessToServers(
@@ -1553,28 +1554,17 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   }
 
   if (command === "/clear") {
-    const clearResult = await clearTrackedTelegramChatHistory(message.chat.id);
-
-    if (message.message_id !== undefined) {
-      const deleteCommandMessageResult = await deleteTelegramMessage({
-        chatId: message.chat.id,
-        messageId: message.message_id,
-      });
-
-      if (!deleteCommandMessageResult.ok) {
-        console.error(
-          "Failed to delete /clear command message:",
-          deleteCommandMessageResult.statusCode,
-          deleteCommandMessageResult.error,
-        );
-      }
-    }
+    const clearResult = await clearTelegramChatHistoryBySweep({
+      chatId: message.chat.id,
+      upToMessageId: message.message_id ?? 1,
+    });
 
     res.status(200).json({
       ok: true,
       processed: true,
       command,
       historyCleared: true,
+      attemptedCount: clearResult.attemptedCount,
       deletedCount: clearResult.deletedCount,
       failedCount: clearResult.failedCount,
     });

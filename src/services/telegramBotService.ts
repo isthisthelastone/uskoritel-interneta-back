@@ -58,6 +58,7 @@ interface DeleteTelegramMessageParams {
 
 interface ClearTrackedTelegramChatHistoryResult {
   ok: boolean;
+  attemptedCount: number;
   deletedCount: number;
   failedCount: number;
 }
@@ -360,6 +361,7 @@ export async function clearTrackedTelegramChatHistory(
   if (trackedIds === undefined || trackedIds.length === 0) {
     return {
       ok: true,
+      attemptedCount: 0,
       deletedCount: 0,
       failedCount: 0,
     };
@@ -385,6 +387,60 @@ export async function clearTrackedTelegramChatHistory(
 
   return {
     ok: failedCount === 0,
+    attemptedCount: idsToDelete.length,
+    deletedCount,
+    failedCount,
+  };
+}
+
+export async function clearTelegramChatHistoryBySweep(params: {
+  chatId: number;
+  upToMessageId: number;
+  maxMessagesToSweep?: number;
+}): Promise<ClearTrackedTelegramChatHistoryResult> {
+  const sweepLimitRaw = params.maxMessagesToSweep ?? 5000;
+  const sweepLimit = Math.max(1, Math.min(10000, Math.trunc(sweepLimitRaw)));
+  const startMessageId = Math.max(1, Math.trunc(params.upToMessageId));
+  const endMessageId = Math.max(1, startMessageId - sweepLimit + 1);
+
+  const trackedIds = trackedMessageIdsByChat.get(params.chatId) ?? [];
+  const idsToDeleteSet = new Set<number>(trackedIds);
+
+  for (let messageId = startMessageId; messageId >= endMessageId; messageId -= 1) {
+    idsToDeleteSet.add(messageId);
+  }
+
+  const idsToDelete = Array.from(idsToDeleteSet).sort((left, right) => right - left);
+
+  if (idsToDelete.length === 0) {
+    return {
+      ok: true,
+      attemptedCount: 0,
+      deletedCount: 0,
+      failedCount: 0,
+    };
+  }
+
+  let deletedCount = 0;
+  let failedCount = 0;
+
+  for (const messageId of idsToDelete) {
+    const deleteResult = await deleteTelegramMessage({
+      chatId: params.chatId,
+      messageId,
+    });
+
+    if (deleteResult.ok) {
+      deletedCount += 1;
+      continue;
+    }
+
+    failedCount += 1;
+  }
+
+  return {
+    ok: failedCount === 0,
+    attemptedCount: idsToDelete.length,
     deletedCount,
     failedCount,
   };
