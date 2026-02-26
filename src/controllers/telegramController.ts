@@ -1201,7 +1201,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           telegramUser === null ||
           (telegramUser.subscription_status === null && !telegramUser.subscription_active);
         const statusText = isSubscriptionMissing
-          ? "🔴 SUBSCRIPTION STATUS: NOT FOUND\nYou can purchase subscription below."
+          ? "🔴 Подписка не найдена\nНиже вы можете приобрести подписку."
           : buildSubscriptionStatusTextFromDb(
               telegramUser.subscription_status,
               telegramUser.subscription_untill,
@@ -1212,7 +1212,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
               chatId: callbackChatId,
               text: statusText,
               inlineKeyboardRows: [
-                [{ text: "🛒 Purchase subscription", callbackData: "buy:open" }],
+                [{ text: "🛒 Приобрести подписку", callbackData: "buy:open" }],
               ],
             })
           : await sendTelegramTextMessage({
@@ -1317,7 +1317,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     if (paymentPayload === null) {
       const invalidPaymentResult = await sendTelegramTextMessage({
         chatId: message.chat.id,
-        text: "Payment received but validation failed. Please contact support.",
+        text: "Платеж получен, но произошла ошибка, свяжитесь с подержкой.",
       });
 
       if (!invalidPaymentResult.ok) {
@@ -1344,7 +1344,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     if (!paymentIsValid) {
       const invalidPaymentResult = await sendTelegramTextMessage({
         chatId: message.chat.id,
-        text: "Payment received but validation failed. Please contact support.",
+        text: "Платеж получен, но произошла ошибка, свяжитесь с подержкой.",
       });
 
       if (!invalidPaymentResult.ok) {
@@ -1373,15 +1373,15 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       const paymentSuccessResult = await sendTelegramTextMessage({
         chatId: message.chat.id,
         text: [
-          "✅ Payment successful via Telegram Stars.",
-          "Plan: " +
+          "✅ Платеж успешно выполнен звездами.",
+          "Оплачено на: " +
             String(paymentPayload.months) +
-            " month" +
-            (paymentPayload.months === 1 ? "" : "s") +
+            " месяц" +
+            (paymentPayload.months === 1 ? "" : "ев") +
             ".",
-          "🟢 SUBSCRIPTION STATUS: LIVE",
+          "🟢 Статус подписки: LIVE",
           updatedUser.subscription_untill
-            ? "Valid until: " + updatedUser.subscription_untill
+            ? "Действительна до: " + updatedUser.subscription_untill
             : null,
         ]
           .filter((line): line is string => line !== null)
@@ -1517,9 +1517,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     chatId: message.chat.id,
     text: isStartCommand
       ? userSyncResult.created
-        ? "Welcome to Uskoritel Interneta VPN. Your profile is created."
-        : "Welcome back to Uskoritel Interneta VPN."
-      : "Main menu:",
+        ? "Добро пожаловать в Starlink. Ваш профиль успешно создан."
+        : "Добро пожаловать в Starlink."
+      : "Главное меню:",
     inlineKeyboardRows: menuPayload.inlineKeyboardRows,
   });
 
