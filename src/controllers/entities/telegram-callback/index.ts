@@ -42,6 +42,7 @@ export type ReferalsAction =
 export type GiftsAction =
   | { kind: "my" }
   | { kind: "give" }
+  | { kind: "promo" }
   | { kind: "view"; giftIndex: number }
   | { kind: "activate"; giftIndex: number }
   | { kind: "method"; method: z.infer<typeof purchaseMethodSchema>; recipientTgId: string }
@@ -171,6 +172,10 @@ export function getGiftsActionFromCallbackData(data: string | undefined): GiftsA
 
   if (data === "gift:give") {
     return { kind: "give" };
+  }
+
+  if (data === "gift:promo") {
+    return { kind: "promo" };
   }
 
   if (data.startsWith("gift:view:")) {

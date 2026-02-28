@@ -67,7 +67,7 @@ export function buildTelegramMenu(
     },
     {
       key: "gifts",
-      label: "🎁 Подарки",
+      label: "🎁 Подарки и промокоды",
       sizeFr: 0.5,
       callbackData: "menu:gifts",
     },

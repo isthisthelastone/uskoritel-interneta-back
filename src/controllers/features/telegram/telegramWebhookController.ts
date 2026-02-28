@@ -12,15 +12,17 @@ import {
 import { buildTelegramMenu } from "../../../services/telegramMenuService";
 import {
   activateTelegramGift,
-  activateTelegramSubscription,
   activateTelegramSubscriptionFromBalance,
   addTelegramGift,
+  applyPromoToTelegramUser,
   applyReferralRewardForPurchase,
   ensureTelegramUser,
+  finalizeTelegramPaidSubscriptionPurchase,
   findTelegramUserByNickname,
   getTelegramUserByTgId,
   mapTelegramUserToMenuSubscriptionStatus,
 } from "../../../services/telegramUserService";
+import { getBlogerPromoByCode } from "../../../services/blogerPromoService";
 import {
   getSubscriptionPriceByMonths,
   listSubscriptionPrices,
@@ -102,7 +104,9 @@ const telegramUpdateSchema = z.object({
 });
 
 const pendingGiftRecipientInputByTgId = new Map<string, number>();
+const pendingPromoInputByTgId = new Map<string, number>();
 const pendingGiftRecipientInputTtlMs = 15 * 60 * 1000;
+const pendingPromoInputTtlMs = 15 * 60 * 1000;
 
 function startPendingGiftRecipientInput(tgId: string): void {
   pendingGiftRecipientInputByTgId.set(tgId, Date.now());
@@ -127,6 +131,63 @@ function hasPendingGiftRecipientInput(tgId: string): boolean {
   return true;
 }
 
+function startPendingPromoInput(tgId: string): void {
+  pendingPromoInputByTgId.set(tgId, Date.now());
+}
+
+function clearPendingPromoInput(tgId: string): void {
+  pendingPromoInputByTgId.delete(tgId);
+}
+
+function hasPendingPromoInput(tgId: string): boolean {
+  const createdAt = pendingPromoInputByTgId.get(tgId);
+
+  if (createdAt === undefined) {
+    return false;
+  }
+
+  if (Date.now() - createdAt > pendingPromoInputTtlMs) {
+    pendingPromoInputByTgId.delete(tgId);
+    return false;
+  }
+
+  return true;
+}
+
+function applyPercentDiscountToStars(baseAmount: number, discountPercent: number): number {
+  const safeDiscount = Math.min(100, Math.max(0, Math.floor(discountPercent)));
+  return Math.max(1, Math.round((baseAmount * (100 - safeDiscount)) / 100));
+}
+
+function applyPercentDiscountToUsd(baseAmount: number, discountPercent: number): number {
+  const safeDiscount = Math.min(100, Math.max(0, Math.floor(discountPercent)));
+  return Math.round(baseAmount * (100 - safeDiscount)) / 100;
+}
+
+async function resolveSubscriptionPurchaseAmount(
+  tgId: string,
+  months: number,
+): Promise<{ starsAmount: number; usdAmount: number; discountPercent: number } | null> {
+  const basePrice = await getSubscriptionPriceByMonths(months);
+
+  if (basePrice === null) {
+    return null;
+  }
+
+  let discountPercent = 0;
+  const payerUser = await getTelegramUserByTgId(tgId);
+
+  if (payerUser !== null && !payerUser.has_purchased && payerUser.current_discount > 0) {
+    discountPercent = payerUser.current_discount;
+  }
+
+  return {
+    starsAmount: applyPercentDiscountToStars(basePrice.stars, discountPercent),
+    usdAmount: applyPercentDiscountToUsd(basePrice.usdt, discountPercent),
+    discountPercent,
+  };
+}
+
 export async function handleTelegramMenuWebhook(req: Request, res: Response): Promise<void> {
   const parsedUpdate = telegramUpdateSchema.safeParse(req.body);
 
@@ -145,17 +206,27 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const invoicePayload = parseSubscriptionInvoicePayload(preCheckoutQuery.invoice_payload);
     let isValidPayload = false;
 
-    if (
-      invoicePayload !== null &&
-      preCheckoutQuery.currency === "XTR" &&
-      invoicePayload.tgId === String(preCheckoutQuery.from.id)
-    ) {
-      try {
-        const expectedPrice = await getSubscriptionPriceByMonths(invoicePayload.months);
-        isValidPayload =
-          expectedPrice !== null && preCheckoutQuery.total_amount === expectedPrice.stars;
-      } catch (error) {
-        console.error("Failed to load price during pre-checkout validation:", error);
+    if (invoicePayload !== null && preCheckoutQuery.currency === "XTR") {
+      if (invoicePayload.tgId !== String(preCheckoutQuery.from.id)) {
+        isValidPayload = false;
+      } else {
+        try {
+          if (invoicePayload.action === "gift") {
+            const expectedPrice = await getSubscriptionPriceByMonths(invoicePayload.months);
+            isValidPayload =
+              expectedPrice !== null && preCheckoutQuery.total_amount === expectedPrice.stars;
+          } else {
+            const expectedPurchaseAmount = await resolveSubscriptionPurchaseAmount(
+              invoicePayload.tgId,
+              invoicePayload.months,
+            );
+            isValidPayload =
+              expectedPurchaseAmount !== null &&
+              preCheckoutQuery.total_amount === expectedPurchaseAmount.starsAmount;
+          }
+        } catch (error) {
+          console.error("Failed to load price during pre-checkout validation:", error);
+        }
       }
     }
 
@@ -318,6 +389,11 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
           try {
             const prices = await listSubscriptionPrices();
+            const payerUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+            const discountPercent =
+              payerUser !== null && !payerUser.has_purchased && payerUser.current_discount > 0
+                ? payerUser.current_discount
+                : 0;
 
             if (prices.length === 0) {
               planOptionsResult = await sendTelegramTextMessage({
@@ -327,7 +403,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             } else {
               planOptionsResult = await sendTelegramInlineMenuMessage({
                 chatId: callbackChatId,
-                text: "Choose Telegram Stars plan:",
+                text:
+                  discountPercent > 0
+                    ? "Choose Telegram Stars plan (скидка " + String(discountPercent) + "%):"
+                    : "Choose Telegram Stars plan:",
                 inlineKeyboardRows: prices.map((price) => [
                   {
                     text:
@@ -335,8 +414,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                       " " +
                       (price.months === 1 ? "month" : "months") +
                       " • " +
-                      String(price.stars) +
-                      " ⭐",
+                      String(applyPercentDiscountToStars(price.stars, discountPercent)) +
+                      " ⭐" +
+                      (discountPercent > 0 ? " (-" + String(discountPercent) + "%)" : ""),
                     callbackData: "buy:plan:" + String(price.months),
                   },
                 ]),
@@ -389,10 +469,13 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
-      let selectedPlanPrice: Awaited<ReturnType<typeof getSubscriptionPriceByMonths>>;
+      let selectedPurchaseAmount: Awaited<ReturnType<typeof resolveSubscriptionPurchaseAmount>>;
 
       try {
-        selectedPlanPrice = await getSubscriptionPriceByMonths(purchaseAction.months);
+        selectedPurchaseAmount = await resolveSubscriptionPurchaseAmount(
+          String(callbackQuery.from.id),
+          purchaseAction.months,
+        );
       } catch (error) {
         console.error("Failed to load selected plan from DB:", error);
         const loadPlanFailedResult = await sendTelegramTextMessage({
@@ -417,7 +500,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
-      if (selectedPlanPrice === null) {
+      if (selectedPurchaseAmount === null) {
         const missingPlanResult = await sendTelegramTextMessage({
           chatId: callbackChatId,
           text: "Выбранный тариф недоступен. Обновите меню и попробуйте снова.",
@@ -448,7 +531,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           String(purchaseAction.months) +
           " month VPN subscription.",
         payload: buildSubscriptionInvoicePayload(callbackQuery.from.id, purchaseAction.months),
-        amount: selectedPlanPrice.stars,
+        amount: selectedPurchaseAmount.starsAmount,
       });
 
       if (!invoiceResult.ok) {
@@ -810,10 +893,11 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     if (menuKey === "gifts") {
       const giftsMenuResult = await sendTelegramInlineMenuMessage({
         chatId: callbackChatId,
-        text: "🎁 Подарки",
+        text: "🎁 Подарки и промокоды",
         inlineKeyboardRows: [
           [{ text: "🎁 Мои подарки", callbackData: "gift:my" }],
           [{ text: "🎉 Подарить подарок", callbackData: "gift:give" }],
+          [{ text: "🏷️ Активировать промокод", callbackData: "gift:promo" }],
         ],
       });
 
@@ -860,6 +944,90 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
+      if (giftsAction.kind === "promo") {
+        try {
+          const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+
+          if (telegramUser === null) {
+            const noUserResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Профиль не найден. Используйте /start, затем попробуйте снова.",
+            });
+
+            if (!noUserResult.ok) {
+              console.error(
+                "Failed to send missing profile message for promo activation:",
+                noUserResult.statusCode,
+                noUserResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: noUserResult.ok,
+            });
+            return;
+          }
+
+          if (telegramUser.has_purchased) {
+            const alreadyPurchasedResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Промокод работает только на первую покупку",
+            });
+
+            if (!alreadyPurchasedResult.ok) {
+              console.error(
+                "Failed to send promo first-purchase restriction message:",
+                alreadyPurchasedResult.statusCode,
+                alreadyPurchasedResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: alreadyPurchasedResult.ok,
+            });
+            return;
+          }
+
+          startPendingPromoInput(String(callbackQuery.from.id));
+
+          const promoPromptResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Введите промокод:",
+          });
+
+          if (!promoPromptResult.ok) {
+            console.error(
+              "Failed to send promo input prompt:",
+              promoPromptResult.statusCode,
+              promoPromptResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: promoPromptResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to start promo activation flow:", error);
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: false,
+          });
+          return;
+        }
+      }
+
       if (giftsAction.kind === "my") {
         try {
           const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
@@ -868,7 +1036,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             const noGiftsResult = await sendTelegramInlineMenuMessage({
               chatId: callbackChatId,
               text: "У вас пока еще нет подарков",
-              inlineKeyboardRows: [[{ text: "🎉 Подарить подарок", callbackData: "gift:give" }]],
+              inlineKeyboardRows: [
+                [{ text: "🎉 Подарить подарок", callbackData: "gift:give" }],
+                [{ text: "🏷️ Активировать промокод", callbackData: "gift:promo" }],
+              ],
             });
 
             if (!noGiftsResult.ok) {
@@ -903,6 +1074,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                 },
               ]),
               [{ text: "🎉 Подарить подарок", callbackData: "gift:give" }],
+              [{ text: "🏷️ Активировать промокод", callbackData: "gift:promo" }],
             ],
           });
 
@@ -1674,21 +1846,38 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     let paymentIsValid = false;
-    let validatedPrice: Awaited<ReturnType<typeof getSubscriptionPriceByMonths>> = null;
+    let validatedUsdAmount = 0;
 
-    if (
-      message.successful_payment.currency === "XTR" &&
-      paymentPayload.tgId === String(message.from.id)
-    ) {
-      try {
-        const expectedPrice = await getSubscriptionPriceByMonths(paymentPayload.months);
-        paymentIsValid =
-          expectedPrice !== null && message.successful_payment.total_amount === expectedPrice.stars;
-        if (paymentIsValid) {
-          validatedPrice = expectedPrice;
+    if (message.successful_payment.currency === "XTR") {
+      if (paymentPayload.tgId !== String(message.from.id)) {
+        paymentIsValid = false;
+      } else {
+        try {
+          if (paymentPayload.action === "gift") {
+            const expectedGiftPrice = await getSubscriptionPriceByMonths(paymentPayload.months);
+            paymentIsValid =
+              expectedGiftPrice !== null &&
+              message.successful_payment.total_amount === expectedGiftPrice.stars;
+
+            if (paymentIsValid && expectedGiftPrice !== null) {
+              validatedUsdAmount = expectedGiftPrice.usdt;
+            }
+          } else {
+            const expectedPurchaseAmount = await resolveSubscriptionPurchaseAmount(
+              paymentPayload.tgId,
+              paymentPayload.months,
+            );
+            paymentIsValid =
+              expectedPurchaseAmount !== null &&
+              message.successful_payment.total_amount === expectedPurchaseAmount.starsAmount;
+
+            if (paymentIsValid && expectedPurchaseAmount !== null) {
+              validatedUsdAmount = expectedPurchaseAmount.usdAmount;
+            }
+          }
+        } catch (error) {
+          console.error("Failed to load price during successful payment validation:", error);
         }
-      } catch (error) {
-        console.error("Failed to load price during successful payment validation:", error);
       }
     }
 
@@ -1730,12 +1919,12 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           },
         });
 
-        if (validatedPrice !== null) {
+        if (validatedUsdAmount > 0) {
           try {
             await applyReferralRewardForPurchase({
               payerTgId: String(message.from.id),
               payerTgNickname: message.from.username ?? null,
-              purchaseAmountUsd: validatedPrice.usdt,
+              purchaseAmountUsd: validatedUsdAmount,
             });
           } catch (rewardError) {
             console.error("Failed to apply referral reward after gift payment:", rewardError);
@@ -1788,18 +1977,18 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
-      const updatedUser = await activateTelegramSubscription({
+      const updatedUser = await finalizeTelegramPaidSubscriptionPurchase({
         tgId: String(message.from.id),
         tgNickname: message.from.username ?? null,
         months: paymentPayload.months,
       });
 
-      if (validatedPrice !== null) {
+      if (validatedUsdAmount > 0) {
         try {
           await applyReferralRewardForPurchase({
             payerTgId: String(message.from.id),
             payerTgNickname: message.from.username ?? null,
-            purchaseAmountUsd: validatedPrice.usdt,
+            purchaseAmountUsd: validatedUsdAmount,
           });
         } catch (rewardError) {
           console.error(
@@ -1997,6 +2186,160 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
   }
 
+  if (
+    message.from !== undefined &&
+    message.text !== undefined &&
+    hasPendingPromoInput(String(message.from.id)) &&
+    !message.text.trim().startsWith("/")
+  ) {
+    try {
+      const userTgId = String(message.from.id);
+      const telegramUser = await getTelegramUserByTgId(userTgId);
+
+      if (telegramUser === null) {
+        clearPendingPromoInput(userTgId);
+
+        const noUserResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: "Профиль не найден. Используйте /start, затем попробуйте снова.",
+        });
+
+        if (!noUserResult.ok) {
+          console.error(
+            "Failed to send missing profile message during promo input:",
+            noUserResult.statusCode,
+            noUserResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          pendingPromo: false,
+          sent: noUserResult.ok,
+        });
+        return;
+      }
+
+      if (telegramUser.has_purchased) {
+        clearPendingPromoInput(userTgId);
+
+        const alreadyPurchasedResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: "Промокод работает только на первую покупку",
+        });
+
+        if (!alreadyPurchasedResult.ok) {
+          console.error(
+            "Failed to send promo first-purchase restriction during input:",
+            alreadyPurchasedResult.statusCode,
+            alreadyPurchasedResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          pendingPromo: false,
+          sent: alreadyPurchasedResult.ok,
+        });
+        return;
+      }
+
+      const promoCode = message.text.trim();
+      const promo = await getBlogerPromoByCode(promoCode);
+
+      if (promo === null) {
+        const promoNotFoundResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: "Промокод не найден.",
+        });
+
+        if (!promoNotFoundResult.ok) {
+          console.error(
+            "Failed to send promo not found message:",
+            promoNotFoundResult.statusCode,
+            promoNotFoundResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          pendingPromo: true,
+          sent: promoNotFoundResult.ok,
+        });
+        return;
+      }
+
+      const updatedUser = await applyPromoToTelegramUser({
+        tgId: userTgId,
+        promoCode: promo.promocode,
+        discountPercent: promo.amountOfDiscount,
+        stateForReferredBy: promo.stateForReferredBy,
+      });
+
+      clearPendingPromoInput(userTgId);
+
+      const appliedPromoResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: [
+          "✅ Промокод активирован.",
+          "Промокод: " + promo.promocode,
+          "Скидка: " + String(updatedUser.current_discount) + "%",
+        ].join("\n"),
+      });
+
+      if (!appliedPromoResult.ok) {
+        console.error(
+          "Failed to send promo applied message:",
+          appliedPromoResult.statusCode,
+          appliedPromoResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingPromo: false,
+        sent: appliedPromoResult.ok,
+      });
+      return;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "";
+      const firstPurchaseOnly = errorMessage.includes("PROMO_ONLY_FIRST_PURCHASE");
+
+      const promoFailedResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: firstPurchaseOnly
+          ? "Промокод работает только на первую покупку"
+          : "Не удалось активировать промокод. Попробуйте позже.",
+      });
+
+      if (!promoFailedResult.ok) {
+        console.error(
+          "Failed to send promo activation failure message:",
+          promoFailedResult.statusCode,
+          promoFailedResult.error,
+        );
+      }
+
+      if (firstPurchaseOnly) {
+        clearPendingPromoInput(String(message.from.id));
+      } else {
+        console.error("Failed to process promo input:", error);
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingPromo: !firstPurchaseOnly,
+        sent: promoFailedResult.ok,
+      });
+      return;
+    }
+  }
+
   const parsedCommand = getTelegramCommand(message.text, process.env.BOT_USERNAME);
 
   if (parsedCommand.isSuspicious) {
@@ -2024,6 +2367,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   if (command === "/clear") {
     if (message.from !== undefined) {
       clearPendingGiftRecipientInput(String(message.from.id));
+      clearPendingPromoInput(String(message.from.id));
     }
 
     const clearResult = await clearTelegramChatHistoryBySweep({

@@ -38,6 +38,9 @@ const telegramUserRowSchema = z.object({
   refferals_data: z.array(telegramReferralEntrySchema),
   reffered_by: telegramReferredBySchema.nullable(),
   gifts: z.array(telegramGiftSchema),
+  promo: z.string().nullable(),
+  current_discount: z.number().int().nonnegative().max(100),
+  has_purchased: z.boolean(),
 });
 
 export type TelegramUserRecord = z.infer<typeof telegramUserRowSchema>;
@@ -57,6 +60,12 @@ interface EnsureTelegramUserResult {
 }
 
 interface ActivateTelegramSubscriptionInput {
+  tgId: string;
+  tgNickname: string | null;
+  months: number;
+}
+
+interface FinalizeTelegramPaidSubscriptionPurchaseInput {
   tgId: string;
   tgNickname: string | null;
   months: number;
@@ -103,6 +112,16 @@ interface ActivateTelegramGiftResult {
   user: TelegramUserRecord;
 }
 
+interface ApplyPromoToTelegramUserInput {
+  tgId: string;
+  promoCode: string;
+  discountPercent: number;
+  stateForReferredBy?: {
+    tgId: string;
+    tgNickname: string | null;
+  } | null;
+}
+
 const telegramUserSelectFields = [
   "internal_uuid",
   "tg_nickname",
@@ -118,6 +137,9 @@ const telegramUserSelectFields = [
   "refferals_data",
   "reffered_by",
   "gifts",
+  "promo",
+  "current_discount",
+  "has_purchased",
 ].join(", ");
 
 function parseTelegramUserRow(rawRow: unknown): TelegramUserRecord {
@@ -315,6 +337,34 @@ export async function activateTelegramSubscription(
   return parseTelegramUserRow(data);
 }
 
+export async function finalizeTelegramPaidSubscriptionPurchase(
+  input: FinalizeTelegramPaidSubscriptionPurchaseInput,
+): Promise<TelegramUserRecord> {
+  const activatedUser = await activateTelegramSubscription({
+    tgId: input.tgId,
+    tgNickname: input.tgNickname,
+    months: input.months,
+  });
+
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      has_purchased: true,
+      current_discount: 0,
+      promo: null,
+    })
+    .eq("tg_id", activatedUser.tg_id)
+    .select(telegramUserSelectFields)
+    .single();
+
+  if (error !== null) {
+    throw new Error("Failed to finalize paid subscription purchase: " + error.message);
+  }
+
+  return parseTelegramUserRow(data);
+}
+
 export async function activateTelegramSubscriptionFromBalance(
   input: ActivateTelegramSubscriptionFromBalanceInput,
 ): Promise<TelegramUserRecord> {
@@ -370,6 +420,50 @@ export async function activateTelegramSubscriptionFromBalance(
 
   if (data === null) {
     throw new Error("INSUFFICIENT_REFERRAL_BALANCE");
+  }
+
+  return parseTelegramUserRow(data);
+}
+
+export async function applyPromoToTelegramUser(
+  input: ApplyPromoToTelegramUserInput,
+): Promise<TelegramUserRecord> {
+  const user = await getTelegramUserByTgId(input.tgId);
+
+  if (user === null) {
+    throw new Error("Telegram user not found for promo activation.");
+  }
+
+  if (user.has_purchased) {
+    throw new Error("PROMO_ONLY_FIRST_PURCHASE");
+  }
+
+  const safeDiscount = Math.min(100, Math.max(0, Math.floor(input.discountPercent)));
+  const nextReferredBy =
+    user.reffered_by !== null
+      ? user.reffered_by
+      : input.stateForReferredBy !== undefined && input.stateForReferredBy !== null
+        ? {
+            tgId: input.stateForReferredBy.tgId,
+            tgNickname: input.stateForReferredBy.tgNickname,
+            referDate: new Date().toISOString().slice(0, 10),
+          }
+        : null;
+
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      current_discount: safeDiscount,
+      promo: input.promoCode,
+      reffered_by: nextReferredBy,
+    })
+    .eq("tg_id", input.tgId)
+    .select(telegramUserSelectFields)
+    .single();
+
+  if (error !== null) {
+    throw new Error("Failed to apply promo to Telegram user: " + error.message);
   }
 
   return parseTelegramUserRow(data);

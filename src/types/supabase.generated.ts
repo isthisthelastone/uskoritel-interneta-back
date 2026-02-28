@@ -14,6 +14,36 @@ export type Database = {
   }
   public: {
     Tables: {
+      blogers_promo: {
+        Row: {
+          amount_of_discount: number
+          bloger_name: string
+          created_at: string
+          internal_uuid: string
+          promocode: string
+          state_for_reffered_by: Json | null
+          updated_at: string
+        }
+        Insert: {
+          amount_of_discount?: number
+          bloger_name: string
+          created_at?: string
+          internal_uuid?: string
+          promocode: string
+          state_for_reffered_by?: Json | null
+          updated_at?: string
+        }
+        Update: {
+          amount_of_discount?: number
+          bloger_name?: string
+          created_at?: string
+          internal_uuid?: string
+          promocode?: string
+          state_for_reffered_by?: Json | null
+          updated_at?: string
+        }
+        Relationships: []
+      }
       subscription_prices: {
         Row: {
           created_at: string
@@ -47,12 +77,15 @@ export type Database = {
       users: {
         Row: {
           created_at: string
+          current_discount: number
           earned_money: number
           gifts: Json
+          has_purchased: boolean
           internal_uuid: string
           number_of_connections: number
           number_of_connections_last_month: number
           number_of_referals: number
+          promo: string | null
           refferals_data: Json
           reffered_by: Json | null
           subscription_active: boolean
@@ -65,12 +98,15 @@ export type Database = {
         }
         Insert: {
           created_at?: string
+          current_discount?: number
           earned_money?: number
           gifts?: Json
+          has_purchased?: boolean
           internal_uuid?: string
           number_of_connections?: number
           number_of_connections_last_month?: number
           number_of_referals?: number
+          promo?: string | null
           refferals_data?: Json
           reffered_by?: Json | null
           subscription_active?: boolean
@@ -83,12 +119,15 @@ export type Database = {
         }
         Update: {
           created_at?: string
+          current_discount?: number
           earned_money?: number
           gifts?: Json
+          has_purchased?: boolean
           internal_uuid?: string
           number_of_connections?: number
           number_of_connections_last_month?: number
           number_of_referals?: number
+          promo?: string | null
           refferals_data?: Json
           reffered_by?: Json | null
           subscription_active?: boolean
