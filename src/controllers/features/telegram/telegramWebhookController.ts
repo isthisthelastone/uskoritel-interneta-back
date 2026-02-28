@@ -923,7 +923,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     chatId: message.chat.id,
     text: isStartCommand
       ? userSyncResult.created
-        ? "Добро пожаловать в Starlink. Ваш профиль успешно создан."
+        ? "Поздравляем, вы зарегистрированы! Как новому пользователю, вам начислено 3 дня бесплатной подписки."
         : "Добро пожаловать в Starlink."
       : "Главное меню:",
     inlineKeyboardRows: menuPayload.inlineKeyboardRows,

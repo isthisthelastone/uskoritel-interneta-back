@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
-import { addMonths, formatDateOnly, parseDateOnly } from "../shared";
+import { addDays, addMonths, formatDateOnly, parseDateOnly } from "../shared";
 import type { TelegramSubscriptionStatus } from "./telegramMenuService";
 
 const telegramUserRowSchema = z.object({
@@ -108,11 +108,18 @@ export async function ensureTelegramUser(
   }
 
   const supabase = getSupabaseAdminClient();
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const trialUntillDate = addDays(today, 3);
+  const trialUntill = formatDateOnly(trialUntillDate);
   const { data, error } = await supabase
     .from("users")
     .insert({
       tg_id: input.tgId,
       tg_nickname: input.tgNickname,
+      subscription_active: true,
+      subscription_status: "ending",
+      subscription_untill: trialUntill,
     })
     .select(telegramUserSelectFields)
     .single();

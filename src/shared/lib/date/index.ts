@@ -15,6 +15,12 @@ export function addMonths(baseDate: Date, months: number): Date {
   return result;
 }
 
+export function addDays(baseDate: Date, days: number): Date {
+  const result = new Date(baseDate);
+  result.setUTCDate(result.getUTCDate() + days);
+  return result;
+}
+
 export function formatDateOnly(date: Date): string {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
