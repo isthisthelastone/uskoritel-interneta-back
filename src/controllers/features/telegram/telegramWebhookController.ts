@@ -12,6 +12,8 @@ import {
 import { buildTelegramMenu } from "../../../services/telegramMenuService";
 import {
   activateTelegramSubscription,
+  activateTelegramSubscriptionFromBalance,
+  applyReferralRewardForPurchase,
   ensureTelegramUser,
   getTelegramUserByTgId,
   mapTelegramUserToMenuSubscriptionStatus,
@@ -37,6 +39,7 @@ import {
   getMenuKeyFromCallbackData,
   getMenuSectionText,
   getPurchaseActionFromCallbackData,
+  getReferalsActionFromCallbackData,
   getTelegramCommand,
   hasAccessToServers,
   parseSubscriptionInvoicePayload,
@@ -153,6 +156,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const menuKey = getMenuKeyFromCallbackData(callbackQuery.data);
     const purchaseAction = getPurchaseActionFromCallbackData(callbackQuery.data);
     const faqAction = getFaqActionFromCallbackData(callbackQuery.data);
+    const referalsAction = getReferalsActionFromCallbackData(callbackQuery.data);
     const countriesAction = getCountriesActionFromCallbackData(callbackQuery.data);
     const howToAction = getHowToActionFromCallbackData(callbackQuery.data);
     const callbackChatId = callbackQuery.message?.chat.id;
@@ -182,23 +186,27 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             : "Opening section..."
           : faqAction !== null
             ? "Opening answer..."
-            : countriesAction !== null
-              ? countriesAction.kind === "country"
-                ? "Loading VPS list..."
-                : "Sending configs..."
-              : howToAction !== null
-                ? "Opening guide..."
-                : menuKey === null
-                  ? "Unknown action."
-                  : menuKey === "subscription_status"
-                    ? "Fetching subscription status..."
-                    : menuKey === "countries"
-                      ? "Loading countries..."
-                      : menuKey === "faq"
-                        ? "Opening FAQ..."
-                        : menuKey === "how_to_use"
-                          ? "Opening platforms..."
-                          : "Opening section...",
+            : referalsAction !== null
+              ? referalsAction.kind === "balance_plan"
+                ? "Processing prolongation..."
+                : "Opening referral section..."
+              : countriesAction !== null
+                ? countriesAction.kind === "country"
+                  ? "Loading VPS list..."
+                  : "Sending configs..."
+                : howToAction !== null
+                  ? "Opening guide..."
+                  : menuKey === null
+                    ? "Unknown action."
+                    : menuKey === "subscription_status"
+                      ? "Fetching subscription status..."
+                      : menuKey === "countries"
+                        ? "Loading countries..."
+                        : menuKey === "faq"
+                          ? "Opening FAQ..."
+                          : menuKey === "how_to_use"
+                            ? "Opening platforms..."
+                            : "Opening section...",
       showAlert: false,
     });
 
@@ -214,6 +222,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       menuKey === null &&
       purchaseAction === null &&
       faqAction === null &&
+      referalsAction === null &&
       countriesAction === null &&
       howToAction === null
     ) {
@@ -463,6 +472,300 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         sent: faqMessageResult.ok,
       });
       return;
+    }
+
+    if (menuKey === "referals") {
+      try {
+        const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+
+        if (telegramUser === null) {
+          const noUserResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Профиль не найден. Используйте /start, затем попробуйте снова.",
+          });
+
+          if (!noUserResult.ok) {
+            console.error(
+              "Failed to send missing profile message for referrals:",
+              noUserResult.statusCode,
+              noUserResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: noUserResult.ok,
+          });
+          return;
+        }
+
+        const botUsername = (process.env.BOT_USERNAME ?? "").replace(/^@/u, "");
+        const referralLink =
+          botUsername.length > 0
+            ? "https://t.me/" + botUsername + "?start=ref_" + telegramUser.tg_id
+            : "BOT_USERNAME не настроен";
+        const totalEarnedUsd = telegramUser.earned_money.toFixed(2);
+
+        const referralMessageResult = await sendTelegramInlineMenuMessage({
+          chatId: callbackChatId,
+          text: [
+            "👥 Реферальная программа",
+            "",
+            "За каждого приглашенного клиента при первой оплате вы получаете 20%",
+            "За каждую последующую ее продление 10%",
+            "",
+            "на заработанные деньги вы можете продлить свою подписку или вывести через USDT",
+            "",
+            "минимальная сумма вывода 5$",
+            "",
+            "Ваша реферальная ссылка:",
+            referralLink,
+            "",
+            "• Всего заработано : " + totalEarnedUsd + "$",
+            "• Количество ваших рефералов: " + String(telegramUser.number_of_referals),
+          ].join("\n"),
+          inlineKeyboardRows: [
+            [{ text: "🔄 Продлить подписку", callbackData: "referals:prolong" }],
+            [{ text: "💬 Связаться с поддержкой для вывода", url: "https://t.me/starlinkacc" }],
+          ],
+        });
+
+        if (!referralMessageResult.ok) {
+          console.error(
+            "Failed to send referral program message:",
+            referralMessageResult.statusCode,
+            referralMessageResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: referralMessageResult.ok,
+        });
+        return;
+      } catch (error) {
+        console.error("Failed to render referral program section:", error);
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: false,
+        });
+        return;
+      }
+    }
+
+    if (referalsAction !== null) {
+      if (referalsAction.kind === "prolong") {
+        try {
+          const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+
+          if (telegramUser === null) {
+            const noUserResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Профиль не найден. Используйте /start, затем попробуйте снова.",
+            });
+
+            if (!noUserResult.ok) {
+              console.error(
+                "Failed to send missing profile message for referrals prolongation:",
+                noUserResult.statusCode,
+                noUserResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: noUserResult.ok,
+            });
+            return;
+          }
+
+          const prices = await listSubscriptionPrices();
+          const affordablePrices = prices.filter(
+            (price) => price.usdt <= telegramUser.earned_money,
+          );
+
+          if (affordablePrices.length === 0) {
+            const notEnoughResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Пока что недостаточно средств для оплаты подписки.",
+            });
+
+            if (!notEnoughResult.ok) {
+              console.error(
+                "Failed to send insufficient referral balance message:",
+                notEnoughResult.statusCode,
+                notEnoughResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: notEnoughResult.ok,
+            });
+            return;
+          }
+
+          const prolongMenuResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text:
+              "Выберите период продления за реферальный баланс.\nТекущий баланс: " +
+              telegramUser.earned_money.toFixed(2) +
+              "$",
+            inlineKeyboardRows: affordablePrices.map((price) => [
+              {
+                text:
+                  String(price.months) +
+                  " " +
+                  (price.months === 1 ? "месяц" : "месяцев") +
+                  " • " +
+                  price.usdt.toFixed(2) +
+                  "$",
+                callbackData: "referals:balance_plan:" + String(price.months),
+              },
+            ]),
+          });
+
+          if (!prolongMenuResult.ok) {
+            console.error(
+              "Failed to send referral prolongation options:",
+              prolongMenuResult.statusCode,
+              prolongMenuResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: prolongMenuResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to build referral prolongation menu:", error);
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: false,
+          });
+          return;
+        }
+      }
+
+      try {
+        const selectedPrice = await getSubscriptionPriceByMonths(referalsAction.months);
+
+        if (selectedPrice === null) {
+          const missingPlanResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Выбранный тариф недоступен. Попробуйте снова.",
+          });
+
+          if (!missingPlanResult.ok) {
+            console.error(
+              "Failed to send missing plan message for referral prolongation:",
+              missingPlanResult.statusCode,
+              missingPlanResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: missingPlanResult.ok,
+          });
+          return;
+        }
+
+        const updatedUser = await activateTelegramSubscriptionFromBalance({
+          tgId: String(callbackQuery.from.id),
+          tgNickname: null,
+          months: referalsAction.months,
+          amountUsd: selectedPrice.usdt,
+        });
+
+        try {
+          await applyReferralRewardForPurchase({
+            payerTgId: String(callbackQuery.from.id),
+            payerTgNickname: updatedUser.tg_nickname,
+            purchaseAmountUsd: selectedPrice.usdt,
+          });
+        } catch (rewardError) {
+          console.error("Failed to apply referral reward after balance prolongation:", rewardError);
+        }
+
+        const successResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: [
+            "✅ Подписка успешно продлена за реферальный баланс.",
+            "Период: " + String(referalsAction.months) + " мес.",
+            "Списано: " + selectedPrice.usdt.toFixed(2) + "$",
+            "Остаток баланса: " + updatedUser.earned_money.toFixed(2) + "$",
+            updatedUser.subscription_untill
+              ? "Подписка до: " + updatedUser.subscription_untill
+              : null,
+          ]
+            .filter((line): line is string => line !== null)
+            .join("\n"),
+        });
+
+        if (!successResult.ok) {
+          console.error(
+            "Failed to send referral prolongation success message:",
+            successResult.statusCode,
+            successResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: successResult.ok,
+        });
+        return;
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "";
+        const isInsufficient = errorMessage.includes("INSUFFICIENT_REFERRAL_BALANCE");
+
+        const failedResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: isInsufficient
+            ? "Пока что недостаточно средств для оплаты подписки."
+            : "Не удалось продлить подписку с реферального баланса. Попробуйте позже.",
+        });
+
+        if (!failedResult.ok) {
+          console.error(
+            "Failed to send referral prolongation failure message:",
+            failedResult.statusCode,
+            failedResult.error,
+          );
+        }
+
+        if (!isInsufficient) {
+          console.error("Failed to process referral prolongation payment:", error);
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: failedResult.ok,
+        });
+        return;
+      }
     }
 
     if (menuKey === "how_to_use") {
@@ -891,6 +1194,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     let paymentIsValid = false;
+    let validatedPrice: Awaited<ReturnType<typeof getSubscriptionPriceByMonths>> = null;
 
     if (
       message.successful_payment.currency === "XTR" &&
@@ -900,6 +1204,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         const expectedPrice = await getSubscriptionPriceByMonths(paymentPayload.months);
         paymentIsValid =
           expectedPrice !== null && message.successful_payment.total_amount === expectedPrice.stars;
+        if (paymentIsValid) {
+          validatedPrice = expectedPrice;
+        }
       } catch (error) {
         console.error("Failed to load price during successful payment validation:", error);
       }
@@ -933,6 +1240,21 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         tgNickname: message.from.username ?? null,
         months: paymentPayload.months,
       });
+
+      if (validatedPrice !== null) {
+        try {
+          await applyReferralRewardForPurchase({
+            payerTgId: String(message.from.id),
+            payerTgNickname: message.from.username ?? null,
+            purchaseAmountUsd: validatedPrice.usdt,
+          });
+        } catch (rewardError) {
+          console.error(
+            "Failed to apply referral reward after Telegram Stars payment:",
+            rewardError,
+          );
+        }
+      }
 
       const paymentSuccessResult = await sendTelegramTextMessage({
         chatId: message.chat.id,
@@ -1008,6 +1330,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   }
 
   const command = parsedCommand.command;
+  const startReferralArgument = command === "/start" ? parsedCommand.argument : null;
 
   if (command !== "/start" && command !== "/menu" && command !== "/clear") {
     res.status(200).json({
@@ -1046,11 +1369,37 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   }
 
   let userSyncResult: Awaited<ReturnType<typeof ensureTelegramUser>>;
+  let referredBy: {
+    tgId: string;
+    tgNickname: string | null;
+    referDate: string;
+  } | null = null;
+
+  if (startReferralArgument !== null) {
+    const referredByTgId = startReferralArgument.replace(/^ref_/u, "");
+
+    if (referredByTgId !== String(message.from.id)) {
+      try {
+        const referrerUser = await getTelegramUserByTgId(referredByTgId);
+
+        if (referrerUser !== null) {
+          referredBy = {
+            tgId: referrerUser.tg_id,
+            tgNickname: referrerUser.tg_nickname,
+            referDate: new Date().toISOString().slice(0, 10),
+          };
+        }
+      } catch (error) {
+        console.error("Failed to resolve referral source from /start payload:", error);
+      }
+    }
+  }
 
   try {
     userSyncResult = await ensureTelegramUser({
       tgId: String(message.from.id),
       tgNickname: message.from.username ?? null,
+      referredBy,
     });
   } catch (error) {
     console.error("Failed to sync Telegram user:", error);

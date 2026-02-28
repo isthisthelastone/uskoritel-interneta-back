@@ -14,6 +14,7 @@ const telegramMenuKeySchema = z.enum([
 
 const purchaseMethodSchema = z.enum(["tg_stars", "tbd_1", "tbd_2"]);
 const faqActionSchema = z.enum(["email", "rules"]);
+const referalsActionSchema = z.enum(["prolong"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
 export const subscriptionPlanMonthsSchema = z.number().int().positive();
 const invoicePayloadSchema = z.object({
@@ -25,6 +26,9 @@ const invoicePayloadSchema = z.object({
 export type HowToPlatform = z.infer<typeof howToPlatformSchema>;
 export type HowToAction = { platform: HowToPlatform };
 export type FaqAction = { kind: z.infer<typeof faqActionSchema> };
+export type ReferalsAction =
+  | { kind: z.infer<typeof referalsActionSchema> }
+  | { kind: "balance_plan"; months: number };
 export type CountriesAction =
   | { kind: "country"; country: string }
   | { kind: "vps"; internalUuid: string };
@@ -104,6 +108,39 @@ export function getFaqActionFromCallbackData(data: string | undefined): FaqActio
   return {
     kind: parsedAction.data,
   };
+}
+
+export function getReferalsActionFromCallbackData(data: string | undefined): ReferalsAction | null {
+  if (data === undefined) {
+    return null;
+  }
+
+  if (data.startsWith("referals:")) {
+    const rawAction = data.slice("referals:".length);
+    const parsedAction = referalsActionSchema.safeParse(rawAction);
+
+    if (parsedAction.success) {
+      return {
+        kind: parsedAction.data,
+      };
+    }
+  }
+
+  if (data.startsWith("referals:balance_plan:")) {
+    const monthsRaw = Number.parseInt(data.slice("referals:balance_plan:".length), 10);
+    const parsedMonths = subscriptionPlanMonthsSchema.safeParse(monthsRaw);
+
+    if (!parsedMonths.success) {
+      return null;
+    }
+
+    return {
+      kind: "balance_plan",
+      months: parsedMonths.data,
+    };
+  }
+
+  return null;
 }
 
 export function getCountriesActionFromCallbackData(

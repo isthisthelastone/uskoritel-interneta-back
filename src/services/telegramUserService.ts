@@ -3,6 +3,19 @@ import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
 import { addDays, addMonths, formatDateOnly, parseDateOnly } from "../shared";
 import type { TelegramSubscriptionStatus } from "./telegramMenuService";
 
+const telegramReferralEntrySchema = z.object({
+  tgId: z.string().min(1),
+  tgLogin: z.string().nullable(),
+  tgNickname: z.string().nullable(),
+  numberOfPurchase: z.number().int().nonnegative(),
+});
+
+const telegramReferredBySchema = z.object({
+  tgId: z.string().min(1),
+  tgNickname: z.string().nullable(),
+  referDate: z.string().min(1),
+});
+
 const telegramUserRowSchema = z.object({
   internal_uuid: z.uuid(),
   tg_nickname: z.string().nullable(),
@@ -13,13 +26,20 @@ const telegramUserRowSchema = z.object({
   traffic_consumed_mb: z.number(),
   number_of_connections: z.number().int(),
   number_of_connections_last_month: z.number().int(),
+  number_of_referals: z.number().int().nonnegative(),
+  earned_money: z.number().nonnegative(),
+  refferals_data: z.array(telegramReferralEntrySchema),
+  reffered_by: telegramReferredBySchema.nullable(),
 });
 
 export type TelegramUserRecord = z.infer<typeof telegramUserRowSchema>;
+export type TelegramReferralEntry = z.infer<typeof telegramReferralEntrySchema>;
+export type TelegramReferredBy = z.infer<typeof telegramReferredBySchema>;
 
 interface EnsureTelegramUserInput {
   tgId: string;
   tgNickname: string | null;
+  referredBy?: TelegramReferredBy | null;
 }
 
 interface EnsureTelegramUserResult {
@@ -33,6 +53,27 @@ interface ActivateTelegramSubscriptionInput {
   months: number;
 }
 
+interface ActivateTelegramSubscriptionFromBalanceInput {
+  tgId: string;
+  tgNickname: string | null;
+  months: number;
+  amountUsd: number;
+}
+
+interface ApplyReferralRewardInput {
+  payerTgId: string;
+  payerTgNickname: string | null;
+  purchaseAmountUsd: number;
+}
+
+interface ApplyReferralRewardResult {
+  applied: boolean;
+  referrerTgId: string | null;
+  rewardAmountUsd: number;
+  rewardPercent: number;
+  referralPurchaseCount: number;
+}
+
 const telegramUserSelectFields = [
   "internal_uuid",
   "tg_nickname",
@@ -43,10 +84,18 @@ const telegramUserSelectFields = [
   "traffic_consumed_mb",
   "number_of_connections",
   "number_of_connections_last_month",
+  "number_of_referals",
+  "earned_money",
+  "refferals_data",
+  "reffered_by",
 ].join(", ");
 
 function parseTelegramUserRow(rawRow: unknown): TelegramUserRecord {
   return telegramUserRowSchema.parse(rawRow);
+}
+
+function roundUsd(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 export async function getTelegramUserByTgId(tgId: string): Promise<TelegramUserRecord | null> {
@@ -120,6 +169,7 @@ export async function ensureTelegramUser(
       subscription_active: true,
       subscription_status: "ending",
       subscription_untill: trialUntill,
+      reffered_by: input.referredBy ?? null,
     })
     .select(telegramUserSelectFields)
     .single();
@@ -205,4 +255,158 @@ export async function activateTelegramSubscription(
   }
 
   return parseTelegramUserRow(data);
+}
+
+export async function activateTelegramSubscriptionFromBalance(
+  input: ActivateTelegramSubscriptionFromBalanceInput,
+): Promise<TelegramUserRecord> {
+  if (!Number.isInteger(input.months) || input.months <= 0) {
+    throw new Error("Invalid subscription months value.");
+  }
+
+  if (!Number.isFinite(input.amountUsd) || input.amountUsd <= 0) {
+    throw new Error("Invalid amountUsd value.");
+  }
+
+  const ensuredUser = await ensureTelegramUser({
+    tgId: input.tgId,
+    tgNickname: input.tgNickname,
+  });
+  const currentUser = ensuredUser.user;
+
+  const nextEarnedMoney = roundUsd(currentUser.earned_money - input.amountUsd);
+
+  if (nextEarnedMoney < 0) {
+    throw new Error("INSUFFICIENT_REFERRAL_BALANCE");
+  }
+
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+
+  const currentUntil = currentUser.subscription_untill
+    ? parseDateOnly(currentUser.subscription_untill)
+    : null;
+
+  const baseDate =
+    currentUntil !== null && currentUntil.getTime() > today.getTime() ? currentUntil : today;
+  const newUntilDate = addMonths(baseDate, input.months);
+  const newUntil = formatDateOnly(newUntilDate);
+
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      subscription_active: true,
+      subscription_status: "live",
+      subscription_untill: newUntil,
+      earned_money: nextEarnedMoney,
+    })
+    .eq("tg_id", input.tgId)
+    .gte("earned_money", input.amountUsd)
+    .select(telegramUserSelectFields)
+    .maybeSingle();
+
+  if (error !== null) {
+    throw new Error("Failed to activate Telegram subscription from balance: " + error.message);
+  }
+
+  if (data === null) {
+    throw new Error("INSUFFICIENT_REFERRAL_BALANCE");
+  }
+
+  return parseTelegramUserRow(data);
+}
+
+export async function applyReferralRewardForPurchase(
+  input: ApplyReferralRewardInput,
+): Promise<ApplyReferralRewardResult> {
+  if (!Number.isFinite(input.purchaseAmountUsd) || input.purchaseAmountUsd <= 0) {
+    return {
+      applied: false,
+      referrerTgId: null,
+      rewardAmountUsd: 0,
+      rewardPercent: 0,
+      referralPurchaseCount: 0,
+    };
+  }
+
+  const payer = await getTelegramUserByTgId(input.payerTgId);
+
+  if (payer === null || payer.reffered_by === null) {
+    return {
+      applied: false,
+      referrerTgId: null,
+      rewardAmountUsd: 0,
+      rewardPercent: 0,
+      referralPurchaseCount: 0,
+    };
+  }
+
+  const referrerTgId = payer.reffered_by.tgId;
+
+  if (referrerTgId === payer.tg_id) {
+    return {
+      applied: false,
+      referrerTgId,
+      rewardAmountUsd: 0,
+      rewardPercent: 0,
+      referralPurchaseCount: 0,
+    };
+  }
+
+  const referrer = await getTelegramUserByTgId(referrerTgId);
+
+  if (referrer === null) {
+    return {
+      applied: false,
+      referrerTgId,
+      rewardAmountUsd: 0,
+      rewardPercent: 0,
+      referralPurchaseCount: 0,
+    };
+  }
+
+  const nextReferralsData = [...referrer.refferals_data];
+  const existingEntryIndex = nextReferralsData.findIndex((entry) => entry.tgId === payer.tg_id);
+  const currentPurchaseCount =
+    existingEntryIndex >= 0 ? nextReferralsData[existingEntryIndex].numberOfPurchase : 0;
+  const nextPurchaseCount = currentPurchaseCount + 1;
+  const rewardPercent = currentPurchaseCount === 0 ? 0.2 : 0.1;
+  const rewardAmountUsd = roundUsd(input.purchaseAmountUsd * rewardPercent);
+
+  const nextEntry: TelegramReferralEntry = {
+    tgId: payer.tg_id,
+    tgLogin: payer.tg_nickname ?? input.payerTgNickname,
+    tgNickname: input.payerTgNickname ?? payer.tg_nickname,
+    numberOfPurchase: nextPurchaseCount,
+  };
+
+  if (existingEntryIndex >= 0) {
+    nextReferralsData[existingEntryIndex] = nextEntry;
+  } else {
+    nextReferralsData.push(nextEntry);
+  }
+
+  const nextEarnedMoney = roundUsd(referrer.earned_money + rewardAmountUsd);
+  const supabase = getSupabaseAdminClient();
+  const { error } = await supabase
+    .from("users")
+    .update({
+      earned_money: nextEarnedMoney,
+      number_of_referals: nextReferralsData.length,
+      refferals_data: nextReferralsData,
+    })
+    .eq("tg_id", referrer.tg_id);
+
+  if (error !== null) {
+    throw new Error("Failed to apply referral reward: " + error.message);
+  }
+
+  return {
+    applied: true,
+    referrerTgId: referrer.tg_id,
+    rewardAmountUsd,
+    rewardPercent,
+    referralPurchaseCount: nextPurchaseCount,
+  };
 }

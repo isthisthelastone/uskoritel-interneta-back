@@ -3,6 +3,7 @@ const suspiciousCommandPattern =
 
 export interface ParsedTelegramCommand {
   command: string | null;
+  argument: string | null;
   isSuspicious: boolean;
   reason?: string;
 }
@@ -14,6 +15,7 @@ export function getTelegramCommand(
   if (text === undefined) {
     return {
       command: null,
+      argument: null,
       isSuspicious: false,
     };
   }
@@ -23,13 +25,15 @@ export function getTelegramCommand(
   if (!normalizedText.startsWith("/")) {
     return {
       command: null,
+      argument: null,
       isSuspicious: false,
     };
   }
 
-  if (normalizedText.length > 64 || suspiciousCommandPattern.test(normalizedText)) {
+  if (normalizedText.length > 128) {
     return {
       command: null,
+      argument: null,
       isSuspicious: true,
       reason: "Potential ID injection payload detected.",
     };
@@ -42,16 +46,18 @@ export function getTelegramCommand(
   if (commandMatch === null) {
     return {
       command: null,
+      argument: null,
       isSuspicious: true,
       reason: "Malformed Telegram command.",
     };
   }
 
-  if (tokens.length > 1) {
+  if (tokens.length > 2) {
     return {
       command: null,
+      argument: null,
       isSuspicious: true,
-      reason: "Command arguments are blocked for security.",
+      reason: "Too many command arguments.",
     };
   }
 
@@ -65,13 +71,45 @@ export function getTelegramCommand(
   ) {
     return {
       command: null,
+      argument: null,
       isSuspicious: false,
       reason: "Command is addressed to a different bot.",
     };
   }
 
+  const normalizedCommand = "/" + commandMatch[1].toLowerCase();
+  const argument = tokens.length === 2 ? tokens[1] : null;
+
+  if (argument !== null) {
+    if (normalizedCommand !== "/start") {
+      return {
+        command: null,
+        argument: null,
+        isSuspicious: true,
+        reason: "Command arguments are blocked for security.",
+      };
+    }
+
+    if (!/^ref_[1-9]\d{4,19}$/u.test(argument)) {
+      return {
+        command: null,
+        argument: null,
+        isSuspicious: true,
+        reason: "Unsupported /start payload.",
+      };
+    }
+  } else if (suspiciousCommandPattern.test(normalizedText)) {
+    return {
+      command: null,
+      argument: null,
+      isSuspicious: true,
+      reason: "Potential ID injection payload detected.",
+    };
+  }
+
   return {
-    command: "/" + commandMatch[1].toLowerCase(),
+    command: normalizedCommand,
+    argument,
     isSuspicious: false,
   };
 }
