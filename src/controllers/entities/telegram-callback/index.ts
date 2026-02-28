@@ -17,11 +17,21 @@ const faqActionSchema = z.enum(["email", "rules"]);
 const referalsActionSchema = z.enum(["prolong"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
 export const subscriptionPlanMonthsSchema = z.number().int().positive();
-const invoicePayloadSchema = z.object({
-  action: z.literal("subscription"),
-  months: subscriptionPlanMonthsSchema,
-  tgId: z.string(),
-});
+const giftIndexSchema = z.number().int().nonnegative();
+const tgIdSchema = z.string().regex(/^[1-9]\d{0,19}$/u);
+const invoicePayloadSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("subscription"),
+    months: subscriptionPlanMonthsSchema,
+    tgId: tgIdSchema,
+  }),
+  z.object({
+    action: z.literal("gift"),
+    months: subscriptionPlanMonthsSchema,
+    tgId: tgIdSchema,
+    recipientTgId: tgIdSchema,
+  }),
+]);
 
 export type HowToPlatform = z.infer<typeof howToPlatformSchema>;
 export type HowToAction = { platform: HowToPlatform };
@@ -29,6 +39,13 @@ export type FaqAction = { kind: z.infer<typeof faqActionSchema> };
 export type ReferalsAction =
   | { kind: z.infer<typeof referalsActionSchema> }
   | { kind: "balance_plan"; months: number };
+export type GiftsAction =
+  | { kind: "my" }
+  | { kind: "give" }
+  | { kind: "view"; giftIndex: number }
+  | { kind: "activate"; giftIndex: number }
+  | { kind: "method"; method: z.infer<typeof purchaseMethodSchema>; recipientTgId: string }
+  | { kind: "plan"; months: number; recipientTgId: string };
 export type CountriesAction =
   | { kind: "country"; country: string }
   | { kind: "vps"; internalUuid: string };
@@ -143,6 +160,93 @@ export function getReferalsActionFromCallbackData(data: string | undefined): Ref
   return null;
 }
 
+export function getGiftsActionFromCallbackData(data: string | undefined): GiftsAction | null {
+  if (data === undefined) {
+    return null;
+  }
+
+  if (data === "gift:my") {
+    return { kind: "my" };
+  }
+
+  if (data === "gift:give") {
+    return { kind: "give" };
+  }
+
+  if (data.startsWith("gift:view:")) {
+    const rawGiftIndex = Number.parseInt(data.slice("gift:view:".length), 10);
+    const parsedGiftIndex = giftIndexSchema.safeParse(rawGiftIndex);
+
+    if (!parsedGiftIndex.success) {
+      return null;
+    }
+
+    return {
+      kind: "view",
+      giftIndex: parsedGiftIndex.data,
+    };
+  }
+
+  if (data.startsWith("gift:activate:")) {
+    const rawGiftIndex = Number.parseInt(data.slice("gift:activate:".length), 10);
+    const parsedGiftIndex = giftIndexSchema.safeParse(rawGiftIndex);
+
+    if (!parsedGiftIndex.success) {
+      return null;
+    }
+
+    return {
+      kind: "activate",
+      giftIndex: parsedGiftIndex.data,
+    };
+  }
+
+  if (data.startsWith("gift:method:")) {
+    const parts = data.split(":");
+
+    if (parts.length !== 4) {
+      return null;
+    }
+
+    const parsedMethod = purchaseMethodSchema.safeParse(parts[2]);
+    const parsedRecipientTgId = tgIdSchema.safeParse(parts[3]);
+
+    if (!parsedMethod.success || !parsedRecipientTgId.success) {
+      return null;
+    }
+
+    return {
+      kind: "method",
+      method: parsedMethod.data,
+      recipientTgId: parsedRecipientTgId.data,
+    };
+  }
+
+  if (data.startsWith("gift:plan:")) {
+    const parts = data.split(":");
+
+    if (parts.length !== 4) {
+      return null;
+    }
+
+    const rawMonths = Number.parseInt(parts[2], 10);
+    const parsedMonths = subscriptionPlanMonthsSchema.safeParse(rawMonths);
+    const parsedRecipientTgId = tgIdSchema.safeParse(parts[3]);
+
+    if (!parsedMonths.success || !parsedRecipientTgId.success) {
+      return null;
+    }
+
+    return {
+      kind: "plan",
+      months: parsedMonths.data,
+      recipientTgId: parsedRecipientTgId.data,
+    };
+  }
+
+  return null;
+}
+
 export function getCountriesActionFromCallbackData(
   data: string | undefined,
 ): CountriesAction | null {
@@ -206,6 +310,19 @@ export function buildSubscriptionInvoicePayload(
     action: "subscription",
     months,
     tgId: String(tgId),
+  });
+}
+
+export function buildGiftInvoicePayload(
+  tgId: number,
+  recipientTgId: string,
+  months: z.infer<typeof subscriptionPlanMonthsSchema>,
+): string {
+  return JSON.stringify({
+    action: "gift",
+    months,
+    tgId: String(tgId),
+    recipientTgId,
   });
 }
 

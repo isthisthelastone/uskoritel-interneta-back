@@ -90,7 +90,7 @@ export function getTelegramCommand(
       };
     }
 
-    if (!/^ref_[1-9]\d{4,19}$/u.test(argument)) {
+    if (!/^ref_[1-9]\d{0,19}$/u.test(argument)) {
       return {
         command: null,
         argument: null,

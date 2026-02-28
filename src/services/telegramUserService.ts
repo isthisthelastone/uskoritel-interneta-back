@@ -16,6 +16,13 @@ const telegramReferredBySchema = z.object({
   referDate: z.string().min(1),
 });
 
+const telegramGiftSchema = z.object({
+  giftedByTgId: z.string().min(1),
+  giftedByTgName: z.string().nullable(),
+  timeAmountGifted: z.number().int().positive(),
+  dateOfGift: z.string().min(1),
+});
+
 const telegramUserRowSchema = z.object({
   internal_uuid: z.uuid(),
   tg_nickname: z.string().nullable(),
@@ -30,11 +37,13 @@ const telegramUserRowSchema = z.object({
   earned_money: z.number().nonnegative(),
   refferals_data: z.array(telegramReferralEntrySchema),
   reffered_by: telegramReferredBySchema.nullable(),
+  gifts: z.array(telegramGiftSchema),
 });
 
 export type TelegramUserRecord = z.infer<typeof telegramUserRowSchema>;
 export type TelegramReferralEntry = z.infer<typeof telegramReferralEntrySchema>;
 export type TelegramReferredBy = z.infer<typeof telegramReferredBySchema>;
+export type TelegramGift = z.infer<typeof telegramGiftSchema>;
 
 interface EnsureTelegramUserInput {
   tgId: string;
@@ -74,6 +83,26 @@ interface ApplyReferralRewardResult {
   referralPurchaseCount: number;
 }
 
+interface AddTelegramGiftInput {
+  recipientTgId: string;
+  recipientTgNickname: string | null;
+  giftedByTgId: string;
+  giftedByTgName: string | null;
+  timeAmountGifted: number;
+  setReferredByWhenUserCreated?: TelegramReferredBy | null;
+}
+
+interface ActivateTelegramGiftInput {
+  tgId: string;
+  tgNickname: string | null;
+  giftIndex: number;
+}
+
+interface ActivateTelegramGiftResult {
+  activatedGift: TelegramGift;
+  user: TelegramUserRecord;
+}
+
 const telegramUserSelectFields = [
   "internal_uuid",
   "tg_nickname",
@@ -88,6 +117,7 @@ const telegramUserSelectFields = [
   "earned_money",
   "refferals_data",
   "reffered_by",
+  "gifts",
 ].join(", ");
 
 function parseTelegramUserRow(rawRow: unknown): TelegramUserRecord {
@@ -108,6 +138,34 @@ export async function getTelegramUserByTgId(tgId: string): Promise<TelegramUserR
 
   if (error !== null) {
     throw new Error("Failed to fetch Telegram user: " + error.message);
+  }
+
+  if (data === null) {
+    return null;
+  }
+
+  return parseTelegramUserRow(data);
+}
+
+export async function findTelegramUserByNickname(
+  tgNickname: string,
+): Promise<TelegramUserRecord | null> {
+  const normalizedNickname = tgNickname.trim().replace(/^@/u, "");
+
+  if (normalizedNickname.length === 0) {
+    return null;
+  }
+
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .select(telegramUserSelectFields)
+    .ilike("tg_nickname", normalizedNickname)
+    .limit(1)
+    .maybeSingle();
+
+  if (error !== null) {
+    throw new Error("Failed to fetch Telegram user by nickname: " + error.message);
   }
 
   if (data === null) {
@@ -408,5 +466,87 @@ export async function applyReferralRewardForPurchase(
     rewardAmountUsd,
     rewardPercent,
     referralPurchaseCount: nextPurchaseCount,
+  };
+}
+
+export async function addTelegramGift(input: AddTelegramGiftInput): Promise<TelegramUserRecord> {
+  if (!Number.isInteger(input.timeAmountGifted) || input.timeAmountGifted <= 0) {
+    throw new Error("Invalid timeAmountGifted value.");
+  }
+
+  const ensuredRecipient = await ensureTelegramUser({
+    tgId: input.recipientTgId,
+    tgNickname: input.recipientTgNickname,
+    referredBy: input.setReferredByWhenUserCreated ?? null,
+  });
+
+  const nextGift: TelegramGift = {
+    giftedByTgId: input.giftedByTgId,
+    giftedByTgName: input.giftedByTgName,
+    timeAmountGifted: input.timeAmountGifted,
+    dateOfGift: new Date().toISOString().slice(0, 10),
+  };
+  const nextGifts = [...ensuredRecipient.user.gifts, nextGift];
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      gifts: nextGifts,
+    })
+    .eq("tg_id", input.recipientTgId)
+    .select(telegramUserSelectFields)
+    .single();
+
+  if (error !== null) {
+    throw new Error("Failed to append gift to Telegram user: " + error.message);
+  }
+
+  return parseTelegramUserRow(data);
+}
+
+export async function activateTelegramGift(
+  input: ActivateTelegramGiftInput,
+): Promise<ActivateTelegramGiftResult> {
+  if (!Number.isInteger(input.giftIndex) || input.giftIndex < 0) {
+    throw new Error("Invalid gift index.");
+  }
+
+  const user = await getTelegramUserByTgId(input.tgId);
+
+  if (user === null) {
+    throw new Error("Telegram user not found for gift activation.");
+  }
+
+  if (input.giftIndex >= user.gifts.length) {
+    throw new Error("GIFT_NOT_FOUND");
+  }
+  const gift = user.gifts[input.giftIndex];
+
+  await activateTelegramSubscription({
+    tgId: input.tgId,
+    tgNickname: input.tgNickname,
+    months: gift.timeAmountGifted,
+  });
+
+  const nextGifts = [...user.gifts];
+  nextGifts.splice(input.giftIndex, 1);
+
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      gifts: nextGifts,
+    })
+    .eq("tg_id", input.tgId)
+    .select(telegramUserSelectFields)
+    .single();
+
+  if (error !== null) {
+    throw new Error("Failed to update gift list after activation: " + error.message);
+  }
+
+  return {
+    activatedGift: gift,
+    user: parseTelegramUserRow(data),
   };
 }

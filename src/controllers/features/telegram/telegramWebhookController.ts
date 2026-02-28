@@ -11,10 +11,13 @@ import {
 } from "../../../services/telegramBotService";
 import { buildTelegramMenu } from "../../../services/telegramMenuService";
 import {
+  activateTelegramGift,
   activateTelegramSubscription,
   activateTelegramSubscriptionFromBalance,
+  addTelegramGift,
   applyReferralRewardForPurchase,
   ensureTelegramUser,
+  findTelegramUserByNickname,
   getTelegramUserByTgId,
   mapTelegramUserToMenuSubscriptionStatus,
 } from "../../../services/telegramUserService";
@@ -28,6 +31,7 @@ import {
   listVpsByCountry,
 } from "../../../services/vpsCatalogService";
 import {
+  buildGiftInvoicePayload,
   buildSubscriptionInvoicePayload,
   buildSubscriptionStatusTextFromDb,
   encodeCountryCallbackValue,
@@ -36,6 +40,7 @@ import {
   getFaqActionText,
   getFaqMenuInlineKeyboardRows,
   getHowToActionFromCallbackData,
+  getGiftsActionFromCallbackData,
   getMenuKeyFromCallbackData,
   getMenuSectionText,
   getPurchaseActionFromCallbackData,
@@ -95,6 +100,32 @@ const telegramUpdateSchema = z.object({
   callback_query: telegramCallbackQuerySchema.optional(),
   pre_checkout_query: telegramPreCheckoutQuerySchema.optional(),
 });
+
+const pendingGiftRecipientInputByTgId = new Map<string, number>();
+const pendingGiftRecipientInputTtlMs = 15 * 60 * 1000;
+
+function startPendingGiftRecipientInput(tgId: string): void {
+  pendingGiftRecipientInputByTgId.set(tgId, Date.now());
+}
+
+function clearPendingGiftRecipientInput(tgId: string): void {
+  pendingGiftRecipientInputByTgId.delete(tgId);
+}
+
+function hasPendingGiftRecipientInput(tgId: string): boolean {
+  const createdAt = pendingGiftRecipientInputByTgId.get(tgId);
+
+  if (createdAt === undefined) {
+    return false;
+  }
+
+  if (Date.now() - createdAt > pendingGiftRecipientInputTtlMs) {
+    pendingGiftRecipientInputByTgId.delete(tgId);
+    return false;
+  }
+
+  return true;
+}
 
 export async function handleTelegramMenuWebhook(req: Request, res: Response): Promise<void> {
   const parsedUpdate = telegramUpdateSchema.safeParse(req.body);
@@ -157,6 +188,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const purchaseAction = getPurchaseActionFromCallbackData(callbackQuery.data);
     const faqAction = getFaqActionFromCallbackData(callbackQuery.data);
     const referalsAction = getReferalsActionFromCallbackData(callbackQuery.data);
+    const giftsAction = getGiftsActionFromCallbackData(callbackQuery.data);
     const countriesAction = getCountriesActionFromCallbackData(callbackQuery.data);
     const howToAction = getHowToActionFromCallbackData(callbackQuery.data);
     const callbackChatId = callbackQuery.message?.chat.id;
@@ -190,23 +222,29 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
               ? referalsAction.kind === "balance_plan"
                 ? "Processing prolongation..."
                 : "Opening referral section..."
-              : countriesAction !== null
-                ? countriesAction.kind === "country"
-                  ? "Loading VPS list..."
-                  : "Sending configs..."
-                : howToAction !== null
-                  ? "Opening guide..."
-                  : menuKey === null
-                    ? "Unknown action."
-                    : menuKey === "subscription_status"
-                      ? "Fetching subscription status..."
-                      : menuKey === "countries"
-                        ? "Loading countries..."
-                        : menuKey === "faq"
-                          ? "Opening FAQ..."
-                          : menuKey === "how_to_use"
-                            ? "Opening platforms..."
-                            : "Opening section...",
+              : giftsAction !== null
+                ? giftsAction.kind === "activate"
+                  ? "Activating gift..."
+                  : giftsAction.kind === "plan"
+                    ? "Opening payment..."
+                    : "Opening gifts..."
+                : countriesAction !== null
+                  ? countriesAction.kind === "country"
+                    ? "Loading VPS list..."
+                    : "Sending configs..."
+                  : howToAction !== null
+                    ? "Opening guide..."
+                    : menuKey === null
+                      ? "Unknown action."
+                      : menuKey === "subscription_status"
+                        ? "Fetching subscription status..."
+                        : menuKey === "countries"
+                          ? "Loading countries..."
+                          : menuKey === "faq"
+                            ? "Opening FAQ..."
+                            : menuKey === "how_to_use"
+                              ? "Opening platforms..."
+                              : "Opening section...",
       showAlert: false,
     });
 
@@ -223,6 +261,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       purchaseAction === null &&
       faqAction === null &&
       referalsAction === null &&
+      giftsAction === null &&
       countriesAction === null &&
       howToAction === null
     ) {
@@ -768,6 +807,447 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       }
     }
 
+    if (menuKey === "gifts") {
+      const giftsMenuResult = await sendTelegramInlineMenuMessage({
+        chatId: callbackChatId,
+        text: "🎁 Подарки",
+        inlineKeyboardRows: [
+          [{ text: "🎁 Мои подарки", callbackData: "gift:my" }],
+          [{ text: "🎉 Подарить подарок", callbackData: "gift:give" }],
+        ],
+      });
+
+      if (!giftsMenuResult.ok) {
+        console.error(
+          "Failed to send gifts menu:",
+          giftsMenuResult.statusCode,
+          giftsMenuResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: giftsMenuResult.ok,
+      });
+      return;
+    }
+
+    if (giftsAction !== null) {
+      if (giftsAction.kind === "give") {
+        startPendingGiftRecipientInput(String(callbackQuery.from.id));
+
+        const promptResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "Введите логин пользователя в тг вместе с @:",
+        });
+
+        if (!promptResult.ok) {
+          console.error(
+            "Failed to send gift recipient prompt:",
+            promptResult.statusCode,
+            promptResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: promptResult.ok,
+        });
+        return;
+      }
+
+      if (giftsAction.kind === "my") {
+        try {
+          const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+
+          if (telegramUser === null || telegramUser.gifts.length === 0) {
+            const noGiftsResult = await sendTelegramInlineMenuMessage({
+              chatId: callbackChatId,
+              text: "У вас пока еще нет подарков",
+              inlineKeyboardRows: [[{ text: "🎉 Подарить подарок", callbackData: "gift:give" }]],
+            });
+
+            if (!noGiftsResult.ok) {
+              console.error(
+                "Failed to send empty gifts message:",
+                noGiftsResult.statusCode,
+                noGiftsResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: noGiftsResult.ok,
+            });
+            return;
+          }
+
+          const giftsListResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: "Ваши подарки:",
+            inlineKeyboardRows: [
+              ...telegramUser.gifts.map((gift, giftIndex) => [
+                {
+                  text:
+                    "🎁 Подарок на " +
+                    String(gift.timeAmountGifted) +
+                    " мес. от " +
+                    (gift.giftedByTgName ?? "Unknown"),
+                  callbackData: "gift:view:" + String(giftIndex),
+                },
+              ]),
+              [{ text: "🎉 Подарить подарок", callbackData: "gift:give" }],
+            ],
+          });
+
+          if (!giftsListResult.ok) {
+            console.error(
+              "Failed to send gifts list:",
+              giftsListResult.statusCode,
+              giftsListResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: giftsListResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to fetch gifts list:", error);
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: false,
+          });
+          return;
+        }
+      }
+
+      if (giftsAction.kind === "view") {
+        try {
+          const telegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+          const selectedGift = telegramUser?.gifts[giftsAction.giftIndex];
+
+          if (selectedGift === undefined) {
+            const missingGiftResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Подарок не найден.",
+            });
+
+            if (!missingGiftResult.ok) {
+              console.error(
+                "Failed to send missing gift message:",
+                missingGiftResult.statusCode,
+                missingGiftResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: missingGiftResult.ok,
+            });
+            return;
+          }
+
+          const giftDetailsResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: [
+              "🎁 Подарок на " + String(selectedGift.timeAmountGifted) + " мес.",
+              "От: " + (selectedGift.giftedByTgName ?? "Unknown"),
+              "Дата: " + selectedGift.dateOfGift,
+            ].join("\n"),
+            inlineKeyboardRows: [
+              [
+                {
+                  text: "✅ Активировать подарок",
+                  callbackData: "gift:activate:" + String(giftsAction.giftIndex),
+                },
+              ],
+              [{ text: "⬅️ Назад", callbackData: "gift:my" }],
+            ],
+          });
+
+          if (!giftDetailsResult.ok) {
+            console.error(
+              "Failed to send gift details message:",
+              giftDetailsResult.statusCode,
+              giftDetailsResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: giftDetailsResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to open gift details:", error);
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: false,
+          });
+          return;
+        }
+      }
+
+      if (giftsAction.kind === "activate") {
+        try {
+          const activationResult = await activateTelegramGift({
+            tgId: String(callbackQuery.from.id),
+            tgNickname: null,
+            giftIndex: giftsAction.giftIndex,
+          });
+
+          const giftActivatedMessageResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: [
+              "✅ Подарок активирован.",
+              "Продлено на: " + String(activationResult.activatedGift.timeAmountGifted) + " мес.",
+              activationResult.user.subscription_untill
+                ? "Подписка до: " + activationResult.user.subscription_untill
+                : null,
+            ]
+              .filter((line): line is string => line !== null)
+              .join("\n"),
+          });
+
+          if (!giftActivatedMessageResult.ok) {
+            console.error(
+              "Failed to send gift activation success message:",
+              giftActivatedMessageResult.statusCode,
+              giftActivatedMessageResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: giftActivatedMessageResult.ok,
+          });
+          return;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : "";
+          const giftNotFound = errorMessage.includes("GIFT_NOT_FOUND");
+
+          const giftActivateFailedResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: giftNotFound
+              ? "Подарок не найден."
+              : "Не удалось активировать подарок. Попробуйте позже.",
+          });
+
+          if (!giftActivateFailedResult.ok) {
+            console.error(
+              "Failed to send gift activation failure message:",
+              giftActivateFailedResult.statusCode,
+              giftActivateFailedResult.error,
+            );
+          }
+
+          if (!giftNotFound) {
+            console.error("Failed to activate gift:", error);
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: giftActivateFailedResult.ok,
+          });
+          return;
+        }
+      }
+
+      if (giftsAction.kind === "method") {
+        if (giftsAction.method === "tg_stars") {
+          try {
+            const recipientUser = await getTelegramUserByTgId(giftsAction.recipientTgId);
+
+            if (recipientUser === null) {
+              const recipientMissingResult = await sendTelegramTextMessage({
+                chatId: callbackChatId,
+                text: "Пользователь не найден.",
+              });
+
+              if (!recipientMissingResult.ok) {
+                console.error(
+                  "Failed to send missing gift recipient message:",
+                  recipientMissingResult.statusCode,
+                  recipientMissingResult.error,
+                );
+              }
+
+              res.status(200).json({
+                ok: true,
+                processed: true,
+                callbackHandled: true,
+                sent: recipientMissingResult.ok,
+              });
+              return;
+            }
+
+            const prices = await listSubscriptionPrices();
+            const giftPlansResult =
+              prices.length === 0
+                ? await sendTelegramTextMessage({
+                    chatId: callbackChatId,
+                    text: "Планы оплаты пока недоступны. Попробуйте позже.",
+                  })
+                : await sendTelegramInlineMenuMessage({
+                    chatId: callbackChatId,
+                    text:
+                      "Выберите срок подарка для @" +
+                      (recipientUser.tg_nickname ?? giftsAction.recipientTgId) +
+                      ":",
+                    inlineKeyboardRows: prices.map((price) => [
+                      {
+                        text:
+                          String(price.months) +
+                          " " +
+                          (price.months === 1 ? "month" : "months") +
+                          " • " +
+                          String(price.stars) +
+                          " ⭐",
+                        callbackData:
+                          "gift:plan:" + String(price.months) + ":" + giftsAction.recipientTgId,
+                      },
+                    ]),
+                  });
+
+            if (!giftPlansResult.ok) {
+              console.error(
+                "Failed to send gift stars plans:",
+                giftPlansResult.statusCode,
+                giftPlansResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: giftPlansResult.ok,
+            });
+            return;
+          } catch (error) {
+            console.error("Failed to build gift payment plans:", error);
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: false,
+            });
+            return;
+          }
+        }
+
+        const tbdGiftMethodResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "This payment method is not implemented yet.",
+        });
+
+        if (!tbdGiftMethodResult.ok) {
+          console.error(
+            "Failed to send TBD gift payment method message:",
+            tbdGiftMethodResult.statusCode,
+            tbdGiftMethodResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: tbdGiftMethodResult.ok,
+        });
+        return;
+      }
+
+      try {
+        const selectedPrice = await getSubscriptionPriceByMonths(giftsAction.months);
+
+        if (selectedPrice === null) {
+          const missingGiftPlanResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Выбранный тариф недоступен. Попробуйте снова.",
+          });
+
+          if (!missingGiftPlanResult.ok) {
+            console.error(
+              "Failed to send missing gift plan message:",
+              missingGiftPlanResult.statusCode,
+              missingGiftPlanResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            invoiceSent: false,
+          });
+          return;
+        }
+
+        const giftInvoiceResult = await sendTelegramStarsInvoice({
+          chatId: callbackChatId,
+          title: "VPN gift " + String(giftsAction.months) + " month plan",
+          description:
+            "Telegram Stars payment for " +
+            String(giftsAction.months) +
+            " month VPN gift subscription.",
+          payload: buildGiftInvoicePayload(
+            callbackQuery.from.id,
+            giftsAction.recipientTgId,
+            giftsAction.months,
+          ),
+          amount: selectedPrice.stars,
+        });
+
+        if (!giftInvoiceResult.ok) {
+          console.error(
+            "Failed to send gift invoice:",
+            giftInvoiceResult.statusCode,
+            giftInvoiceResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          invoiceSent: giftInvoiceResult.ok,
+        });
+        return;
+      } catch (error) {
+        console.error("Failed to prepare gift invoice:", error);
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          invoiceSent: false,
+        });
+        return;
+      }
+    }
+
     if (menuKey === "how_to_use") {
       const howToMenuResult = await sendTelegramInlineMenuMessage({
         chatId: callbackChatId,
@@ -1235,6 +1715,79 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     try {
+      if (paymentPayload.action === "gift") {
+        const referDate = new Date().toISOString().slice(0, 10);
+        const giftedRecipient = await addTelegramGift({
+          recipientTgId: paymentPayload.recipientTgId,
+          recipientTgNickname: null,
+          giftedByTgId: String(message.from.id),
+          giftedByTgName: message.from.username ?? null,
+          timeAmountGifted: paymentPayload.months,
+          setReferredByWhenUserCreated: {
+            tgId: String(message.from.id),
+            tgNickname: message.from.username ?? null,
+            referDate,
+          },
+        });
+
+        if (validatedPrice !== null) {
+          try {
+            await applyReferralRewardForPurchase({
+              payerTgId: String(message.from.id),
+              payerTgNickname: message.from.username ?? null,
+              purchaseAmountUsd: validatedPrice.usdt,
+            });
+          } catch (rewardError) {
+            console.error("Failed to apply referral reward after gift payment:", rewardError);
+          }
+        }
+
+        const giftPaymentSuccessResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: [
+            "✅ Подарок успешно оплачен.",
+            "Период подарка: " + String(paymentPayload.months) + " мес.",
+            "Получатель: @" + (giftedRecipient.tg_nickname ?? giftedRecipient.tg_id),
+          ].join("\n"),
+        });
+
+        if (!giftPaymentSuccessResult.ok) {
+          console.error(
+            "Failed to send gift payment success confirmation:",
+            giftPaymentSuccessResult.statusCode,
+            giftPaymentSuccessResult.error,
+          );
+        }
+
+        const recipientChatId = Number(paymentPayload.recipientTgId);
+        if (Number.isSafeInteger(recipientChatId)) {
+          const recipientNotificationResult = await sendTelegramTextMessage({
+            chatId: recipientChatId,
+            text: [
+              "🎁 Вам отправлен подарок.",
+              "Период: " + String(paymentPayload.months) + " мес.",
+              "От: @" + (message.from.username ?? String(message.from.id)),
+              "Откройте раздел Подарки, чтобы активировать.",
+            ].join("\n"),
+          });
+
+          if (!recipientNotificationResult.ok) {
+            console.error(
+              "Failed to send gift notification to recipient:",
+              recipientNotificationResult.statusCode,
+              recipientNotificationResult.error,
+            );
+          }
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          paymentApplied: true,
+        });
+        return;
+      }
+
       const updatedUser = await activateTelegramSubscription({
         tgId: String(message.from.id),
         tgNickname: message.from.username ?? null,
@@ -1317,6 +1870,133 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     return;
   }
 
+  if (
+    message.from !== undefined &&
+    message.text !== undefined &&
+    hasPendingGiftRecipientInput(String(message.from.id)) &&
+    !message.text.trim().startsWith("/")
+  ) {
+    const rawNicknameInput = message.text.trim();
+
+    if (!/^@[a-zA-Z0-9_]{5,32}$/u.test(rawNicknameInput)) {
+      const invalidLoginResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Введите корректный логин пользователя в формате @username.",
+      });
+
+      if (!invalidLoginResult.ok) {
+        console.error(
+          "Failed to send invalid gift recipient login message:",
+          invalidLoginResult.statusCode,
+          invalidLoginResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingGiftRecipient: true,
+        sent: invalidLoginResult.ok,
+      });
+      return;
+    }
+
+    try {
+      const recipientUser = await findTelegramUserByNickname(rawNicknameInput);
+
+      if (recipientUser === null) {
+        const userNotFoundResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: "Пользователь не найден.",
+        });
+
+        if (!userNotFoundResult.ok) {
+          console.error(
+            "Failed to send gift recipient not found message:",
+            userNotFoundResult.statusCode,
+            userNotFoundResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          pendingGiftRecipient: true,
+          sent: userNotFoundResult.ok,
+        });
+        return;
+      }
+
+      if (recipientUser.tg_id === String(message.from.id)) {
+        const selfGiftBlockedResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: "Нельзя отправить подарок самому себе.",
+        });
+
+        if (!selfGiftBlockedResult.ok) {
+          console.error(
+            "Failed to send self-gift blocked message:",
+            selfGiftBlockedResult.statusCode,
+            selfGiftBlockedResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          pendingGiftRecipient: true,
+          sent: selfGiftBlockedResult.ok,
+        });
+        return;
+      }
+
+      clearPendingGiftRecipientInput(String(message.from.id));
+
+      const paymentMethodsResult = await sendTelegramInlineMenuMessage({
+        chatId: message.chat.id,
+        text:
+          "Выберите способ оплаты подарка для @" +
+          (recipientUser.tg_nickname ?? recipientUser.tg_id) +
+          ":",
+        inlineKeyboardRows: [
+          [
+            {
+              text: "⭐ Telegram Stars",
+              callbackData: "gift:method:tg_stars:" + recipientUser.tg_id,
+            },
+          ],
+          [{ text: "TBD", callbackData: "gift:method:tbd_1:" + recipientUser.tg_id }],
+          [{ text: "TBD", callbackData: "gift:method:tbd_2:" + recipientUser.tg_id }],
+        ],
+      });
+
+      if (!paymentMethodsResult.ok) {
+        console.error(
+          "Failed to send gift payment methods:",
+          paymentMethodsResult.statusCode,
+          paymentMethodsResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingGiftRecipient: false,
+        sent: paymentMethodsResult.ok,
+      });
+      return;
+    } catch (error) {
+      console.error("Failed to resolve gift recipient from login:", error);
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingGiftRecipient: true,
+        sent: false,
+      });
+      return;
+    }
+  }
+
   const parsedCommand = getTelegramCommand(message.text, process.env.BOT_USERNAME);
 
   if (parsedCommand.isSuspicious) {
@@ -1342,6 +2022,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   }
 
   if (command === "/clear") {
+    if (message.from !== undefined) {
+      clearPendingGiftRecipientInput(String(message.from.id));
+    }
+
     const clearResult = await clearTelegramChatHistoryBySweep({
       chatId: message.chat.id,
       upToMessageId: message.message_id ?? 1,
