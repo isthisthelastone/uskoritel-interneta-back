@@ -30,7 +30,7 @@ interface EnsureTelegramUserResult {
 interface ActivateTelegramSubscriptionInput {
   tgId: string;
   tgNickname: string | null;
-  months: 1 | 3 | 6 | 12;
+  months: number;
 }
 
 const telegramUserSelectFields = [
@@ -166,6 +166,10 @@ export function mapTelegramUserToMenuSubscriptionStatus(
 export async function activateTelegramSubscription(
   input: ActivateTelegramSubscriptionInput,
 ): Promise<TelegramUserRecord> {
+  if (!Number.isInteger(input.months) || input.months <= 0) {
+    throw new Error("Invalid subscription months value.");
+  }
+
   const ensuredUser = await ensureTelegramUser({
     tgId: input.tgId,
     tgNickname: input.tgNickname,

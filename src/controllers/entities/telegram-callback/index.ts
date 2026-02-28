@@ -15,12 +15,7 @@ const telegramMenuKeySchema = z.enum([
 const purchaseMethodSchema = z.enum(["tg_stars", "tbd_1", "tbd_2"]);
 const faqActionSchema = z.enum(["email", "rules"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
-export const subscriptionPlanMonthsSchema = z.union([
-  z.literal(1),
-  z.literal(3),
-  z.literal(6),
-  z.literal(12),
-]);
+export const subscriptionPlanMonthsSchema = z.number().int().positive();
 const invoicePayloadSchema = z.object({
   action: z.literal("subscription"),
   months: subscriptionPlanMonthsSchema,

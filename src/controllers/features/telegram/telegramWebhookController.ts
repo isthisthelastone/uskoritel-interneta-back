@@ -17,6 +17,10 @@ import {
   mapTelegramUserToMenuSubscriptionStatus,
 } from "../../../services/telegramUserService";
 import {
+  getSubscriptionPriceByMonths,
+  listSubscriptionPrices,
+} from "../../../services/subscriptionPricingService";
+import {
   getVpsConfigByInternalUuid,
   listUniqueVpsCountries,
   listVpsByCountry,
@@ -105,11 +109,21 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
   if (preCheckoutQuery !== undefined) {
     const invoicePayload = parseSubscriptionInvoicePayload(preCheckoutQuery.invoice_payload);
-    const isValidPayload =
+    let isValidPayload = false;
+
+    if (
       invoicePayload !== null &&
       preCheckoutQuery.currency === "XTR" &&
-      preCheckoutQuery.total_amount === invoicePayload.months &&
-      invoicePayload.tgId === String(preCheckoutQuery.from.id);
+      invoicePayload.tgId === String(preCheckoutQuery.from.id)
+    ) {
+      try {
+        const expectedPrice = await getSubscriptionPriceByMonths(invoicePayload.months);
+        isValidPayload =
+          expectedPrice !== null && preCheckoutQuery.total_amount === expectedPrice.stars;
+      } catch (error) {
+        console.error("Failed to load price during pre-checkout validation:", error);
+      }
+    }
 
     const preCheckoutAnswerResult = await answerTelegramPreCheckoutQuery({
       preCheckoutQueryId: preCheckoutQuery.id,
@@ -252,16 +266,41 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
       if (purchaseAction.kind === "method") {
         if (purchaseAction.method === "tg_stars") {
-          const planOptionsResult = await sendTelegramInlineMenuMessage({
-            chatId: callbackChatId,
-            text: "Choose Telegram Stars plan:",
-            inlineKeyboardRows: [
-              [{ text: "1 month • 1 ⭐", callbackData: "buy:plan:1" }],
-              [{ text: "3 months • 3 ⭐", callbackData: "buy:plan:3" }],
-              [{ text: "6 months • 6 ⭐", callbackData: "buy:plan:6" }],
-              [{ text: "12 months • 12 ⭐", callbackData: "buy:plan:12" }],
-            ],
-          });
+          let planOptionsResult: Awaited<ReturnType<typeof sendTelegramInlineMenuMessage>>;
+
+          try {
+            const prices = await listSubscriptionPrices();
+
+            if (prices.length === 0) {
+              planOptionsResult = await sendTelegramTextMessage({
+                chatId: callbackChatId,
+                text: "Планы оплаты пока недоступны. Попробуйте позже.",
+              });
+            } else {
+              planOptionsResult = await sendTelegramInlineMenuMessage({
+                chatId: callbackChatId,
+                text: "Choose Telegram Stars plan:",
+                inlineKeyboardRows: prices.map((price) => [
+                  {
+                    text:
+                      String(price.months) +
+                      " " +
+                      (price.months === 1 ? "month" : "months") +
+                      " • " +
+                      String(price.stars) +
+                      " ⭐",
+                    callbackData: "buy:plan:" + String(price.months),
+                  },
+                ]),
+              });
+            }
+          } catch (error) {
+            console.error("Failed to fetch stars plan options from DB:", error);
+            planOptionsResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Не удалось загрузить тарифы. Попробуйте позже.",
+            });
+          }
 
           if (!planOptionsResult.ok) {
             console.error(
@@ -302,6 +341,57 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
+      let selectedPlanPrice: Awaited<ReturnType<typeof getSubscriptionPriceByMonths>>;
+
+      try {
+        selectedPlanPrice = await getSubscriptionPriceByMonths(purchaseAction.months);
+      } catch (error) {
+        console.error("Failed to load selected plan from DB:", error);
+        const loadPlanFailedResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "Не удалось загрузить тариф. Попробуйте позже.",
+        });
+
+        if (!loadPlanFailedResult.ok) {
+          console.error(
+            "Failed to send plan load failure message:",
+            loadPlanFailedResult.statusCode,
+            loadPlanFailedResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          invoiceSent: false,
+        });
+        return;
+      }
+
+      if (selectedPlanPrice === null) {
+        const missingPlanResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "Выбранный тариф недоступен. Обновите меню и попробуйте снова.",
+        });
+
+        if (!missingPlanResult.ok) {
+          console.error(
+            "Failed to send unavailable plan message:",
+            missingPlanResult.statusCode,
+            missingPlanResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          invoiceSent: false,
+        });
+        return;
+      }
+
       const invoiceResult = await sendTelegramStarsInvoice({
         chatId: callbackChatId,
         title: "VPN " + String(purchaseAction.months) + " month plan",
@@ -310,7 +400,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           String(purchaseAction.months) +
           " month VPN subscription.",
         payload: buildSubscriptionInvoicePayload(callbackQuery.from.id, purchaseAction.months),
-        amount: purchaseAction.months,
+        amount: selectedPlanPrice.stars,
       });
 
       if (!invoiceResult.ok) {
@@ -798,10 +888,20 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       return;
     }
 
-    const paymentIsValid =
+    let paymentIsValid = false;
+
+    if (
       message.successful_payment.currency === "XTR" &&
-      message.successful_payment.total_amount === paymentPayload.months &&
-      paymentPayload.tgId === String(message.from.id);
+      paymentPayload.tgId === String(message.from.id)
+    ) {
+      try {
+        const expectedPrice = await getSubscriptionPriceByMonths(paymentPayload.months);
+        paymentIsValid =
+          expectedPrice !== null && message.successful_payment.total_amount === expectedPrice.stars;
+      } catch (error) {
+        console.error("Failed to load price during successful payment validation:", error);
+      }
+    }
 
     if (!paymentIsValid) {
       const invalidPaymentResult = await sendTelegramTextMessage({
