@@ -18,6 +18,7 @@ interface SendTelegramTextMessageParams {
   chatId: number;
   text: string;
   protectContent?: boolean;
+  parseMode?: "HTML" | "MarkdownV2";
 }
 
 interface SendTelegramPhotoMessageParams {
@@ -238,11 +239,17 @@ export async function sendTelegramInlineMenuMessage(
 export async function sendTelegramTextMessage(
   params: SendTelegramTextMessageParams,
 ): Promise<TelegramApiResult> {
-  const result = await postTelegramApi("sendMessage", {
+  const payload: Record<string, boolean | number | string | Record<string, unknown> | unknown[]> = {
     chat_id: params.chatId,
     text: params.text,
     protect_content: params.protectContent ?? false,
-  });
+  };
+
+  if (params.parseMode !== undefined) {
+    payload.parse_mode = params.parseMode;
+  }
+
+  const result = await postTelegramApi("sendMessage", payload);
 
   if (result.ok && result.messageId !== undefined) {
     trackMessageId(params.chatId, result.messageId);

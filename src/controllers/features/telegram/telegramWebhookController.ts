@@ -617,10 +617,15 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           }
 
           for (const configUrl of vpsConfig.configList) {
+            const escapedConfigUrl = configUrl
+              .replaceAll("&", "&amp;")
+              .replaceAll("<", "&lt;")
+              .replaceAll(">", "&gt;");
             const configMessageResult = await sendTelegramTextMessage({
               chatId: callbackChatId,
-              text: configUrl,
+              text: "<code>" + escapedConfigUrl + "</code>",
               protectContent: true,
+              parseMode: "HTML",
             });
 
             if (!configMessageResult.ok) {
