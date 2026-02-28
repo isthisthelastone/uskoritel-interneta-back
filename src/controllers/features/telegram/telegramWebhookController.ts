@@ -570,35 +570,75 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       try {
         const vpsConfig = await getVpsConfigByInternalUuid(countriesAction.internalUuid);
 
-        const configResult =
-          vpsConfig === null
-            ? await sendTelegramTextMessage({
-                chatId: callbackChatId,
-                text: "Конфигурация сервера не найдена.",
-              })
-            : vpsConfig.configList.length === 0
-              ? await sendTelegramTextMessage({
-                  chatId: callbackChatId,
-                  text: "Для этого сервера пока нет конфигов.",
-                })
-              : await sendTelegramTextMessage({
-                  chatId: callbackChatId,
-                  text: ["Ссылки для приложения:", vpsConfig.configList.join("\n\n")].join("\n\n"),
-                });
+        let sent = true;
 
-        if (!configResult.ok) {
-          console.error(
-            "Failed to send VPS config list:",
-            configResult.statusCode,
-            configResult.error,
-          );
+        if (vpsConfig === null) {
+          const notFoundResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Конфигурация сервера не найдена.",
+          });
+
+          if (!notFoundResult.ok) {
+            console.error(
+              "Failed to send missing VPS config message:",
+              notFoundResult.statusCode,
+              notFoundResult.error,
+            );
+            sent = false;
+          }
+        } else if (vpsConfig.configList.length === 0) {
+          const emptyResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Для этого сервера пока нет конфигов.",
+          });
+
+          if (!emptyResult.ok) {
+            console.error(
+              "Failed to send empty VPS config message:",
+              emptyResult.statusCode,
+              emptyResult.error,
+            );
+            sent = false;
+          }
+        } else {
+          const introResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Ссылки для приложения:",
+            protectContent: true,
+          });
+
+          if (!introResult.ok) {
+            console.error(
+              "Failed to send config intro message:",
+              introResult.statusCode,
+              introResult.error,
+            );
+            sent = false;
+          }
+
+          for (const configUrl of vpsConfig.configList) {
+            const configMessageResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: configUrl,
+              protectContent: true,
+            });
+
+            if (!configMessageResult.ok) {
+              console.error(
+                "Failed to send protected VPS config URL:",
+                configMessageResult.statusCode,
+                configMessageResult.error,
+              );
+              sent = false;
+            }
+          }
         }
 
         res.status(200).json({
           ok: true,
           processed: true,
           callbackHandled: true,
-          sent: configResult.ok,
+          sent,
         });
         return;
       } catch (error) {

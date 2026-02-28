@@ -17,6 +17,7 @@ interface SendTelegramInlineMenuMessageParams {
 interface SendTelegramTextMessageParams {
   chatId: number;
   text: string;
+  protectContent?: boolean;
 }
 
 interface SendTelegramPhotoMessageParams {
@@ -240,6 +241,7 @@ export async function sendTelegramTextMessage(
   const result = await postTelegramApi("sendMessage", {
     chat_id: params.chatId,
     text: params.text,
+    protect_content: params.protectContent ?? false,
   });
 
   if (result.ok && result.messageId !== undefined) {
