@@ -8,12 +8,12 @@ import {
   getTelegramMenu,
   handleTelegramMenuWebhook,
   requireTelegramSecret,
-} from "./controllers/telegramController";
+} from "./controllers/features/telegram";
 import {
   requireAdminSecret,
   syncVpsConnectionsNow,
   testVpsSshConnection,
-} from "./controllers/vpsController";
+} from "./controllers/features/vps";
 
 export function createApp() {
   const app = express();

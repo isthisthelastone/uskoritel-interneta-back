@@ -1,4 +1,5 @@
 import type { TelegramInlineButton } from "./telegramMenuService";
+import { parseJsonSafe } from "../shared";
 
 interface TelegramApiResult {
   ok: boolean;
@@ -186,15 +187,7 @@ async function postTelegramApi(
   });
 
   const responseText = await response.text();
-  let parsedBody: unknown = null;
-
-  if (responseText.length > 0) {
-    try {
-      parsedBody = JSON.parse(responseText);
-    } catch {
-      parsedBody = null;
-    }
-  }
+  const parsedBody = responseText.length > 0 ? parseJsonSafe(responseText) : null;
 
   if (!response.ok) {
     return {

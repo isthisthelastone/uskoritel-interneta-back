@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
+import { addMonths, formatDateOnly, parseDateOnly } from "../shared";
 import type { TelegramSubscriptionStatus } from "./telegramMenuService";
 
 const telegramUserRowSchema = z.object({
@@ -46,31 +47,6 @@ const telegramUserSelectFields = [
 
 function parseTelegramUserRow(rawRow: unknown): TelegramUserRecord {
   return telegramUserRowSchema.parse(rawRow);
-}
-
-function parseDateOnly(value: string): Date | null {
-  const date = new Date(value + "T00:00:00Z");
-
-  if (!Number.isFinite(date.getTime())) {
-    return null;
-  }
-
-  date.setUTCHours(0, 0, 0, 0);
-  return date;
-}
-
-function addMonths(baseDate: Date, months: number): Date {
-  const result = new Date(baseDate);
-  result.setUTCMonth(result.getUTCMonth() + months);
-  return result;
-}
-
-function formatDateOnly(date: Date): string {
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(date.getUTCDate()).padStart(2, "0");
-
-  return String(year) + "-" + month + "-" + day;
 }
 
 export async function getTelegramUserByTgId(tgId: string): Promise<TelegramUserRecord | null> {
