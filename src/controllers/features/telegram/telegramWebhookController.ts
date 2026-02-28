@@ -761,16 +761,18 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
               telegramUser.subscription_untill,
             );
 
-        const statusMessageResult = isSubscriptionMissing
-          ? await sendTelegramInlineMenuMessage({
-              chatId: callbackChatId,
-              text: statusText,
-              inlineKeyboardRows: [[{ text: "🛒 Приобрести подписку", callbackData: "buy:open" }]],
-            })
-          : await sendTelegramTextMessage({
-              chatId: callbackChatId,
-              text: statusText,
-            });
+        const statusMessageResult = await sendTelegramInlineMenuMessage({
+          chatId: callbackChatId,
+          text: statusText,
+          inlineKeyboardRows: [
+            [
+              {
+                text: isSubscriptionMissing ? "🛒 Приобрести подписку" : "🔄 Продлить подписку",
+                callbackData: "buy:open",
+              },
+            ],
+          ],
+        });
 
         if (!statusMessageResult.ok) {
           console.error(
