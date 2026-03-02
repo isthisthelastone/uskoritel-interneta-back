@@ -83,6 +83,10 @@ Current migrations:
 
 ## SSH / VPS Workflow
 
+Detailed multi-VPS Xray typing/secrets policy:
+
+- `docs/vps-xray-config-and-secrets.md`
+
 ### Backend SSH config envs
 
 - `VPS_SSH_HOST`
