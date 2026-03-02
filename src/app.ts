@@ -19,6 +19,14 @@ export function createApp() {
   const app = express();
   const logger = pino({
     level: process.env.NODE_ENV === "production" ? "info" : "debug",
+    redact: {
+      paths: [
+        'req.headers["x-admin-secret"]',
+        'req.headers["x-telegram-secret"]',
+        'req.headers["x-telegram-bot-api-secret-token"]',
+      ],
+      censor: "[REDACTED]",
+    },
   });
 
   app.use(

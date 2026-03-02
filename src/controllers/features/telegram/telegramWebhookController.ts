@@ -107,6 +107,19 @@ const pendingGiftRecipientInputByTgId = new Map<string, number>();
 const pendingPromoInputByTgId = new Map<string, number>();
 const pendingGiftRecipientInputTtlMs = 15 * 60 * 1000;
 const pendingPromoInputTtlMs = 15 * 60 * 1000;
+const clearQueueMaxPending = 5;
+const clearQueueSweepLimit = 5000;
+const clearQueueOverloadedErrorCode = "CLEAR_QUEUE_OVERLOADED";
+
+interface ClearQueueTask {
+  chatId: number;
+  upToMessageId: number;
+  resolve: (result: Awaited<ReturnType<typeof clearTelegramChatHistoryBySweep>>) => void;
+  reject: (error: unknown) => void;
+}
+
+const clearQueueTasks: ClearQueueTask[] = [];
+let isClearQueueWorkerRunning = false;
 
 function startPendingGiftRecipientInput(tgId: string): void {
   pendingGiftRecipientInputByTgId.set(tgId, Date.now());
@@ -152,6 +165,59 @@ function hasPendingPromoInput(tgId: string): boolean {
   }
 
   return true;
+}
+
+function getClearQueueLoad(): number {
+  return clearQueueTasks.length + (isClearQueueWorkerRunning ? 1 : 0);
+}
+
+function runClearQueueWorker(): void {
+  if (isClearQueueWorkerRunning) {
+    return;
+  }
+
+  const nextTask = clearQueueTasks.shift();
+
+  if (nextTask === undefined) {
+    return;
+  }
+
+  isClearQueueWorkerRunning = true;
+
+  void (async () => {
+    try {
+      const clearResult = await clearTelegramChatHistoryBySweep({
+        chatId: nextTask.chatId,
+        upToMessageId: nextTask.upToMessageId,
+        maxMessagesToSweep: clearQueueSweepLimit,
+      });
+      nextTask.resolve(clearResult);
+    } catch (error) {
+      nextTask.reject(error);
+    } finally {
+      isClearQueueWorkerRunning = false;
+      runClearQueueWorker();
+    }
+  })();
+}
+
+function enqueueClearChatHistory(params: {
+  chatId: number;
+  upToMessageId: number;
+}): Promise<Awaited<ReturnType<typeof clearTelegramChatHistoryBySweep>>> {
+  if (getClearQueueLoad() >= clearQueueMaxPending) {
+    return Promise.reject(new Error(clearQueueOverloadedErrorCode));
+  }
+
+  return new Promise((resolve, reject) => {
+    clearQueueTasks.push({
+      chatId: params.chatId,
+      upToMessageId: params.upToMessageId,
+      resolve,
+      reject,
+    });
+    runClearQueueWorker();
+  });
 }
 
 function applyPercentDiscountToStars(baseAmount: number, discountPercent: number): number {
@@ -2370,21 +2436,60 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       clearPendingPromoInput(String(message.from.id));
     }
 
-    const clearResult = await clearTelegramChatHistoryBySweep({
-      chatId: message.chat.id,
-      upToMessageId: message.message_id ?? 1,
-    });
+    try {
+      const clearResult = await enqueueClearChatHistory({
+        chatId: message.chat.id,
+        upToMessageId: message.message_id ?? 1,
+      });
 
-    res.status(200).json({
-      ok: true,
-      processed: true,
-      command,
-      historyCleared: true,
-      attemptedCount: clearResult.attemptedCount,
-      deletedCount: clearResult.deletedCount,
-      failedCount: clearResult.failedCount,
-    });
-    return;
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        command,
+        historyCleared: true,
+        attemptedCount: clearResult.attemptedCount,
+        deletedCount: clearResult.deletedCount,
+        failedCount: clearResult.failedCount,
+      });
+      return;
+    } catch (error) {
+      const queueIsOverloaded =
+        error instanceof Error && error.message === clearQueueOverloadedErrorCode;
+
+      if (queueIsOverloaded) {
+        const queueBusyResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text: "Попробуйте очистку позже, слишком много пользователей удаляет сообщения",
+        });
+
+        if (!queueBusyResult.ok) {
+          console.error(
+            "Failed to send clear queue overload message:",
+            queueBusyResult.statusCode,
+            queueBusyResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          command,
+          historyCleared: false,
+          reason: "Clear queue is overloaded.",
+        });
+        return;
+      }
+
+      console.error("Failed to clear Telegram chat history:", error);
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        command,
+        historyCleared: false,
+        reason: "Failed to clear chat history.",
+      });
+      return;
+    }
   }
 
   if (message.from === undefined) {
