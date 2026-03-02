@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { randomBytes } from "node:crypto";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
+import { ensureVpsTrojanClient } from "./vpsXrayService";
+import type { VpsSshConfig } from "./vpsSshService";
 
 const vpsCountryRowSchema = z.object({
   country: z.string().min(1),
@@ -18,6 +20,13 @@ const vpsConfigRowSchema = z.object({
   nickname: z.string().nullable(),
   config_list: z.array(z.string()),
   users_kv_map: z.unknown(),
+});
+
+const vpsIssueConfigRowSchema = vpsConfigRowSchema.extend({
+  api_address: z.string().min(1),
+  password: z.string().min(1),
+  ssh_key: z.string().min(1),
+  optional_passsword: z.string().nullable(),
 });
 
 const vpsUserCredentialEntrySchema = z.object({
@@ -65,6 +74,10 @@ function parseVpsConfigRow(rawRow: unknown): z.infer<typeof vpsConfigRowSchema> 
   return vpsConfigRowSchema.parse(rawRow);
 }
 
+function parseVpsIssueConfigRow(rawRow: unknown): z.infer<typeof vpsIssueConfigRowSchema> {
+  return vpsIssueConfigRowSchema.parse(rawRow);
+}
+
 function parseUsersKvMap(rawValue: unknown): Partial<Record<string, VpsUserCredentialEntry>> {
   if (typeof rawValue !== "object" || rawValue === null || Array.isArray(rawValue)) {
     return {};
@@ -87,6 +100,41 @@ function parseUsersKvMap(rawValue: unknown): Partial<Record<string, VpsUserCrede
 
 function buildGeneratedPassword(): string {
   return randomBytes(18).toString("base64url");
+}
+
+function decodeBase64OrKeepRaw(rawValue: string): string {
+  const normalizedRaw = rawValue.trim();
+
+  if (normalizedRaw.length === 0) {
+    return normalizedRaw;
+  }
+
+  let decoded: string;
+
+  try {
+    decoded = Buffer.from(normalizedRaw, "base64").toString("utf8");
+  } catch {
+    return normalizedRaw;
+  }
+
+  if (decoded.length === 0) {
+    return normalizedRaw;
+  }
+
+  const normalizedDecoded = Buffer.from(decoded, "utf8").toString("base64").replace(/=+$/u, "");
+  const normalizedSource = normalizedRaw.replace(/=+$/u, "");
+
+  return normalizedDecoded === normalizedSource ? decoded : normalizedRaw;
+}
+
+function decodeBase64Strict(rawValue: string): string {
+  const decoded = Buffer.from(rawValue, "base64").toString("utf8");
+
+  if (decoded.length === 0) {
+    throw new Error("Stored user passwordBase64 is invalid.");
+  }
+
+  return decoded;
 }
 
 function buildTrojanUrlFromTemplate(templateUrl: string, password: string, label: string): string {
@@ -124,6 +172,73 @@ function pickDirectAndObfsTemplates(configList: string[]): {
   return {
     directTemplate,
     obfsTemplate,
+  };
+}
+
+function parseSshKey(sshKey: string): { user: string; host: string | null; port: number | null } {
+  const trimmed = sshKey.trim();
+
+  if (trimmed.length === 0) {
+    return {
+      user: "root",
+      host: null,
+      port: null,
+    };
+  }
+
+  const [left, right] = trimmed.includes("@") ? trimmed.split("@", 2) : ["root", trimmed];
+  const user = left.trim().length > 0 ? left.trim() : "root";
+  const hostPart = right.trim();
+
+  if (hostPart.length === 0) {
+    return {
+      user,
+      host: null,
+      port: null,
+    };
+  }
+
+  const maybePortIndex = hostPart.lastIndexOf(":");
+
+  if (maybePortIndex > 0 && maybePortIndex < hostPart.length - 1) {
+    const hostCandidate = hostPart.slice(0, maybePortIndex).trim();
+    const portCandidate = Number.parseInt(hostPart.slice(maybePortIndex + 1).trim(), 10);
+
+    if (Number.isFinite(portCandidate) && portCandidate > 0 && portCandidate <= 65535) {
+      return {
+        user,
+        host: hostCandidate,
+        port: portCandidate,
+      };
+    }
+  }
+
+  return {
+    user,
+    host: hostPart,
+    port: null,
+  };
+}
+
+function buildVpsSshConfig(row: z.infer<typeof vpsIssueConfigRowSchema>): VpsSshConfig {
+  const parsedSshKey = parseSshKey(row.ssh_key);
+  const decodedMainPassword = decodeBase64OrKeepRaw(row.password);
+  const optionalPassword =
+    row.optional_passsword !== null && row.optional_passsword.trim().length > 0
+      ? decodeBase64OrKeepRaw(row.optional_passsword)
+      : undefined;
+  const sshPassword =
+    decodedMainPassword.trim().length > 0 ? decodedMainPassword : optionalPassword;
+
+  if (sshPassword === undefined || sshPassword.trim().length === 0) {
+    throw new Error("VPS SSH password is empty for selected server.");
+  }
+
+  return {
+    host: parsedSshKey.host ?? row.api_address,
+    user: parsedSshKey.user,
+    port: parsedSshKey.port ?? 22,
+    password: sshPassword,
   };
 }
 
@@ -210,7 +325,9 @@ export async function issueOrGetUserVpsConfigUrls(
   const supabase = getSupabaseAdminClient();
   const { data, error } = await supabase
     .from("vps")
-    .select("nickname, config_list, users_kv_map")
+    .select(
+      "nickname, config_list, users_kv_map, api_address, password, ssh_key, optional_passsword",
+    )
     .eq("internal_uuid", internalUuid)
     .maybeSingle();
 
@@ -222,10 +339,11 @@ export async function issueOrGetUserVpsConfigUrls(
     return null;
   }
 
-  const row = parseVpsConfigRow(data);
+  const row = parseVpsIssueConfigRow(data);
   const usersKvMap = parseUsersKvMap(row.users_kv_map);
   const existingEntry = usersKvMap[userInternalUuid];
   const nickname = row.nickname ?? "VPS";
+  const sshConfig = buildVpsSshConfig(row);
 
   if (
     existingEntry !== undefined &&
@@ -233,6 +351,12 @@ export async function issueOrGetUserVpsConfigUrls(
     existingEntry.directUrl.length > 0 &&
     existingEntry.obfsUrl.length > 0
   ) {
+    await ensureVpsTrojanClient({
+      sshConfig,
+      userInternalUuid,
+      password: decodeBase64Strict(existingEntry.passwordBase64),
+    });
+
     return {
       nickname,
       directUrl: existingEntry.directUrl,
@@ -248,6 +372,13 @@ export async function issueOrGetUserVpsConfigUrls(
   const obfsLabel = nickname + " OBFUSCATED";
   const directUrl = buildTrojanUrlFromTemplate(templates.directTemplate, passwordRaw, directLabel);
   const obfsUrl = buildTrojanUrlFromTemplate(templates.obfsTemplate, passwordRaw, obfsLabel);
+
+  await ensureVpsTrojanClient({
+    sshConfig,
+    userInternalUuid,
+    password: passwordRaw,
+  });
+
   const nextUsersKvMap = {
     ...usersKvMap,
     [userInternalUuid]: {

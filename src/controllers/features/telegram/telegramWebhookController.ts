@@ -1750,11 +1750,24 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       } catch (error) {
         console.error("Failed to issue VPS config list for user:", error);
+        const failedResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "Ошибка при подключении к серверу, попробуйте выбрать другой",
+        });
+
+        if (!failedResult.ok) {
+          console.error(
+            "Failed to send VPS connection failure message:",
+            failedResult.statusCode,
+            failedResult.error,
+          );
+        }
+
         res.status(200).json({
           ok: true,
           processed: true,
           callbackHandled: true,
-          sent: false,
+          sent: failedResult.ok,
         });
         return;
       }

@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-interface VpsSshConfig {
+export interface VpsSshConfig {
   host: string;
   user: string;
   port: number;
@@ -32,11 +32,45 @@ function parsePort(portRaw: string | undefined): number {
   return parsedPort;
 }
 
-async function getVpsSshConfig(): Promise<VpsSshConfig> {
+async function ensureReadablePrivateKey(privateKeyPath: string | undefined): Promise<void> {
+  if (privateKeyPath === undefined || privateKeyPath.length === 0) {
+    return;
+  }
+
+  await access(privateKeyPath, fsConstants.R_OK);
+}
+
+async function validateVpsSshConfig(config: VpsSshConfig): Promise<VpsSshConfig> {
+  if (config.host.trim().length === 0) {
+    throw new Error("VPS SSH host is not configured.");
+  }
+
+  if (config.user.trim().length === 0) {
+    throw new Error("VPS SSH user is not configured.");
+  }
+
+  if (!Number.isFinite(config.port) || config.port <= 0 || config.port > 65535) {
+    throw new Error("VPS SSH port is invalid.");
+  }
+
+  await ensureReadablePrivateKey(config.privateKeyPath);
+
+  return {
+    host: config.host,
+    user: config.user,
+    port: config.port,
+    password:
+      config.password !== undefined && config.password.length > 0 ? config.password : undefined,
+    privateKeyPath:
+      config.privateKeyPath !== undefined && config.privateKeyPath.length > 0
+        ? config.privateKeyPath
+        : undefined,
+  };
+}
+
+async function getVpsSshConfigFromEnv(): Promise<VpsSshConfig> {
   const host = process.env.VPS_SSH_HOST;
   const user = process.env.VPS_SSH_USER;
-  const password = process.env.VPS_SSH_PASSWORD;
-  const privateKeyPath = process.env.VPS_SSH_PRIVATE_KEY_PATH;
 
   if (host === undefined || host.length === 0) {
     throw new Error("VPS_SSH_HOST is not configured.");
@@ -46,18 +80,13 @@ async function getVpsSshConfig(): Promise<VpsSshConfig> {
     throw new Error("VPS_SSH_USER is not configured.");
   }
 
-  if (privateKeyPath !== undefined && privateKeyPath.length > 0) {
-    await access(privateKeyPath, fsConstants.R_OK);
-  }
-
-  return {
+  return validateVpsSshConfig({
     host,
     user,
     port: parsePort(process.env.VPS_SSH_PORT),
-    password: password !== undefined && password.length > 0 ? password : undefined,
-    privateKeyPath:
-      privateKeyPath !== undefined && privateKeyPath.length > 0 ? privateKeyPath : undefined,
-  };
+    password: process.env.VPS_SSH_PASSWORD,
+    privateKeyPath: process.env.VPS_SSH_PRIVATE_KEY_PATH,
+  });
 }
 
 function getBaseSshArgs(config: VpsSshConfig): string[] {
@@ -83,19 +112,22 @@ function getBaseSshArgs(config: VpsSshConfig): string[] {
   return args;
 }
 
-export async function runVpsSshCommand(command: string): Promise<VpsSshCommandResult> {
+async function runSshCommandWithConfig(
+  config: VpsSshConfig,
+  command: string,
+): Promise<VpsSshCommandResult> {
   if (command.trim().length === 0) {
     throw new Error("SSH command cannot be empty.");
   }
 
-  const config = await getVpsSshConfig();
-  const sshArgs = [...getBaseSshArgs(config), command];
+  const normalizedConfig = await validateVpsSshConfig(config);
+  const sshArgs = [...getBaseSshArgs(normalizedConfig), command];
 
-  if (config.password !== undefined) {
+  if (normalizedConfig.password !== undefined) {
     try {
       const { stdout, stderr } = await execFileAsync(
         "sshpass",
-        ["-p", config.password, "ssh", ...sshArgs],
+        ["-p", normalizedConfig.password, "ssh", ...sshArgs],
         {
           timeout: 20_000,
           maxBuffer: 1024 * 1024,
@@ -128,4 +160,16 @@ export async function runVpsSshCommand(command: string): Promise<VpsSshCommandRe
     stdout,
     stderr,
   };
+}
+
+export async function runVpsSshCommandWithConfig(
+  config: VpsSshConfig,
+  command: string,
+): Promise<VpsSshCommandResult> {
+  return runSshCommandWithConfig(config, command);
+}
+
+export async function runVpsSshCommand(command: string): Promise<VpsSshCommandResult> {
+  const config = await getVpsSshConfigFromEnv();
+  return runSshCommandWithConfig(config, command);
 }
