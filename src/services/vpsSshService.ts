@@ -2,6 +2,9 @@ import { access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
@@ -112,6 +115,43 @@ function getBaseSshArgs(config: VpsSshConfig): string[] {
   return args;
 }
 
+async function runSshCommandWithPassword(
+  sshArgs: string[],
+  password: string,
+): Promise<VpsSshCommandResult> {
+  const askPassDir = await mkdtemp(join(tmpdir(), "vps-ssh-askpass-"));
+  const askPassPath = join(askPassDir, "askpass.sh");
+
+  try {
+    await writeFile(
+      askPassPath,
+      "#!/bin/sh\nprintf '%s\\n' \"$VPS_SSH_ASKPASS_PASSWORD\"\n",
+      "utf8",
+    );
+    await chmod(askPassPath, 0o700);
+
+    const { stdout, stderr } = await execFileAsync("ssh", sshArgs, {
+      timeout: 20_000,
+      maxBuffer: 1024 * 1024,
+      env: {
+        ...process.env,
+        DISPLAY: "localhost:0",
+        SSH_ASKPASS: askPassPath,
+        SSH_ASKPASS_REQUIRE: "force",
+        SSH_AUTH_SOCK: "",
+        VPS_SSH_ASKPASS_PASSWORD: password,
+      },
+    });
+
+    return {
+      stdout,
+      stderr,
+    };
+  } finally {
+    await rm(askPassDir, { recursive: true, force: true });
+  }
+}
+
 async function runSshCommandWithConfig(
   config: VpsSshConfig,
   command: string,
@@ -121,37 +161,25 @@ async function runSshCommandWithConfig(
   }
 
   const normalizedConfig = await validateVpsSshConfig(config);
-  const sshArgs = [...getBaseSshArgs(normalizedConfig), command];
+  const sshArgs = [...getBaseSshArgs(normalizedConfig)];
 
   if (normalizedConfig.password !== undefined) {
-    try {
-      const { stdout, stderr } = await execFileAsync(
-        "sshpass",
-        ["-p", normalizedConfig.password, "ssh", ...sshArgs],
-        {
-          timeout: 20_000,
-          maxBuffer: 1024 * 1024,
-        },
-      );
-
-      return {
-        stdout,
-        stderr,
-      };
-    } catch (error) {
-      const typedError = error as NodeJS.ErrnoException;
-
-      if (typedError.code === "ENOENT") {
-        throw new Error(
-          "sshpass is not installed. Install sshpass or set VPS_SSH_PRIVATE_KEY_PATH for key-based auth.",
-        );
-      }
-
-      throw error;
-    }
+    return runSshCommandWithPassword(
+      [
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "PreferredAuthentications=password",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        ...sshArgs,
+        command,
+      ],
+      normalizedConfig.password,
+    );
   }
 
-  const { stdout, stderr } = await execFileAsync("ssh", sshArgs, {
+  const { stdout, stderr } = await execFileAsync("ssh", [...sshArgs, command], {
     timeout: 20_000,
     maxBuffer: 1024 * 1024,
   });
