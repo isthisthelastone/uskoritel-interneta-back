@@ -175,6 +175,24 @@ function pickDirectAndObfsTemplates(configList: string[]): {
   };
 }
 
+function appendUserUrlsToConfigList(
+  currentConfigList: string[],
+  directUrl: string,
+  obfsUrl: string,
+): string[] {
+  const nextConfigList = [...currentConfigList];
+
+  if (!nextConfigList.includes(directUrl)) {
+    nextConfigList.push(directUrl);
+  }
+
+  if (!nextConfigList.includes(obfsUrl)) {
+    nextConfigList.push(obfsUrl);
+  }
+
+  return nextConfigList;
+}
+
 function parseSshKey(sshKey: string): { user: string; host: string | null; port: number | null } {
   const trimmed = sshKey.trim();
 
@@ -389,11 +407,13 @@ export async function issueOrGetUserVpsConfigUrls(
       active: true,
     },
   };
+  const nextConfigList = appendUserUrlsToConfigList(row.config_list, directUrl, obfsUrl);
 
   const { error: updateError } = await supabase
     .from("vps")
     .update({
       users_kv_map: nextUsersKvMap,
+      config_list: nextConfigList,
     })
     .eq("internal_uuid", internalUuid);
 
