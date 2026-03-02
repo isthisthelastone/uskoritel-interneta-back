@@ -28,7 +28,7 @@ import {
   listSubscriptionPrices,
 } from "../../../services/subscriptionPricingService";
 import {
-  getVpsConfigByInternalUuid,
+  issueOrGetUserVpsConfigUrls,
   listUniqueVpsCountries,
   listVpsByCountry,
 } from "../../../services/vpsCatalogService";
@@ -1679,7 +1679,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       }
 
       try {
-        const vpsConfig = await getVpsConfigByInternalUuid(countriesAction.internalUuid);
+        const vpsConfig = await issueOrGetUserVpsConfigUrls(
+          countriesAction.internalUuid,
+          telegramUser.internal_uuid,
+        );
 
         let sent = true;
 
@@ -1697,24 +1700,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             );
             sent = false;
           }
-        } else if (vpsConfig.configList.length === 0) {
-          const emptyResult = await sendTelegramTextMessage({
-            chatId: callbackChatId,
-            text: "Для этого сервера пока нет конфигов.",
-          });
-
-          if (!emptyResult.ok) {
-            console.error(
-              "Failed to send empty VPS config message:",
-              emptyResult.statusCode,
-              emptyResult.error,
-            );
-            sent = false;
-          }
         } else {
           const introResult = await sendTelegramTextMessage({
             chatId: callbackChatId,
-            text: "Ссылки для приложения:",
+            text: "Ваши персональные ссылки для приложения:",
             protectContent: true,
           });
 
@@ -1727,7 +1716,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             sent = false;
           }
 
-          for (const configUrl of vpsConfig.configList) {
+          const configUrls = [vpsConfig.directUrl, vpsConfig.obfsUrl];
+
+          for (const configUrl of configUrls) {
             const escapedConfigUrl = configUrl
               .replaceAll("&", "&amp;")
               .replaceAll("<", "&lt;")
@@ -1758,7 +1749,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         });
         return;
       } catch (error) {
-        console.error("Failed to fetch VPS config list:", error);
+        console.error("Failed to issue VPS config list for user:", error);
         res.status(200).json({
           ok: true,
           processed: true,
