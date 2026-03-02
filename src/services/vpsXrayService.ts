@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { xrayConfigSchema, type XrayConfig } from "../shared";
+import { z } from "zod";
 import { runVpsSshCommandWithConfig, type VpsSshConfig } from "./vpsSshService";
 
 const DEFAULT_XRAY_CONFIG_PATH = "/etc/xray/config.json";
@@ -11,6 +11,18 @@ interface EnsureVpsTrojanClientInput {
   userInternalUuid: string;
   password: string;
 }
+
+type JsonObject = Record<string, unknown>;
+
+interface XrayConfigDocument extends JsonObject {
+  inbounds: JsonObject[];
+}
+
+const xrayConfigDocumentSchema = z
+  .object({
+    inbounds: z.array(z.record(z.string(), z.unknown())),
+  })
+  .loose();
 
 function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
@@ -32,7 +44,7 @@ function getXrayRuntimeConfig(): {
   };
 }
 
-function parseXrayConfig(rawConfig: string): XrayConfig {
+function parseXrayConfig(rawConfig: string): XrayConfigDocument {
   let parsedJson: unknown;
 
   try {
@@ -41,40 +53,74 @@ function parseXrayConfig(rawConfig: string): XrayConfig {
     throw new Error("Failed to parse remote Xray config JSON.");
   }
 
-  return xrayConfigSchema.parse(parsedJson);
+  const parsed = xrayConfigDocumentSchema.parse(parsedJson);
+  return parsed as XrayConfigDocument;
+}
+
+function getInboundClients(inbound: JsonObject, inboundTag: string): JsonObject[] {
+  const protocol = inbound.protocol;
+
+  if (protocol !== "trojan") {
+    throw new Error("Xray inbound " + inboundTag + " must use trojan protocol.");
+  }
+
+  const settingsRaw = inbound.settings;
+
+  if (typeof settingsRaw !== "object" || settingsRaw === null || Array.isArray(settingsRaw)) {
+    throw new Error("Xray inbound " + inboundTag + " has invalid settings object.");
+  }
+
+  const settings = settingsRaw as JsonObject;
+  const clientsRaw = settings.clients;
+
+  if (!Array.isArray(clientsRaw)) {
+    throw new Error("Xray inbound " + inboundTag + " has no settings.clients array.");
+  }
+
+  const clients: JsonObject[] = [];
+
+  for (const client of clientsRaw) {
+    if (typeof client === "object" && client !== null && !Array.isArray(client)) {
+      clients.push(client as JsonObject);
+    }
+  }
+
+  settings.clients = clients;
+  return clients;
 }
 
 function upsertTrojanClientByEmail(
-  config: XrayConfig,
+  config: XrayConfigDocument,
   inboundTag: string,
   userInternalUuid: string,
   password: string,
 ): boolean {
-  const inbound = config.inbounds.find((item) => item.tag === inboundTag);
+  const inbound = config.inbounds.find(
+    (item) => typeof item.tag === "string" && item.tag === inboundTag,
+  );
 
   if (inbound === undefined) {
     throw new Error("Xray inbound tag is missing: " + inboundTag);
   }
 
-  const existingIndex = inbound.settings.clients.findIndex(
-    (client) => client.email === userInternalUuid,
-  );
+  const clients = getInboundClients(inbound, inboundTag);
+  const existingIndex = clients.findIndex((client) => client.email === userInternalUuid);
 
   if (existingIndex === -1) {
-    inbound.settings.clients.push({
+    clients.push({
       email: userInternalUuid,
       password,
     });
     return true;
   }
 
-  const existingClient = inbound.settings.clients[existingIndex];
+  const existingClient = clients[existingIndex];
 
   if (existingClient.password === password && existingClient.email === userInternalUuid) {
     return false;
   }
 
-  inbound.settings.clients[existingIndex] = {
+  clients[existingIndex] = {
     ...existingClient,
     email: userInternalUuid,
     password,
@@ -86,7 +132,7 @@ function upsertTrojanClientByEmail(
 async function readRemoteXrayConfig(
   sshConfig: VpsSshConfig,
   configPath: string,
-): Promise<XrayConfig> {
+): Promise<XrayConfigDocument> {
   const readResult = await runVpsSshCommandWithConfig(sshConfig, "cat " + shellQuote(configPath));
   return parseXrayConfig(readResult.stdout);
 }
@@ -94,7 +140,7 @@ async function readRemoteXrayConfig(
 async function writeRemoteXrayConfig(
   sshConfig: VpsSshConfig,
   configPath: string,
-  nextConfig: XrayConfig,
+  nextConfig: XrayConfigDocument,
 ): Promise<void> {
   const tempPath = "/tmp/xray-config-" + randomBytes(8).toString("hex") + ".json";
   const base64Payload = Buffer.from(JSON.stringify(nextConfig, null, 2), "utf8").toString("base64");
