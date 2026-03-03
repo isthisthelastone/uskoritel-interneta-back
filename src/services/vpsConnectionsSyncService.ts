@@ -869,7 +869,11 @@ async function runSyncSafely(trigger: string): Promise<void> {
       "droppedUsers=" + String(result.droppedUsers),
     );
   } catch (error) {
-    console.error("[vps-sync]", trigger, "failed:", error);
+    if (error instanceof Error) {
+      console.error("[vps-sync]", trigger, "failed:", error.message);
+    } else {
+      console.error("[vps-sync]", trigger, "failed:", error);
+    }
   }
 }
 
@@ -878,11 +882,16 @@ export function startVpsConnectionsSyncJob(): void {
     return;
   }
 
-  if (process.env.VPS_CONNECTION_SYNC_ENABLED !== "true") {
+  const syncEnabledRaw = process.env.VPS_CONNECTION_SYNC_ENABLED?.trim().toLowerCase();
+  const syncEnabled = syncEnabledRaw !== "false";
+
+  if (!syncEnabled) {
+    console.log("[vps-sync] disabled by VPS_CONNECTION_SYNC_ENABLED=false");
     return;
   }
 
   const intervalMs = getSyncIntervalMs();
+  console.log("[vps-sync] starting; intervalMs=" + String(intervalMs));
   void runSyncSafely("startup");
 
   syncIntervalTimer = setInterval(() => {

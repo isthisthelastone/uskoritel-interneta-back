@@ -1,1 +1,1 @@
-export { requireAdminSecret, syncVpsConnectionsNow, testVpsSshConnection } from "./features/vps";
+export { requireAdminSecret, syncVpsConnectionsNow } from "./features/vps";
