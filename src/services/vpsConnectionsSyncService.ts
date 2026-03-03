@@ -477,29 +477,59 @@ function parseUserIpSetsFromLogs(
 
 function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number> {
   const userTrafficBytes = new Map<string, number>();
+  let pendingUserInternalUuid: string | null = null;
 
-  for (const line of statsOutput.split(/\r?\n/u)) {
-    const metricMatch = line.match(/user>>>([^>]+)>>>traffic>>>(uplink|downlink)/iu);
-    const valueMatch = line.match(/value:\s*(\d+)/iu);
+  for (const rawLine of statsOutput.split(/\r?\n/u)) {
+    const line = rawLine.trim();
 
-    if (metricMatch === null || valueMatch === null) {
+    if (line.length === 0) {
       continue;
     }
 
-    const userInternalUuid = metricMatch[1].toLowerCase();
+    const metricMatch = line.match(/user>>>(.*?)>>>traffic>>>(uplink|downlink)/iu);
 
-    if (!UUID_PATTERN.test(userInternalUuid)) {
+    if (metricMatch !== null) {
+      const uuidMatch = metricMatch[1].match(UUID_PATTERN);
+      pendingUserInternalUuid = uuidMatch === null ? null : uuidMatch[0].toLowerCase();
+    }
+
+    const valueMatch = line.match(/\bvalue:\s*(\d+)\b/iu);
+
+    if (valueMatch === null || pendingUserInternalUuid === null) {
       continue;
     }
 
     const value = Number.parseInt(valueMatch[1], 10);
 
     if (!Number.isFinite(value) || value < 0) {
+      pendingUserInternalUuid = null;
       continue;
     }
 
-    const current = userTrafficBytes.get(userInternalUuid) ?? 0;
-    userTrafficBytes.set(userInternalUuid, current + value);
+    const current = userTrafficBytes.get(pendingUserInternalUuid) ?? 0;
+    userTrafficBytes.set(pendingUserInternalUuid, current + value);
+    pendingUserInternalUuid = null;
+  }
+
+  if (userTrafficBytes.size === 0) {
+    const inlinePattern = /user>>>(.*?)>>>traffic>>>(?:uplink|downlink)[^0-9]*(\d+)/giu;
+    let inlineMatch = inlinePattern.exec(statsOutput);
+
+    while (inlineMatch !== null) {
+      const uuidMatch = inlineMatch[1].match(UUID_PATTERN);
+
+      if (uuidMatch !== null) {
+        const userInternalUuid = uuidMatch[0].toLowerCase();
+        const value = Number.parseInt(inlineMatch[2], 10);
+
+        if (Number.isFinite(value) && value >= 0) {
+          const current = userTrafficBytes.get(userInternalUuid) ?? 0;
+          userTrafficBytes.set(userInternalUuid, current + value);
+        }
+      }
+
+      inlineMatch = inlinePattern.exec(statsOutput);
+    }
   }
 
   return userTrafficBytes;
@@ -555,6 +585,13 @@ async function collectVpsMetrics(sshConfig: VpsSshConfig, ports: number[]): Prom
   const activeIps = parseDistinctIps(activeIpsResult.stdout);
   const userTrafficBytes = parseUserTrafficBytesFromStats(statsResult.stdout);
   const userIpSets = parseUserIpSetsFromLogs(logsResult.stdout, getCurrentWindowMinutes());
+
+  if (userTrafficBytes.size === 0 && statsResult.stdout.trim().length > 0) {
+    console.warn(
+      "[vps-sync] statsquery returned data but no user traffic rows were parsed; sample=" +
+        statsResult.stdout.slice(0, 300).replaceAll(/\s+/gu, " "),
+    );
+  }
 
   return {
     activeIps,
