@@ -41,6 +41,10 @@ interface PerVpsMetrics {
   userCurrentIps: Map<string, Set<string>>;
   userMonthIps: Map<string, Set<string>>;
   userTrafficBytes: Map<string, number>;
+  statsStdoutLength: number;
+  statsStderrLength: number;
+  statsStdoutSample: string;
+  statsStderrSample: string;
 }
 
 interface UserVpsTrafficMonthlyStateRow {
@@ -328,6 +332,20 @@ function getXrayLogTailLines(): number {
   return parsed;
 }
 
+function isVerboseSyncLoggingEnabled(): boolean {
+  return process.env.VPS_SYNC_VERBOSE?.trim().toLowerCase() === "true";
+}
+
+function toLogSample(value: string, maxLength = 600): string {
+  const compact = value.replaceAll(/\s+/gu, " ").trim();
+
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+
+  return compact.slice(0, maxLength) + "...";
+}
+
 function buildDistinctActiveIpCommand(ports: number[]): string {
   const ssPortsClause = ports.map((port) => "sport = :" + String(port)).join(" or ");
   const netstatPortsClause = ports
@@ -352,13 +370,13 @@ function buildStatsQueryCommand(statsServer: string): string {
     "if command -v xray >/dev/null 2>&1; then " +
     "xray api statsquery --server=" +
     shellQuote(statsServer) +
-    " 2>/dev/null || true; " +
+    " || echo '__XRAY_STATSQUERY_FAILED__'; " +
     "elif [ -x /usr/local/bin/xray ]; then " +
     "/usr/local/bin/xray api statsquery --server=" +
     shellQuote(statsServer) +
-    " 2>/dev/null || true; " +
+    " || echo '__XRAY_STATSQUERY_FAILED__'; " +
     "else " +
-    "true; " +
+    "echo '__XRAY_BINARY_NOT_FOUND__'; " +
     "fi"
   );
 }
@@ -586,18 +604,15 @@ async function collectVpsMetrics(sshConfig: VpsSshConfig, ports: number[]): Prom
   const userTrafficBytes = parseUserTrafficBytesFromStats(statsResult.stdout);
   const userIpSets = parseUserIpSetsFromLogs(logsResult.stdout, getCurrentWindowMinutes());
 
-  if (userTrafficBytes.size === 0 && statsResult.stdout.trim().length > 0) {
-    console.warn(
-      "[vps-sync] statsquery returned data but no user traffic rows were parsed; sample=" +
-        statsResult.stdout.slice(0, 300).replaceAll(/\s+/gu, " "),
-    );
-  }
-
   return {
     activeIps,
     userCurrentIps: userIpSets.userCurrentIps,
     userMonthIps: userIpSets.userMonthIps,
     userTrafficBytes,
+    statsStdoutLength: statsResult.stdout.length,
+    statsStderrLength: statsResult.stderr.length,
+    statsStdoutSample: toLogSample(statsResult.stdout),
+    statsStderrSample: toLogSample(statsResult.stderr),
   };
 }
 
@@ -610,6 +625,8 @@ async function computeCalendarMonthTrafficByUser(params: {
   perVpsUserTotals: Map<string, number>;
   now: Date;
 }): Promise<Map<string, number>> {
+  const verbose = isVerboseSyncLoggingEnabled();
+
   if (params.vpsInternalUuids.length === 0) {
     return new Map<string, number>();
   }
@@ -625,6 +642,15 @@ async function computeCalendarMonthTrafficByUser(params: {
 
   if (error !== null) {
     throw new Error("Failed to fetch user_vps_traffic_monthly_state rows: " + error.message);
+  }
+
+  if (verbose) {
+    console.log(
+      "[vps-sync][debug] monthly-state fetched:",
+      "rows=" + String(data.length),
+      "vpsCount=" + String(params.vpsInternalUuids.length),
+      "perVpsTotals=" + String(params.perVpsUserTotals.size),
+    );
   }
 
   const stateMap = new Map<string, UserVpsTrafficMonthlyStateRow>();
@@ -698,6 +724,14 @@ async function computeCalendarMonthTrafficByUser(params: {
     }
   }
 
+  if (verbose) {
+    console.log(
+      "[vps-sync][debug] monthly-state upsert:",
+      "rows=" + String(upsertRows.length),
+      "monthKey=" + currentMonthKey,
+    );
+  }
+
   const monthBytesByUser = new Map<string, number>();
 
   for (const row of stateMap.values()) {
@@ -707,6 +741,18 @@ async function computeCalendarMonthTrafficByUser(params: {
 
     const currentBytes = monthBytesByUser.get(row.userInternalUuid) ?? 0;
     monthBytesByUser.set(row.userInternalUuid, currentBytes + row.monthConsumedBytes);
+  }
+
+  if (verbose) {
+    const totalMonthBytes = Array.from(monthBytesByUser.values()).reduce(
+      (acc, value) => acc + value,
+      0,
+    );
+    console.log(
+      "[vps-sync][debug] month traffic aggregated:",
+      "users=" + String(monthBytesByUser.size),
+      "bytes=" + String(totalMonthBytes),
+    );
   }
 
   return monthBytesByUser;
@@ -731,6 +777,7 @@ async function dropAbusiveUserConnections(
 }
 
 export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncResult> {
+  const verbose = isVerboseSyncLoggingEnabled();
   const userIpLimit = getUserIpLimit();
   const syncNow = new Date();
   const supabase = getSupabaseAdminClient();
@@ -754,6 +801,26 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     const sshConfig = buildVpsSshConfig(row);
     const ports = extractVpsPorts(row.config_list);
     const metrics = await collectVpsMetrics(sshConfig, ports);
+    if (verbose || metrics.userTrafficBytes.size === 0) {
+      console.log(
+        "[vps-sync][debug] vps metrics:",
+        "internalUuid=" + row.internal_uuid,
+        "domain=" + row.domain,
+        "activeIps=" + String(metrics.activeIps.size),
+        "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
+        "statsStdoutLength=" + String(metrics.statsStdoutLength),
+        "statsStderrLength=" + String(metrics.statsStderrLength),
+      );
+
+      if (metrics.statsStdoutLength > 0) {
+        console.log("[vps-sync][debug] stats stdout sample:", metrics.statsStdoutSample);
+      }
+
+      if (metrics.statsStderrLength > 0) {
+        console.log("[vps-sync][debug] stats stderr sample:", metrics.statsStderrSample);
+      }
+    }
+
     const knownUserIds = parseUsersKvMapKeys(row.users_kv_map);
     const abusiveUsers: string[] = [];
 
@@ -856,6 +923,15 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     perVpsUserTotals,
     now: syncNow,
   });
+
+  if (verbose) {
+    console.log(
+      "[vps-sync][debug] sync totals:",
+      "aggregatedUsers=" + String(userAggregates.size),
+      "perVpsUserTotals=" + String(perVpsUserTotals.size),
+      "monthUsers=" + String(monthTrafficBytesByUser.size),
+    );
+  }
 
   for (const userId of monthTrafficBytesByUser.keys()) {
     if (!userAggregates.has(userId)) {
