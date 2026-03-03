@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_SSH_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
 export interface VpsSshConfig {
   host: string;
@@ -33,6 +34,26 @@ function parsePort(portRaw: string | undefined): number {
   }
 
   return parsedPort;
+}
+
+function getSshMaxBufferBytes(): number {
+  const rawMaxBuffer = process.env.VPS_SSH_MAX_BUFFER_BYTES;
+
+  if (rawMaxBuffer === undefined || rawMaxBuffer.trim().length === 0) {
+    return DEFAULT_SSH_MAX_BUFFER_BYTES;
+  }
+
+  const parsedMaxBuffer = Number.parseInt(rawMaxBuffer.trim(), 10);
+
+  if (!Number.isFinite(parsedMaxBuffer) || parsedMaxBuffer < 1024 * 1024) {
+    throw new Error("VPS_SSH_MAX_BUFFER_BYTES must be at least 1048576.");
+  }
+
+  if (parsedMaxBuffer > 256 * 1024 * 1024) {
+    throw new Error("VPS_SSH_MAX_BUFFER_BYTES must be at most 268435456.");
+  }
+
+  return parsedMaxBuffer;
 }
 
 async function ensureReadablePrivateKey(privateKeyPath: string | undefined): Promise<void> {
@@ -119,6 +140,7 @@ async function runSshCommandWithPassword(
   sshArgs: string[],
   password: string,
 ): Promise<VpsSshCommandResult> {
+  const maxBuffer = getSshMaxBufferBytes();
   const askPassDir = await mkdtemp(join(tmpdir(), "vps-ssh-askpass-"));
   const askPassPath = join(askPassDir, "askpass.sh");
 
@@ -132,7 +154,7 @@ async function runSshCommandWithPassword(
 
     const { stdout, stderr } = await execFileAsync("ssh", sshArgs, {
       timeout: 20_000,
-      maxBuffer: 1024 * 1024,
+      maxBuffer,
       env: {
         ...process.env,
         DISPLAY: "localhost:0",
@@ -161,6 +183,7 @@ async function runSshCommandWithConfig(
   }
 
   const normalizedConfig = await validateVpsSshConfig(config);
+  const maxBuffer = getSshMaxBufferBytes();
   const sshArgs = [...getBaseSshArgs(normalizedConfig)];
 
   if (normalizedConfig.password !== undefined) {
@@ -181,7 +204,7 @@ async function runSshCommandWithConfig(
 
   const { stdout, stderr } = await execFileAsync("ssh", [...sshArgs, command], {
     timeout: 20_000,
-    maxBuffer: 1024 * 1024,
+    maxBuffer,
   });
 
   return {

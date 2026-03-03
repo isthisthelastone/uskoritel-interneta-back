@@ -6,7 +6,7 @@ const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_USER_IP_LIMIT = 5;
 const DEFAULT_XRAY_STATS_SERVER = "127.0.0.1:10085";
 const DEFAULT_XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log";
-const DEFAULT_XRAY_LOG_TAIL_LINES = 50_000;
+const DEFAULT_XRAY_LOG_TAIL_LINES = 5_000;
 const DEFAULT_USER_IP_CURRENT_WINDOW_MINUTES = 20;
 const UUID_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
@@ -321,8 +321,8 @@ function getXrayLogTailLines(): number {
 
   const parsed = Number.parseInt(rawLines, 10);
 
-  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 1_000_000) {
-    throw new Error("XRAY_ACCESS_LOG_TAIL_LINES must be between 1 and 1000000.");
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 200_000) {
+    throw new Error("XRAY_ACCESS_LOG_TAIL_LINES must be between 1 and 200000.");
   }
 
   return parsed;
