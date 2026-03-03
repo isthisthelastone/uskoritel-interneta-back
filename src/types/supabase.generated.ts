@@ -186,6 +186,7 @@ export type Database = {
           country: string;
           country_emoji: string;
           created_at: string;
+          disabled: boolean | null;
           domain: string;
           internal_uuid: string;
           nickname: string | null;
@@ -202,6 +203,7 @@ export type Database = {
           country: string;
           country_emoji: string;
           created_at?: string;
+          disabled?: boolean | null;
           domain: string;
           internal_uuid?: string;
           nickname?: string | null;
@@ -218,6 +220,7 @@ export type Database = {
           country?: string;
           country_emoji?: string;
           created_at?: string;
+          disabled?: boolean | null;
           domain?: string;
           internal_uuid?: string;
           nickname?: string | null;

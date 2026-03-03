@@ -21,6 +21,7 @@ const vpsSyncRowSchema = z.object({
   optional_passsword: z.string().nullable(),
   config_list: z.array(z.string()),
   users_kv_map: z.unknown(),
+  disabled: z.boolean().nullable().optional(),
 });
 
 const userVpsTrafficMonthlyStateRowSchema = z.object({
@@ -45,6 +46,8 @@ interface PerVpsMetrics {
   statsStderrLength: number;
   statsStdoutSample: string;
   statsStderrSample: string;
+  statsCommandFailed: boolean;
+  statsBinaryNotFound: boolean;
 }
 
 interface UserVpsTrafficMonthlyStateRow {
@@ -371,8 +374,24 @@ function buildStatsQueryCommand(statsServer: string): string {
     "xray api statsquery --server=" +
     shellQuote(statsServer) +
     " || echo '__XRAY_STATSQUERY_FAILED__'; " +
+    "elif [ -x /usr/bin/xray ]; then " +
+    "/usr/bin/xray api statsquery --server=" +
+    shellQuote(statsServer) +
+    " || echo '__XRAY_STATSQUERY_FAILED__'; " +
     "elif [ -x /usr/local/bin/xray ]; then " +
     "/usr/local/bin/xray api statsquery --server=" +
+    shellQuote(statsServer) +
+    " || echo '__XRAY_STATSQUERY_FAILED__'; " +
+    "elif [ -x /usr/sbin/xray ]; then " +
+    "/usr/sbin/xray api statsquery --server=" +
+    shellQuote(statsServer) +
+    " || echo '__XRAY_STATSQUERY_FAILED__'; " +
+    "elif [ -x /usr/local/sbin/xray ]; then " +
+    "/usr/local/sbin/xray api statsquery --server=" +
+    shellQuote(statsServer) +
+    " || echo '__XRAY_STATSQUERY_FAILED__'; " +
+    "elif command -v xray-core >/dev/null 2>&1; then " +
+    "xray-core api statsquery --server=" +
     shellQuote(statsServer) +
     " || echo '__XRAY_STATSQUERY_FAILED__'; " +
     "else " +
@@ -601,6 +620,8 @@ async function collectVpsMetrics(sshConfig: VpsSshConfig, ports: number[]): Prom
   ]);
 
   const activeIps = parseDistinctIps(activeIpsResult.stdout);
+  const statsCommandFailed = statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
+  const statsBinaryNotFound = statsResult.stdout.includes("__XRAY_BINARY_NOT_FOUND__");
   const userTrafficBytes = parseUserTrafficBytesFromStats(statsResult.stdout);
   const userIpSets = parseUserIpSetsFromLogs(logsResult.stdout, getCurrentWindowMinutes());
 
@@ -613,6 +634,8 @@ async function collectVpsMetrics(sshConfig: VpsSshConfig, ports: number[]): Prom
     statsStderrLength: statsResult.stderr.length,
     statsStdoutSample: toLogSample(statsResult.stdout),
     statsStderrSample: toLogSample(statsResult.stderr),
+    statsCommandFailed,
+    statsBinaryNotFound,
   };
 }
 
@@ -784,14 +807,22 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   const { data, error } = await supabase
     .from("vps")
     .select(
-      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map",
+      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map, disabled",
     );
 
   if (error !== null) {
     throw new Error("Failed to fetch VPS rows for sync: " + error.message);
   }
 
-  const parsedRows = data.map((rawRow) => parseVpsSyncRow(rawRow));
+  const allRows = data.map((rawRow) => parseVpsSyncRow(rawRow));
+  const parsedRows = allRows.filter((row) => row.disabled !== true);
+
+  if (verbose) {
+    const skippedDisabled = allRows.length - parsedRows.length;
+    if (skippedDisabled > 0) {
+      console.log("[vps-sync][debug] skipped disabled VPS rows:", String(skippedDisabled));
+    }
+  }
   const userAggregates = new Map<string, UserAggregate>();
   const perVpsUserTotals = new Map<string, number>();
   const pendingAbuseEvents: Array<{ sshConfig: VpsSshConfig; event: AbuseEvent }> = [];
@@ -810,6 +841,8 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
         "statsStdoutLength=" + String(metrics.statsStdoutLength),
         "statsStderrLength=" + String(metrics.statsStderrLength),
+        "statsCommandFailed=" + String(metrics.statsCommandFailed),
+        "statsBinaryNotFound=" + String(metrics.statsBinaryNotFound),
       );
 
       if (metrics.statsStdoutLength > 0) {
@@ -834,8 +867,10 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     }
 
     for (const [userId, bytes] of metrics.userTrafficBytes.entries()) {
-      const stateKey = buildUserVpsTrafficStateKey(row.internal_uuid, userId);
-      perVpsUserTotals.set(stateKey, bytes);
+      if (!metrics.statsCommandFailed && !metrics.statsBinaryNotFound) {
+        const stateKey = buildUserVpsTrafficStateKey(row.internal_uuid, userId);
+        perVpsUserTotals.set(stateKey, bytes);
+      }
 
       if (!userAggregates.has(userId)) {
         userAggregates.set(userId, {
@@ -946,13 +981,22 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
   for (const [userId, aggregate] of userAggregates.entries()) {
     const monthTrafficBytes = monthTrafficBytesByUser.get(userId) ?? 0;
+    const userUpdatePayload: {
+      number_of_connections: number;
+      number_of_connections_last_month: number;
+      traffic_consumed_mb?: number;
+    } = {
+      number_of_connections: aggregate.currentIps.size,
+      number_of_connections_last_month: aggregate.monthIps.size,
+    };
+
+    if (monthTrafficBytesByUser.has(userId)) {
+      userUpdatePayload.traffic_consumed_mb = toRoundedMb(monthTrafficBytes);
+    }
+
     const { error: updateUserError } = await supabase
       .from("users")
-      .update({
-        traffic_consumed_mb: toRoundedMb(monthTrafficBytes),
-        number_of_connections: aggregate.currentIps.size,
-        number_of_connections_last_month: aggregate.monthIps.size,
-      })
+      .update(userUpdatePayload)
       .eq("internal_uuid", userId);
 
     if (updateUserError !== null) {

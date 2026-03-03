@@ -27,6 +27,7 @@ const vpsIssueConfigRowSchema = vpsConfigRowSchema.extend({
   password: z.string().min(1),
   ssh_key: z.string().min(1),
   optional_passsword: z.string().nullable(),
+  disabled: z.boolean().nullable().optional(),
 });
 
 const vpsUserCredentialEntrySchema = z.object({
@@ -265,6 +266,7 @@ export async function listUniqueVpsCountries(): Promise<VpsCountryOption[]> {
   const { data, error } = await supabase
     .from("vps")
     .select("country, country_emoji")
+    .or("disabled.is.null,disabled.eq.false")
     .order("country", { ascending: true });
 
   if (error !== null) {
@@ -294,6 +296,7 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
     .from("vps")
     .select("internal_uuid, nickname, country, country_emoji")
     .eq("country", country)
+    .or("disabled.is.null,disabled.eq.false")
     .order("nickname", { ascending: true });
 
   if (error !== null) {
@@ -319,6 +322,7 @@ export async function getVpsConfigByInternalUuid(
     .from("vps")
     .select("nickname, config_list, users_kv_map")
     .eq("internal_uuid", internalUuid)
+    .or("disabled.is.null,disabled.eq.false")
     .maybeSingle();
 
   if (error !== null) {
@@ -344,7 +348,7 @@ export async function issueOrGetUserVpsConfigUrls(
   const { data, error } = await supabase
     .from("vps")
     .select(
-      "nickname, config_list, users_kv_map, api_address, password, ssh_key, optional_passsword",
+      "nickname, config_list, users_kv_map, api_address, password, ssh_key, optional_passsword, disabled",
     )
     .eq("internal_uuid", internalUuid)
     .maybeSingle();
@@ -358,6 +362,11 @@ export async function issueOrGetUserVpsConfigUrls(
   }
 
   const row = parseVpsIssueConfigRow(data);
+
+  if (row.disabled === true) {
+    return null;
+  }
+
   const usersKvMap = parseUsersKvMap(row.users_kv_map);
   const existingEntry = usersKvMap[userInternalUuid];
   const nickname = row.nickname ?? "VPS";
