@@ -28,11 +28,27 @@ export type CryptoBotInvoiceCheckStatus =
   | "paid"
   | "already_paid"
   | "expired"
+  | "cancelled"
   | "failed";
 
 let syncIntervalTimer: NodeJS.Timeout | null = null;
 let isSyncRunning = false;
 let isSyncDisabledBySchemaError = false;
+const cryptoBotSyncDebugLogsEnabled =
+  process.env.CRYPTO_BOT_DEBUG_LOGS?.trim().toLowerCase() === "true";
+
+function logCryptoBotSyncDebug(event: string, data?: Record<string, unknown>): void {
+  if (!cryptoBotSyncDebugLogsEnabled) {
+    return;
+  }
+
+  if (data === undefined) {
+    console.log("[cryptobot-sync][debug]", event);
+    return;
+  }
+
+  console.log("[cryptobot-sync][debug]", event, JSON.stringify(data));
+}
 
 function getSyncIntervalMs(): number {
   const rawInterval = process.env.CRYPTO_BOT_SYNC_INTERVAL_MS;
@@ -59,7 +75,9 @@ function chunkArray<T>(items: T[], size: number): T[][] {
   return chunks;
 }
 
-function normalizeRemoteStatus(status: string): "active" | "paid" | "expired" | "failed" {
+function normalizeRemoteStatus(
+  status: string,
+): "active" | "paid" | "expired" | "cancelled" | "failed" {
   if (status === "active") {
     return "active";
   }
@@ -70,6 +88,10 @@ function normalizeRemoteStatus(status: string): "active" | "paid" | "expired" | 
 
   if (status === "expired") {
     return "expired";
+  }
+
+  if (status === "cancelled" || status === "canceled") {
+    return "cancelled";
   }
 
   return "failed";
@@ -216,6 +238,15 @@ async function syncCryptoBotInvoices(notifyUser: boolean): Promise<CryptoBotSync
       continue;
     }
 
+    if (normalizedStatus === "cancelled") {
+      await updateCryptoBotInvoiceStatus({
+        internalUuid: localInvoice.internalUuid,
+        status: "cancelled",
+        rawPayload: remoteInvoice.raw,
+      });
+      continue;
+    }
+
     if (normalizedStatus === "failed") {
       await updateCryptoBotInvoiceStatus({
         internalUuid: localInvoice.internalUuid,
@@ -298,31 +329,68 @@ export async function checkCryptoBotInvoiceByIdForUser(params: {
   tgId: string;
   invoiceId: number;
 }): Promise<CryptoBotInvoiceCheckStatus> {
+  logCryptoBotSyncDebug("manual_check_start", {
+    tgId: params.tgId,
+    invoiceId: params.invoiceId,
+  });
   const invoice = await getCryptoBotInvoiceByInvoiceId(params.invoiceId);
 
   if (invoice === null) {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "not_found",
+      invoiceId: params.invoiceId,
+    });
     return "not_found";
   }
 
   if (invoice.tgId !== params.tgId) {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "forbidden",
+      invoiceId: params.invoiceId,
+      invoiceTgId: invoice.tgId,
+    });
     return "forbidden";
   }
 
   if (invoice.status === "paid") {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "already_paid",
+      invoiceId: invoice.invoiceId,
+    });
     return "already_paid";
   }
 
   if (invoice.status === "expired") {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "expired",
+      invoiceId: invoice.invoiceId,
+    });
     return "expired";
   }
 
+  if (invoice.status === "cancelled") {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "cancelled",
+      invoiceId: invoice.invoiceId,
+    });
+    return "cancelled";
+  }
+
   if (invoice.status === "failed") {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "failed",
+      invoiceId: invoice.invoiceId,
+    });
     return "failed";
   }
 
   const remoteInvoices = await getRemoteCryptoBotInvoicesByIds([invoice.invoiceId]);
 
   if (remoteInvoices.length === 0) {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "pending",
+      invoiceId: invoice.invoiceId,
+    });
     return "pending";
   }
 
@@ -331,6 +399,10 @@ export async function checkCryptoBotInvoiceByIdForUser(params: {
   const normalizedStatus = normalizeRemoteStatus(remoteInvoice.status);
 
   if (normalizedStatus === "active") {
+    logCryptoBotSyncDebug("manual_check_result", {
+      status: "pending",
+      invoiceId: invoice.invoiceId,
+    });
     return "pending";
   }
 
@@ -341,6 +413,15 @@ export async function checkCryptoBotInvoiceByIdForUser(params: {
       rawPayload: remoteInvoice.raw,
     });
     return "expired";
+  }
+
+  if (normalizedStatus === "cancelled") {
+    await updateCryptoBotInvoiceStatus({
+      internalUuid: invoice.internalUuid,
+      status: "cancelled",
+      rawPayload: remoteInvoice.raw,
+    });
+    return "cancelled";
   }
 
   if (normalizedStatus === "failed") {
@@ -354,6 +435,7 @@ export async function checkCryptoBotInvoiceByIdForUser(params: {
   }
 
   await applyPaidInvoice(invoice, remoteInvoice, true);
+  logCryptoBotSyncDebug("manual_check_result", { status: "paid", invoiceId: invoice.invoiceId });
   return "paid";
 }
 

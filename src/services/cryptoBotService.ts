@@ -29,7 +29,13 @@ const cryptoBotDbInvoiceSchema = z.object({
   bot_invoice_url: z.string(),
 });
 
-export type CryptoBotInvoiceStatus = "active" | "processing" | "paid" | "expired" | "failed";
+export type CryptoBotInvoiceStatus =
+  | "active"
+  | "processing"
+  | "paid"
+  | "expired"
+  | "failed"
+  | "cancelled";
 
 export interface CryptoBotInvoiceRecord {
   internalUuid: string;
@@ -52,6 +58,22 @@ interface CreateCryptoBotSubscriptionInvoiceInput {
   tgId: string;
   months: number;
   amountUsd: number;
+}
+
+const cryptoBotDebugLogsEnabled =
+  process.env.CRYPTO_BOT_DEBUG_LOGS?.trim().toLowerCase() === "true";
+
+function logCryptoBotDebug(event: string, data?: Record<string, unknown>): void {
+  if (!cryptoBotDebugLogsEnabled) {
+    return;
+  }
+
+  if (data === undefined) {
+    console.log("[cryptobot-debug]", event);
+    return;
+  }
+
+  console.log("[cryptobot-debug]", event, JSON.stringify(data));
 }
 
 function getCryptoBotApiToken(): string {
@@ -95,6 +117,10 @@ function normalizeStatus(rawStatus: string): CryptoBotInvoiceStatus {
     return "expired";
   }
 
+  if (rawStatus === "cancelled" || rawStatus === "canceled") {
+    return "cancelled";
+  }
+
   return "failed";
 }
 
@@ -116,6 +142,7 @@ async function postCryptoBotApi(
   method: string,
   payload: Record<string, unknown>,
 ): Promise<unknown> {
+  logCryptoBotDebug("api_request", { method, payloadKeys: Object.keys(payload) });
   const response = await fetch(getCryptoBotApiBaseUrl() + "/" + method, {
     method: "POST",
     headers: {
@@ -127,6 +154,12 @@ async function postCryptoBotApi(
 
   const responseText = await response.text();
   const parsedResponse = responseText.length > 0 ? parseJsonSafe(responseText) : null;
+  logCryptoBotDebug("api_response", {
+    method,
+    status: response.status,
+    ok: response.ok,
+    bodySample: responseText.slice(0, 300),
+  });
 
   if (!response.ok) {
     throw new Error("CryptoBot API HTTP error " + String(response.status) + ": " + responseText);
@@ -163,6 +196,11 @@ export async function createCryptoBotSubscriptionInvoice(
   }
 
   const amountUsdRounded = Math.round(input.amountUsd * 100) / 100;
+  logCryptoBotDebug("create_invoice_start", {
+    tgId: input.tgId,
+    months: input.months,
+    amountUsd: amountUsdRounded,
+  });
   const result = await postCryptoBotApi("createInvoice", {
     currency_type: "fiat",
     fiat: "USD",
@@ -199,6 +237,12 @@ export async function createCryptoBotSubscriptionInvoice(
     throw new Error("Failed to save CryptoBot invoice to DB: " + error.message);
   }
 
+  logCryptoBotDebug("create_invoice_saved", {
+    tgId: input.tgId,
+    invoiceId: parsedInvoice.invoice_id,
+    status: normalizeStatus(parsedInvoice.status),
+  });
+
   return {
     invoiceId: parsedInvoice.invoice_id,
     botInvoiceUrl: parsedInvoice.bot_invoice_url,
@@ -220,6 +264,32 @@ export async function listActiveCryptoBotInvoices(limit = 100): Promise<CryptoBo
   }
 
   return data.map((rawRow) => mapDbInvoice(rawRow));
+}
+
+export async function getActiveCryptoBotInvoiceByTgId(
+  tgId: string,
+): Promise<CryptoBotInvoiceRecord | null> {
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("crypto_bot_invoices")
+    .select("internal_uuid, invoice_id, tg_id, months, amount_usd, status, bot_invoice_url")
+    .eq("tg_id", tgId)
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error !== null) {
+    throw new Error("Failed to fetch active CryptoBot invoice by tg_id: " + error.message);
+  }
+
+  if (data === null) {
+    logCryptoBotDebug("active_invoice_lookup", { tgId, found: false });
+    return null;
+  }
+
+  logCryptoBotDebug("active_invoice_lookup", { tgId, found: true, invoiceId: data.invoice_id });
+  return mapDbInvoice(data);
 }
 
 export async function getCryptoBotInvoiceByInvoiceId(
@@ -324,4 +394,11 @@ export async function getRemoteCryptoBotInvoicesByIds(
     botInvoiceUrl: invoice.bot_invoice_url,
     raw: invoice,
   }));
+}
+
+export async function cancelRemoteCryptoBotInvoice(invoiceId: number): Promise<unknown> {
+  logCryptoBotDebug("cancel_invoice_start", { invoiceId });
+  return postCryptoBotApi("deleteInvoice", {
+    invoice_id: invoiceId,
+  });
 }

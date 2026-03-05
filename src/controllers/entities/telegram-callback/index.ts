@@ -59,7 +59,10 @@ export type PurchaseAction =
       method: z.infer<typeof purchaseMethodSchema>;
       months: z.infer<typeof subscriptionPlanMonthsSchema>;
     }
-  | { kind: "crypto_check"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> };
+  | { kind: "crypto_check"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> }
+  | { kind: "crypto_cancel"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> }
+  | { kind: "crypto_cancel_confirm"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> }
+  | { kind: "crypto_cancel_abort"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> };
 export type SubscriptionInvoicePayload = z.infer<typeof invoicePayloadSchema>;
 
 export function getMenuKeyFromCallbackData(data: string | undefined): TelegramMenuKey | null {
@@ -92,6 +95,48 @@ export function getPurchaseActionFromCallbackData(data: string | undefined): Pur
 
     return {
       kind: "crypto_check",
+      invoiceId: parsedInvoiceId.data,
+    };
+  }
+
+  if (data.startsWith("buy:crypto_cancel_confirm:")) {
+    const invoiceIdRaw = Number.parseInt(data.slice("buy:crypto_cancel_confirm:".length), 10);
+    const parsedInvoiceId = cryptoBotInvoiceIdSchema.safeParse(invoiceIdRaw);
+
+    if (!parsedInvoiceId.success) {
+      return null;
+    }
+
+    return {
+      kind: "crypto_cancel_confirm",
+      invoiceId: parsedInvoiceId.data,
+    };
+  }
+
+  if (data.startsWith("buy:crypto_cancel_abort:")) {
+    const invoiceIdRaw = Number.parseInt(data.slice("buy:crypto_cancel_abort:".length), 10);
+    const parsedInvoiceId = cryptoBotInvoiceIdSchema.safeParse(invoiceIdRaw);
+
+    if (!parsedInvoiceId.success) {
+      return null;
+    }
+
+    return {
+      kind: "crypto_cancel_abort",
+      invoiceId: parsedInvoiceId.data,
+    };
+  }
+
+  if (data.startsWith("buy:crypto_cancel:")) {
+    const invoiceIdRaw = Number.parseInt(data.slice("buy:crypto_cancel:".length), 10);
+    const parsedInvoiceId = cryptoBotInvoiceIdSchema.safeParse(invoiceIdRaw);
+
+    if (!parsedInvoiceId.success) {
+      return null;
+    }
+
+    return {
+      kind: "crypto_cancel",
       invoiceId: parsedInvoiceId.data,
     };
   }

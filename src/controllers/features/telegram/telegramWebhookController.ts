@@ -28,7 +28,13 @@ import {
   listSubscriptionPrices,
 } from "../../../services/subscriptionPricingService";
 import { checkCryptoBotInvoiceByIdForUser } from "../../../services/cryptoBotPaymentsSyncService";
-import { createCryptoBotSubscriptionInvoice } from "../../../services/cryptoBotService";
+import {
+  cancelRemoteCryptoBotInvoice,
+  createCryptoBotSubscriptionInvoice,
+  getActiveCryptoBotInvoiceByTgId,
+  getCryptoBotInvoiceByInvoiceId,
+  updateCryptoBotInvoiceStatus,
+} from "../../../services/cryptoBotService";
 import {
   issueOrGetUserVpsConfigUrls,
   listUniqueVpsCountries,
@@ -123,6 +129,20 @@ interface ClearQueueTask {
 
 const clearQueueTasks: ClearQueueTask[] = [];
 let isClearQueueWorkerRunning = false;
+const telegramDebugLogsEnabled = process.env.TELEGRAM_DEBUG_LOGS?.trim().toLowerCase() === "true";
+
+function logTelegramDebug(event: string, data?: Record<string, unknown>): void {
+  if (!telegramDebugLogsEnabled) {
+    return;
+  }
+
+  if (data === undefined) {
+    console.log("[telegram-debug]", event);
+    return;
+  }
+
+  console.log("[telegram-debug]", event, JSON.stringify(data));
+}
 
 function startPendingGiftRecipientInput(tgId: string): void {
   pendingGiftRecipientInputByTgId.set(tgId, Date.now());
@@ -241,6 +261,14 @@ function formatUsdAmount(value: number): string {
     .replace(/(\.\d)0$/u, "$1");
 }
 
+function buildCryptoBotActiveInvoiceKeyboard(invoiceId: number, botInvoiceUrl: string) {
+  return [
+    [{ text: "💳 Перейти к CryptoBot", url: botInvoiceUrl }],
+    [{ text: "✅ Проверить оплату", callbackData: "buy:crypto_check:" + String(invoiceId) }],
+    [{ text: "❌ Отменить", callbackData: "buy:crypto_cancel:" + String(invoiceId) }],
+  ];
+}
+
 async function resolveSubscriptionPurchaseAmount(
   tgId: string,
   months: number,
@@ -269,6 +297,11 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   const parsedUpdate = telegramUpdateSchema.safeParse(req.body);
 
   if (!parsedUpdate.success) {
+    logTelegramDebug("invalid_update_payload", {
+      issues: parsedUpdate.error.issues
+        .slice(0, 5)
+        .map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+    });
     res.status(200).json({
       ok: true,
       processed: false,
@@ -280,6 +313,11 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   const preCheckoutQuery = parsedUpdate.data.pre_checkout_query;
 
   if (preCheckoutQuery !== undefined) {
+    logTelegramDebug("pre_checkout_received", {
+      fromId: preCheckoutQuery.from.id,
+      currency: preCheckoutQuery.currency,
+      totalAmount: preCheckoutQuery.total_amount,
+    });
     const invoicePayload = parseSubscriptionInvoicePayload(preCheckoutQuery.invoice_payload);
     let isValidPayload = false;
 
@@ -342,6 +380,15 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const callbackChatId = callbackQuery.message?.chat.id;
     const callbackMessageId = callbackQuery.message?.message_id;
     const callbackChatType = callbackQuery.message?.chat.type;
+    logTelegramDebug("callback_received", {
+      callbackId: callbackQuery.id,
+      fromId: callbackQuery.from.id,
+      chatId: callbackChatId ?? null,
+      messageId: callbackMessageId ?? null,
+      data: callbackQuery.data ?? null,
+      menuKey: menuKey ?? null,
+      purchaseKind: purchaseAction?.kind ?? null,
+    });
 
     if (
       callbackChatId !== undefined &&
@@ -365,7 +412,13 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             ? "Opening payment..."
             : purchaseAction.kind === "crypto_check"
               ? "Checking payment..."
-              : "Opening section..."
+              : purchaseAction.kind === "crypto_cancel"
+                ? "Opening cancel confirmation..."
+                : purchaseAction.kind === "crypto_cancel_confirm"
+                  ? "Cancelling invoice..."
+                  : purchaseAction.kind === "crypto_cancel_abort"
+                    ? "Continuing payment..."
+                    : "Opening section..."
           : faqAction !== null
             ? "Opening answer..."
             : referalsAction !== null
@@ -463,6 +516,43 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           let planOptionsResult: Awaited<ReturnType<typeof sendTelegramInlineMenuMessage>>;
 
           try {
+            if (purchaseAction.method === "crypto_bot") {
+              const activeInvoice = await getActiveCryptoBotInvoiceByTgId(
+                String(callbackQuery.from.id),
+              );
+
+              if (activeInvoice !== null) {
+                logTelegramDebug("crypto_active_invoice_blocked_from_method", {
+                  tgId: String(callbackQuery.from.id),
+                  invoiceId: activeInvoice.invoiceId,
+                });
+                planOptionsResult = await sendTelegramInlineMenuMessage({
+                  chatId: callbackChatId,
+                  text: "У вас есть активный иновойс в CryptoBot. Оплатите или отмените его:",
+                  inlineKeyboardRows: buildCryptoBotActiveInvoiceKeyboard(
+                    activeInvoice.invoiceId,
+                    activeInvoice.botInvoiceUrl,
+                  ),
+                });
+
+                if (!planOptionsResult.ok) {
+                  console.error(
+                    "Failed to send active CryptoBot invoice from method screen:",
+                    planOptionsResult.statusCode,
+                    planOptionsResult.error,
+                  );
+                }
+
+                res.status(200).json({
+                  ok: true,
+                  processed: true,
+                  callbackHandled: true,
+                  sent: planOptionsResult.ok,
+                });
+                return;
+              }
+            }
+
             const prices = await listSubscriptionPrices();
             const payerUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
             const discountPercent =
@@ -555,6 +645,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       }
 
       if (purchaseAction.kind === "crypto_check") {
+        logTelegramDebug("crypto_check_start", {
+          tgId: String(callbackQuery.from.id),
+          invoiceId: purchaseAction.invoiceId,
+        });
         let checkStatus: Awaited<ReturnType<typeof checkCryptoBotInvoiceByIdForUser>>;
 
         try {
@@ -595,11 +689,18 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                 ? "⌛ Оплата пока не подтверждена. Нажмите Проверить оплату через 10-20 секунд."
                 : checkStatus === "expired"
                   ? "⛔ Счет истек. Сформируйте новый платеж."
-                  : checkStatus === "forbidden"
-                    ? "⛔ Этот счет принадлежит другому пользователю."
-                    : checkStatus === "not_found"
-                      ? "Счет не найден."
-                      : "Ошибка обработки счета. Обратитесь в поддержку.";
+                  : checkStatus === "cancelled"
+                    ? "⛔ Счет отменен. Сформируйте новый платеж."
+                    : checkStatus === "forbidden"
+                      ? "⛔ Этот счет принадлежит другому пользователю."
+                      : checkStatus === "not_found"
+                        ? "Счет не найден."
+                        : "Ошибка обработки счета. Обратитесь в поддержку.";
+        logTelegramDebug("crypto_check_result", {
+          tgId: String(callbackQuery.from.id),
+          invoiceId: purchaseAction.invoiceId,
+          status: checkStatus,
+        });
 
         const checkResult = await sendTelegramTextMessage({
           chatId: callbackChatId,
@@ -621,6 +722,240 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           sent: checkResult.ok,
         });
         return;
+      }
+
+      if (purchaseAction.kind === "crypto_cancel") {
+        logTelegramDebug("crypto_cancel_prompt", {
+          tgId: String(callbackQuery.from.id),
+          invoiceId: purchaseAction.invoiceId,
+        });
+        const cancelConfirmResult = await sendTelegramInlineMenuMessage({
+          chatId: callbackChatId,
+          text: "Вы уверены, что хотите отменить платеж?",
+          inlineKeyboardRows: [
+            [
+              {
+                text: "✅ Да, отменить",
+                callbackData: "buy:crypto_cancel_confirm:" + String(purchaseAction.invoiceId),
+              },
+              {
+                text: "↩️ Нет, продолжить платеж",
+                callbackData: "buy:crypto_cancel_abort:" + String(purchaseAction.invoiceId),
+              },
+            ],
+          ],
+        });
+
+        if (!cancelConfirmResult.ok) {
+          console.error(
+            "Failed to send CryptoBot cancel confirmation message:",
+            cancelConfirmResult.statusCode,
+            cancelConfirmResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: cancelConfirmResult.ok,
+        });
+        return;
+      }
+
+      if (purchaseAction.kind === "crypto_cancel_abort") {
+        logTelegramDebug("crypto_cancel_abort", {
+          tgId: String(callbackQuery.from.id),
+          invoiceId: purchaseAction.invoiceId,
+        });
+        const invoice = await getCryptoBotInvoiceByInvoiceId(purchaseAction.invoiceId);
+
+        if (invoice === null || invoice.tgId !== String(callbackQuery.from.id)) {
+          const notFoundResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Счет не найден.",
+          });
+
+          if (!notFoundResult.ok) {
+            console.error(
+              "Failed to send CryptoBot invoice not found message:",
+              notFoundResult.statusCode,
+              notFoundResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: notFoundResult.ok,
+          });
+          return;
+        }
+
+        const continueResult = await sendTelegramInlineMenuMessage({
+          chatId: callbackChatId,
+          text: "Платеж не отменен. Продолжайте оплату:",
+          inlineKeyboardRows: buildCryptoBotActiveInvoiceKeyboard(
+            invoice.invoiceId,
+            invoice.botInvoiceUrl,
+          ),
+        });
+
+        if (!continueResult.ok) {
+          console.error(
+            "Failed to send CryptoBot continue payment message:",
+            continueResult.statusCode,
+            continueResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: continueResult.ok,
+        });
+        return;
+      }
+
+      if (purchaseAction.kind === "crypto_cancel_confirm") {
+        logTelegramDebug("crypto_cancel_confirm", {
+          tgId: String(callbackQuery.from.id),
+          invoiceId: purchaseAction.invoiceId,
+        });
+        const invoice = await getCryptoBotInvoiceByInvoiceId(purchaseAction.invoiceId);
+
+        if (invoice === null) {
+          const notFoundResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Счет не найден.",
+          });
+
+          if (!notFoundResult.ok) {
+            console.error(
+              "Failed to send missing CryptoBot invoice message:",
+              notFoundResult.statusCode,
+              notFoundResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: notFoundResult.ok,
+          });
+          return;
+        }
+
+        if (invoice.tgId !== String(callbackQuery.from.id)) {
+          const forbiddenResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "⛔ Этот счет принадлежит другому пользователю.",
+          });
+
+          if (!forbiddenResult.ok) {
+            console.error(
+              "Failed to send forbidden CryptoBot invoice message:",
+              forbiddenResult.statusCode,
+              forbiddenResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: forbiddenResult.ok,
+          });
+          return;
+        }
+
+        if (invoice.status !== "active") {
+          const inactiveResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text:
+              invoice.status === "paid"
+                ? "✅ Этот счет уже оплачен."
+                : invoice.status === "cancelled"
+                  ? "⛔ Этот счет уже отменен."
+                  : "Счет уже неактивен.",
+          });
+
+          if (!inactiveResult.ok) {
+            console.error(
+              "Failed to send inactive CryptoBot invoice message:",
+              inactiveResult.statusCode,
+              inactiveResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: inactiveResult.ok,
+          });
+          return;
+        }
+
+        try {
+          const cancelResultPayload = await cancelRemoteCryptoBotInvoice(invoice.invoiceId);
+          await updateCryptoBotInvoiceStatus({
+            internalUuid: invoice.internalUuid,
+            status: "cancelled",
+            rawPayload: cancelResultPayload,
+            lastError: null,
+          });
+          logTelegramDebug("crypto_cancelled", {
+            tgId: String(callbackQuery.from.id),
+            invoiceId: invoice.invoiceId,
+          });
+
+          const cancelledResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "✅ Платеж отменен.",
+          });
+
+          if (!cancelledResult.ok) {
+            console.error(
+              "Failed to send CryptoBot cancelled message:",
+              cancelledResult.statusCode,
+              cancelledResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: cancelledResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to cancel CryptoBot invoice:", error);
+          const cancelFailedResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Не удалось отменить счет. Попробуйте позже.",
+          });
+
+          if (!cancelFailedResult.ok) {
+            console.error(
+              "Failed to send CryptoBot cancel failure message:",
+              cancelFailedResult.statusCode,
+              cancelFailedResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: cancelFailedResult.ok,
+          });
+          return;
+        }
       }
 
       let selectedPurchaseAmount: Awaited<ReturnType<typeof resolveSubscriptionPurchaseAmount>>;
@@ -708,8 +1043,49 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
       if (purchaseAction.method === "crypto_bot") {
         try {
+          const activeInvoice = await getActiveCryptoBotInvoiceByTgId(
+            String(callbackQuery.from.id),
+          );
+
+          if (activeInvoice !== null) {
+            logTelegramDebug("crypto_active_invoice_blocked_from_plan", {
+              tgId: String(callbackQuery.from.id),
+              invoiceId: activeInvoice.invoiceId,
+            });
+            const activeInvoiceResult = await sendTelegramInlineMenuMessage({
+              chatId: callbackChatId,
+              text: "У вас есть активный иновойс в CryptoBot. Оплатите или отмените его:",
+              inlineKeyboardRows: buildCryptoBotActiveInvoiceKeyboard(
+                activeInvoice.invoiceId,
+                activeInvoice.botInvoiceUrl,
+              ),
+            });
+
+            if (!activeInvoiceResult.ok) {
+              console.error(
+                "Failed to send active CryptoBot invoice notice:",
+                activeInvoiceResult.statusCode,
+                activeInvoiceResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              invoiceSent: activeInvoiceResult.ok,
+            });
+            return;
+          }
+
           const cryptoInvoice = await createCryptoBotSubscriptionInvoice({
             tgId: String(callbackQuery.from.id),
+            months: purchaseAction.months,
+            amountUsd: selectedPurchaseAmount.usdAmount,
+          });
+          logTelegramDebug("crypto_invoice_created", {
+            tgId: String(callbackQuery.from.id),
+            invoiceId: cryptoInvoice.invoiceId,
             months: purchaseAction.months,
             amountUsd: selectedPurchaseAmount.usdAmount,
           });
@@ -723,20 +1099,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
               "Поддерживаются любые доступные криптовалюты в CryptoBot.",
               "После оплаты нажмите кнопку проверки.",
             ].join("\n"),
-            inlineKeyboardRows: [
-              [
-                {
-                  text: "💳 Оплатить через CryptoBot",
-                  url: cryptoInvoice.botInvoiceUrl,
-                },
-              ],
-              [
-                {
-                  text: "✅ Проверить оплату",
-                  callbackData: "buy:crypto_check:" + String(cryptoInvoice.invoiceId),
-                },
-              ],
-            ],
+            inlineKeyboardRows: buildCryptoBotActiveInvoiceKeyboard(
+              cryptoInvoice.invoiceId,
+              cryptoInvoice.botInvoiceUrl,
+            ),
           });
 
           if (!cryptoInvoiceResult.ok) {
