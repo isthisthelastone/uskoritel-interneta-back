@@ -12,12 +12,13 @@ const telegramMenuKeySchema = z.enum([
   "countries",
 ]);
 
-const purchaseMethodSchema = z.enum(["tg_stars", "tbd_1", "tbd_2"]);
+const purchaseMethodSchema = z.enum(["tg_stars", "crypto_bot", "tbd_1", "tbd_2"]);
 const faqActionSchema = z.enum(["email", "rules"]);
 const referalsActionSchema = z.enum(["prolong"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
 export const subscriptionPlanMonthsSchema = z.number().int().positive();
 const giftIndexSchema = z.number().int().nonnegative();
+const cryptoBotInvoiceIdSchema = z.number().int().positive();
 const tgIdSchema = z.string().regex(/^[1-9]\d{0,19}$/u);
 const invoicePayloadSchema = z.discriminatedUnion("action", [
   z.object({
@@ -53,7 +54,12 @@ export type CountriesAction =
 export type PurchaseAction =
   | { kind: "open" }
   | { kind: "method"; method: z.infer<typeof purchaseMethodSchema> }
-  | { kind: "plan"; months: z.infer<typeof subscriptionPlanMonthsSchema> };
+  | {
+      kind: "plan";
+      method: z.infer<typeof purchaseMethodSchema>;
+      months: z.infer<typeof subscriptionPlanMonthsSchema>;
+    }
+  | { kind: "crypto_check"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> };
 export type SubscriptionInvoicePayload = z.infer<typeof invoicePayloadSchema>;
 
 export function getMenuKeyFromCallbackData(data: string | undefined): TelegramMenuKey | null {
@@ -76,6 +82,20 @@ export function getPurchaseActionFromCallbackData(data: string | undefined): Pur
     return null;
   }
 
+  if (data.startsWith("buy:crypto_check:")) {
+    const invoiceIdRaw = Number.parseInt(data.slice("buy:crypto_check:".length), 10);
+    const parsedInvoiceId = cryptoBotInvoiceIdSchema.safeParse(invoiceIdRaw);
+
+    if (!parsedInvoiceId.success) {
+      return null;
+    }
+
+    return {
+      kind: "crypto_check",
+      invoiceId: parsedInvoiceId.data,
+    };
+  }
+
   if (data === "buy:open") {
     return { kind: "open" };
   }
@@ -95,15 +115,31 @@ export function getPurchaseActionFromCallbackData(data: string | undefined): Pur
   }
 
   if (data.startsWith("buy:plan:")) {
-    const monthsRaw = Number.parseInt(data.slice("buy:plan:".length), 10);
+    const planRaw = data.slice("buy:plan:".length);
+    const planParts = planRaw.split(":");
+    let methodRaw = "";
+    let monthsRaw = NaN;
+
+    if (planParts.length === 1) {
+      methodRaw = "tg_stars";
+      monthsRaw = Number.parseInt(planParts[0], 10);
+    } else if (planParts.length === 2) {
+      methodRaw = planParts[0];
+      monthsRaw = Number.parseInt(planParts[1], 10);
+    } else {
+      return null;
+    }
+
+    const parsedMethod = purchaseMethodSchema.safeParse(methodRaw);
     const parsedMonths = subscriptionPlanMonthsSchema.safeParse(monthsRaw);
 
-    if (!parsedMonths.success) {
+    if (!parsedMethod.success || !parsedMonths.success) {
       return null;
     }
 
     return {
       kind: "plan",
+      method: parsedMethod.data,
       months: parsedMonths.data,
     };
   }

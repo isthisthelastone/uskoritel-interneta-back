@@ -1,4 +1,5 @@
 import { sendTelegramInlineMenuMessage } from "../../../services/telegramBotService";
+import type { TelegramInlineButton } from "../../../services/telegramMenuService";
 
 export function hasAccessToServers(
   subscriptionStatus: "live" | "ending" | null,
@@ -32,14 +33,17 @@ export function buildSubscriptionStatusTextFromDb(
   return "🔴 Статус подписки: Отсутствует";
 }
 
+export function getSubscriptionPaymentMethodInlineKeyboardRows(): TelegramInlineButton[][] {
+  return [
+    [{ text: "⭐ Telegram Stars", callbackData: "buy:method:tg_stars" }],
+    [{ text: "💎 CryptoBot", callbackData: "buy:method:crypto_bot" }],
+  ];
+}
+
 export async function sendSubscriptionRequiredForServersMessage(chatId: number) {
   return sendTelegramInlineMenuMessage({
     chatId,
     text: "ЧТОБЫ ПОСМОТРЕТЬ СЕРВЕРА НУЖНО КУПИТЬ ПОДПИСКУ, ВОТ КАК ЭТО МОЖНО СДЕЛАТЬ:",
-    inlineKeyboardRows: [
-      [{ text: "⭐ Telegram Stars", callbackData: "buy:method:tg_stars" }],
-      [{ text: "TBD", callbackData: "buy:method:tbd_1" }],
-      [{ text: "TBD", callbackData: "buy:method:tbd_2" }],
-    ],
+    inlineKeyboardRows: getSubscriptionPaymentMethodInlineKeyboardRows(),
   });
 }

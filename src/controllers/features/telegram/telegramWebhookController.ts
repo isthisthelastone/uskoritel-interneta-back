@@ -27,6 +27,8 @@ import {
   getSubscriptionPriceByMonths,
   listSubscriptionPrices,
 } from "../../../services/subscriptionPricingService";
+import { checkCryptoBotInvoiceByIdForUser } from "../../../services/cryptoBotPaymentsSyncService";
+import { createCryptoBotSubscriptionInvoice } from "../../../services/cryptoBotService";
 import {
   issueOrGetUserVpsConfigUrls,
   listUniqueVpsCountries,
@@ -37,6 +39,7 @@ import {
   buildSubscriptionInvoicePayload,
   buildSubscriptionStatusTextFromDb,
   encodeCountryCallbackValue,
+  getSubscriptionPaymentMethodInlineKeyboardRows,
   getCountriesActionFromCallbackData,
   getFaqActionFromCallbackData,
   getFaqActionText,
@@ -230,6 +233,14 @@ function applyPercentDiscountToUsd(baseAmount: number, discountPercent: number):
   return Math.round(baseAmount * (100 - safeDiscount)) / 100;
 }
 
+function formatUsdAmount(value: number): string {
+  const rounded = Math.round(value * 100) / 100;
+  return rounded
+    .toFixed(2)
+    .replace(/\.00$/u, "")
+    .replace(/(\.\d)0$/u, "$1");
+}
+
 async function resolveSubscriptionPurchaseAmount(
   tgId: string,
   months: number,
@@ -352,7 +363,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         purchaseAction !== null
           ? purchaseAction.kind === "plan"
             ? "Opening payment..."
-            : "Opening section..."
+            : purchaseAction.kind === "crypto_check"
+              ? "Checking payment..."
+              : "Opening section..."
           : faqAction !== null
             ? "Opening answer..."
             : referalsAction !== null
@@ -425,11 +438,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         const paymentOptionsResult = await sendTelegramInlineMenuMessage({
           chatId: callbackChatId,
           text: "Choose payment method:",
-          inlineKeyboardRows: [
-            [{ text: "⭐ Telegram Stars", callbackData: "buy:method:tg_stars" }],
-            [{ text: "TBD", callbackData: "buy:method:tbd_1" }],
-            [{ text: "TBD", callbackData: "buy:method:tbd_2" }],
-          ],
+          inlineKeyboardRows: getSubscriptionPaymentMethodInlineKeyboardRows(),
         });
 
         if (!paymentOptionsResult.ok) {
@@ -450,7 +459,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       }
 
       if (purchaseAction.kind === "method") {
-        if (purchaseAction.method === "tg_stars") {
+        if (purchaseAction.method === "tg_stars" || purchaseAction.method === "crypto_bot") {
           let planOptionsResult: Awaited<ReturnType<typeof sendTelegramInlineMenuMessage>>;
 
           try {
@@ -467,29 +476,39 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                 text: "Планы оплаты пока недоступны. Попробуйте позже.",
               });
             } else {
+              const isStarsMethod = purchaseAction.method === "tg_stars";
               planOptionsResult = await sendTelegramInlineMenuMessage({
                 chatId: callbackChatId,
-                text:
-                  discountPercent > 0
+                text: isStarsMethod
+                  ? discountPercent > 0
                     ? "Choose Telegram Stars plan (скидка " + String(discountPercent) + "%):"
-                    : "Choose Telegram Stars plan:",
+                    : "Choose Telegram Stars plan:"
+                  : discountPercent > 0
+                    ? "Choose CryptoBot plan (скидка " + String(discountPercent) + "%):"
+                    : "Choose CryptoBot plan (any crypto asset):",
                 inlineKeyboardRows: prices.map((price) => [
                   {
-                    text:
-                      String(price.months) +
-                      " " +
-                      (price.months === 1 ? "month" : "months") +
-                      " • " +
-                      String(applyPercentDiscountToStars(price.stars, discountPercent)) +
-                      " ⭐" +
-                      (discountPercent > 0 ? " (-" + String(discountPercent) + "%)" : ""),
-                    callbackData: "buy:plan:" + String(price.months),
+                    text: isStarsMethod
+                      ? String(price.months) +
+                        " " +
+                        (price.months === 1 ? "month" : "months") +
+                        " • " +
+                        String(applyPercentDiscountToStars(price.stars, discountPercent)) +
+                        " ⭐" +
+                        (discountPercent > 0 ? " (-" + String(discountPercent) + "%)" : "")
+                      : String(price.months) +
+                        " " +
+                        (price.months === 1 ? "month" : "months") +
+                        " • $" +
+                        formatUsdAmount(applyPercentDiscountToUsd(price.usdt, discountPercent)) +
+                        (discountPercent > 0 ? " (-" + String(discountPercent) + "%)" : ""),
+                    callbackData: "buy:plan:" + purchaseAction.method + ":" + String(price.months),
                   },
                 ]),
               });
             }
           } catch (error) {
-            console.error("Failed to fetch stars plan options from DB:", error);
+            console.error("Failed to fetch plan options from DB:", error);
             planOptionsResult = await sendTelegramTextMessage({
               chatId: callbackChatId,
               text: "Не удалось загрузить тарифы. Попробуйте позже.",
@@ -498,7 +517,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
           if (!planOptionsResult.ok) {
             console.error(
-              "Failed to send stars plan options:",
+              "Failed to send plan options:",
               planOptionsResult.statusCode,
               planOptionsResult.error,
             );
@@ -531,6 +550,75 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           processed: true,
           callbackHandled: true,
           sent: tbdResult.ok,
+        });
+        return;
+      }
+
+      if (purchaseAction.kind === "crypto_check") {
+        let checkStatus: Awaited<ReturnType<typeof checkCryptoBotInvoiceByIdForUser>>;
+
+        try {
+          checkStatus = await checkCryptoBotInvoiceByIdForUser({
+            tgId: String(callbackQuery.from.id),
+            invoiceId: purchaseAction.invoiceId,
+          });
+        } catch (error) {
+          console.error("Failed to check CryptoBot invoice status:", error);
+          const checkFailedResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Не удалось проверить оплату. Попробуйте чуть позже.",
+          });
+
+          if (!checkFailedResult.ok) {
+            console.error(
+              "Failed to send CryptoBot check failure message:",
+              checkFailedResult.statusCode,
+              checkFailedResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: checkFailedResult.ok,
+          });
+          return;
+        }
+
+        const statusText =
+          checkStatus === "paid"
+            ? "✅ Оплата подтверждена, подписка активирована."
+            : checkStatus === "already_paid"
+              ? "✅ Этот счет уже оплачен ранее."
+              : checkStatus === "pending"
+                ? "⌛ Оплата пока не подтверждена. Нажмите Проверить оплату через 10-20 секунд."
+                : checkStatus === "expired"
+                  ? "⛔ Счет истек. Сформируйте новый платеж."
+                  : checkStatus === "forbidden"
+                    ? "⛔ Этот счет принадлежит другому пользователю."
+                    : checkStatus === "not_found"
+                      ? "Счет не найден."
+                      : "Ошибка обработки счета. Обратитесь в поддержку.";
+
+        const checkResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: statusText,
+        });
+
+        if (!checkResult.ok) {
+          console.error(
+            "Failed to send CryptoBot check result message:",
+            checkResult.statusCode,
+            checkResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: checkResult.ok,
         });
         return;
       }
@@ -589,22 +677,118 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
-      const invoiceResult = await sendTelegramStarsInvoice({
+      if (purchaseAction.method === "tg_stars") {
+        const invoiceResult = await sendTelegramStarsInvoice({
+          chatId: callbackChatId,
+          title: "VPN " + String(purchaseAction.months) + " month plan",
+          description:
+            "Telegram Stars payment for " +
+            String(purchaseAction.months) +
+            " month VPN subscription.",
+          payload: buildSubscriptionInvoicePayload(callbackQuery.from.id, purchaseAction.months),
+          amount: selectedPurchaseAmount.starsAmount,
+        });
+
+        if (!invoiceResult.ok) {
+          console.error(
+            "Failed to send Telegram Stars invoice:",
+            invoiceResult.statusCode,
+            invoiceResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          invoiceSent: invoiceResult.ok,
+        });
+        return;
+      }
+
+      if (purchaseAction.method === "crypto_bot") {
+        try {
+          const cryptoInvoice = await createCryptoBotSubscriptionInvoice({
+            tgId: String(callbackQuery.from.id),
+            months: purchaseAction.months,
+            amountUsd: selectedPurchaseAmount.usdAmount,
+          });
+
+          const cryptoInvoiceResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: [
+              "💎 Счет CryptoBot создан.",
+              "План: " + String(purchaseAction.months) + " мес.",
+              "Сумма: $" + formatUsdAmount(selectedPurchaseAmount.usdAmount),
+              "Поддерживаются любые доступные криптовалюты в CryptoBot.",
+              "После оплаты нажмите кнопку проверки.",
+            ].join("\n"),
+            inlineKeyboardRows: [
+              [
+                {
+                  text: "💳 Оплатить через CryptoBot",
+                  url: cryptoInvoice.botInvoiceUrl,
+                },
+              ],
+              [
+                {
+                  text: "✅ Проверить оплату",
+                  callbackData: "buy:crypto_check:" + String(cryptoInvoice.invoiceId),
+                },
+              ],
+            ],
+          });
+
+          if (!cryptoInvoiceResult.ok) {
+            console.error(
+              "Failed to send CryptoBot invoice message:",
+              cryptoInvoiceResult.statusCode,
+              cryptoInvoiceResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            invoiceSent: cryptoInvoiceResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to create CryptoBot invoice:", error);
+          const failedResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Не удалось создать счет CryptoBot. Попробуйте позже.",
+          });
+
+          if (!failedResult.ok) {
+            console.error(
+              "Failed to send CryptoBot invoice failure message:",
+              failedResult.statusCode,
+              failedResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            invoiceSent: failedResult.ok,
+          });
+          return;
+        }
+      }
+
+      const unsupportedMethodResult = await sendTelegramTextMessage({
         chatId: callbackChatId,
-        title: "VPN " + String(purchaseAction.months) + " month plan",
-        description:
-          "Telegram Stars payment for " +
-          String(purchaseAction.months) +
-          " month VPN subscription.",
-        payload: buildSubscriptionInvoicePayload(callbackQuery.from.id, purchaseAction.months),
-        amount: selectedPurchaseAmount.starsAmount,
+        text: "This payment method is not implemented yet.",
       });
 
-      if (!invoiceResult.ok) {
+      if (!unsupportedMethodResult.ok) {
         console.error(
-          "Failed to send Telegram Stars invoice:",
-          invoiceResult.statusCode,
-          invoiceResult.error,
+          "Failed to send unsupported payment method message:",
+          unsupportedMethodResult.statusCode,
+          unsupportedMethodResult.error,
         );
       }
 
@@ -612,7 +796,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         ok: true,
         processed: true,
         callbackHandled: true,
-        invoiceSent: invoiceResult.ok,
+        invoiceSent: unsupportedMethodResult.ok,
       });
       return;
     }

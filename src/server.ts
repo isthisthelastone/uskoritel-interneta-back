@@ -1,4 +1,5 @@
 import { createApp } from "./app";
+import { startCryptoBotPaymentsSyncJob } from "./services/cryptoBotPaymentsSyncService";
 import { startVpsConnectionsSyncJob } from "./services/vpsConnectionsSyncService";
 
 function getPort(): number {
@@ -17,6 +18,7 @@ export function startServer(): void {
   const port = getPort();
 
   startVpsConnectionsSyncJob();
+  startCryptoBotPaymentsSyncJob();
 
   app.listen(port, () => {
     console.log("Backend is running on http://localhost:" + String(port));
