@@ -16,7 +16,9 @@ const cryptoBotApiResponseSchema = z.object({
 const cryptoBotInvoiceSchema = z.object({
   invoice_id: z.number().int().positive(),
   status: z.string(),
-  bot_invoice_url: z.string().min(1),
+  bot_invoice_url: z.string().min(1).optional(),
+  pay_url: z.string().min(1).optional(),
+  hash: z.string().min(1).optional(),
 });
 
 const cryptoBotDbInvoiceSchema = z.object({
@@ -124,6 +126,52 @@ function normalizeStatus(rawStatus: string): CryptoBotInvoiceStatus {
   return "failed";
 }
 
+function buildInvoiceUrl(rawInvoice: z.infer<typeof cryptoBotInvoiceSchema>): string {
+  if (rawInvoice.bot_invoice_url !== undefined && rawInvoice.bot_invoice_url.length > 0) {
+    return rawInvoice.bot_invoice_url;
+  }
+
+  if (rawInvoice.pay_url !== undefined && rawInvoice.pay_url.length > 0) {
+    return rawInvoice.pay_url;
+  }
+
+  if (rawInvoice.hash !== undefined && rawInvoice.hash.length > 0) {
+    return "https://t.me/CryptoBot?start=" + rawInvoice.hash;
+  }
+
+  return "";
+}
+
+const getInvoicesResultSchema = z.union([
+  z.array(cryptoBotInvoiceSchema),
+  z.object({
+    items: z.array(cryptoBotInvoiceSchema),
+  }),
+  z.object({
+    invoices: z.array(cryptoBotInvoiceSchema),
+  }),
+]);
+
+function extractInvoicesFromGetInvoicesResult(
+  rawResult: unknown,
+): z.infer<typeof cryptoBotInvoiceSchema>[] {
+  const parsedResult = getInvoicesResultSchema.safeParse(rawResult);
+
+  if (!parsedResult.success) {
+    throw new Error(JSON.stringify(parsedResult.error.issues));
+  }
+
+  if (Array.isArray(parsedResult.data)) {
+    return parsedResult.data;
+  }
+
+  if ("items" in parsedResult.data) {
+    return parsedResult.data.items;
+  }
+
+  return parsedResult.data.invoices;
+}
+
 function mapDbInvoice(rawRow: unknown): CryptoBotInvoiceRecord {
   const parsedRow = cryptoBotDbInvoiceSchema.parse(rawRow);
 
@@ -215,6 +263,11 @@ export async function createCryptoBotSubscriptionInvoice(
   });
 
   const parsedInvoice = cryptoBotInvoiceSchema.parse(result);
+  const invoiceUrl = buildInvoiceUrl(parsedInvoice);
+
+  if (invoiceUrl.length === 0) {
+    throw new Error("CryptoBot createInvoice returned invoice without URL.");
+  }
   const supabase = getSupabaseAdminClient();
   const { error } = await supabase.from("crypto_bot_invoices").upsert(
     {
@@ -223,7 +276,7 @@ export async function createCryptoBotSubscriptionInvoice(
       months: input.months,
       amount_usd: amountUsdRounded,
       status: normalizeStatus(parsedInvoice.status),
-      bot_invoice_url: parsedInvoice.bot_invoice_url,
+      bot_invoice_url: invoiceUrl,
       raw_payload: result,
       last_error: null,
       paid_at: null,
@@ -245,7 +298,7 @@ export async function createCryptoBotSubscriptionInvoice(
 
   return {
     invoiceId: parsedInvoice.invoice_id,
-    botInvoiceUrl: parsedInvoice.bot_invoice_url,
+    botInvoiceUrl: invoiceUrl,
   };
 }
 
@@ -385,13 +438,12 @@ export async function getRemoteCryptoBotInvoicesByIds(
   const result = await postCryptoBotApi("getInvoices", {
     invoice_ids: invoiceIds.join(","),
   });
-
-  const parsedInvoices = z.array(cryptoBotInvoiceSchema).parse(result);
+  const parsedInvoices = extractInvoicesFromGetInvoicesResult(result);
 
   return parsedInvoices.map((invoice) => ({
     invoiceId: invoice.invoice_id,
     status: invoice.status,
-    botInvoiceUrl: invoice.bot_invoice_url,
+    botInvoiceUrl: buildInvoiceUrl(invoice),
     raw: invoice,
   }));
 }
