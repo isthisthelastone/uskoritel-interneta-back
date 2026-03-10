@@ -22,7 +22,7 @@ const vpsSyncRowSchema = z.object({
   config_list: z.array(z.string()),
   users_kv_map: z.unknown(),
   disabled: z.boolean().nullable().optional(),
-  connetction: z.boolean().nullable().optional(),
+  connection: z.boolean().nullable().optional(),
 });
 
 const userVpsTrafficMonthlyStateRowSchema = z.object({
@@ -808,7 +808,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   const { data, error } = await supabase
     .from("vps")
     .select(
-      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map, disabled, connetction",
+      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map, disabled, connection",
     );
 
   if (error !== null) {
@@ -816,7 +816,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   }
 
   const allRows = data.map((rawRow) => parseVpsSyncRow(rawRow));
-  const parsedRows = allRows.filter((row) => row.disabled !== true);
+  const parsedRows = allRows.filter((row) => row.disabled !== true || row.connection === false);
 
   if (verbose) {
     const skippedDisabled = allRows.length - parsedRows.length;
@@ -925,7 +925,8 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         .from("vps")
         .update({
           number_of_connections: metrics.activeIps.size,
-          connetction: true,
+          connection: true,
+          disabled: false,
         })
         .eq("internal_uuid", row.internal_uuid);
 
@@ -951,7 +952,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const { error: markDisconnectedError } = await supabase
         .from("vps")
         .update({
-          connetction: false,
+          connection: false,
           disabled: true,
         })
         .eq("internal_uuid", row.internal_uuid);
