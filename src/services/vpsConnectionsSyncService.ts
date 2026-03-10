@@ -22,6 +22,7 @@ const vpsSyncRowSchema = z.object({
   config_list: z.array(z.string()),
   users_kv_map: z.unknown(),
   disabled: z.boolean().nullable().optional(),
+  connetction: z.boolean().nullable().optional(),
 });
 
 const userVpsTrafficMonthlyStateRowSchema = z.object({
@@ -807,7 +808,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   const { data, error } = await supabase
     .from("vps")
     .select(
-      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map, disabled",
+      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map, disabled, connetction",
     );
 
   if (error !== null) {
@@ -829,113 +830,148 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   const nodeSummaries: VpsNodeSyncSummary[] = [];
 
   for (const row of parsedRows) {
-    const sshConfig = buildVpsSshConfig(row);
-    const ports = extractVpsPorts(row.config_list);
-    const metrics = await collectVpsMetrics(sshConfig, ports);
-    if (verbose || metrics.userTrafficBytes.size === 0) {
-      console.log(
-        "[vps-sync][debug] vps metrics:",
+    try {
+      const sshConfig = buildVpsSshConfig(row);
+      const ports = extractVpsPorts(row.config_list);
+      const metrics = await collectVpsMetrics(sshConfig, ports);
+      if (verbose || metrics.userTrafficBytes.size === 0) {
+        console.log(
+          "[vps-sync][debug] vps metrics:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "activeIps=" + String(metrics.activeIps.size),
+          "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
+          "statsStdoutLength=" + String(metrics.statsStdoutLength),
+          "statsStderrLength=" + String(metrics.statsStderrLength),
+          "statsCommandFailed=" + String(metrics.statsCommandFailed),
+          "statsBinaryNotFound=" + String(metrics.statsBinaryNotFound),
+        );
+
+        if (metrics.statsStdoutLength > 0) {
+          console.log("[vps-sync][debug] stats stdout sample:", metrics.statsStdoutSample);
+        }
+
+        if (metrics.statsStderrLength > 0) {
+          console.log("[vps-sync][debug] stats stderr sample:", metrics.statsStderrSample);
+        }
+      }
+
+      const knownUserIds = parseUsersKvMapKeys(row.users_kv_map);
+      const abusiveUsers: string[] = [];
+
+      for (const userId of knownUserIds) {
+        if (!userAggregates.has(userId)) {
+          userAggregates.set(userId, {
+            currentIps: new Set<string>(),
+            monthIps: new Set<string>(),
+          });
+        }
+      }
+
+      for (const [userId, bytes] of metrics.userTrafficBytes.entries()) {
+        if (!metrics.statsCommandFailed && !metrics.statsBinaryNotFound) {
+          const stateKey = buildUserVpsTrafficStateKey(row.internal_uuid, userId);
+          perVpsUserTotals.set(stateKey, bytes);
+        }
+
+        if (!userAggregates.has(userId)) {
+          userAggregates.set(userId, {
+            currentIps: new Set<string>(),
+            monthIps: new Set<string>(),
+          });
+        }
+      }
+
+      for (const [userId, ips] of metrics.userCurrentIps.entries()) {
+        const aggregate = userAggregates.get(userId) ?? {
+          currentIps: new Set<string>(),
+          monthIps: new Set<string>(),
+        };
+
+        for (const ip of ips.values()) {
+          aggregate.currentIps.add(ip);
+        }
+
+        userAggregates.set(userId, aggregate);
+
+        if (aggregate.currentIps.size > userIpLimit) {
+          abusiveUsers.push(userId);
+          pendingAbuseEvents.push({
+            sshConfig,
+            event: {
+              internalUuid: row.internal_uuid,
+              userInternalUuid: userId,
+              ips: Array.from(aggregate.currentIps.values()),
+              ports,
+            },
+          });
+        }
+      }
+
+      for (const [userId, ips] of metrics.userMonthIps.entries()) {
+        const aggregate = userAggregates.get(userId) ?? {
+          currentIps: new Set<string>(),
+          monthIps: new Set<string>(),
+        };
+
+        for (const ip of ips.values()) {
+          aggregate.monthIps.add(ip);
+        }
+
+        userAggregates.set(userId, aggregate);
+      }
+
+      const { error: updateVpsError } = await supabase
+        .from("vps")
+        .update({
+          number_of_connections: metrics.activeIps.size,
+          connetction: true,
+        })
+        .eq("internal_uuid", row.internal_uuid);
+
+      if (updateVpsError !== null) {
+        throw new Error("Failed to update VPS number_of_connections: " + updateVpsError.message);
+      }
+
+      nodeSummaries.push({
+        internalUuid: row.internal_uuid,
+        domain: row.domain,
+        activeIpCount: metrics.activeIps.size,
+        abusiveUsers,
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error(
+        "[vps-sync] failed node sync:",
         "internalUuid=" + row.internal_uuid,
         "domain=" + row.domain,
-        "activeIps=" + String(metrics.activeIps.size),
-        "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
-        "statsStdoutLength=" + String(metrics.statsStdoutLength),
-        "statsStderrLength=" + String(metrics.statsStderrLength),
-        "statsCommandFailed=" + String(metrics.statsCommandFailed),
-        "statsBinaryNotFound=" + String(metrics.statsBinaryNotFound),
+        "message=" + errorMessage,
       );
 
-      if (metrics.statsStdoutLength > 0) {
-        console.log("[vps-sync][debug] stats stdout sample:", metrics.statsStdoutSample);
+      const { error: markDisconnectedError } = await supabase
+        .from("vps")
+        .update({
+          connetction: false,
+          disabled: true,
+        })
+        .eq("internal_uuid", row.internal_uuid);
+
+      if (markDisconnectedError !== null) {
+        console.error(
+          "[vps-sync] failed to mark VPS as disconnected+disabled:",
+          row.internal_uuid,
+          markDisconnectedError.message,
+        );
       }
 
-      if (metrics.statsStderrLength > 0) {
-        console.log("[vps-sync][debug] stats stderr sample:", metrics.statsStderrSample);
-      }
+      nodeSummaries.push({
+        internalUuid: row.internal_uuid,
+        domain: row.domain,
+        activeIpCount: 0,
+        abusiveUsers: [],
+      });
+      continue;
     }
-
-    const knownUserIds = parseUsersKvMapKeys(row.users_kv_map);
-    const abusiveUsers: string[] = [];
-
-    for (const userId of knownUserIds) {
-      if (!userAggregates.has(userId)) {
-        userAggregates.set(userId, {
-          currentIps: new Set<string>(),
-          monthIps: new Set<string>(),
-        });
-      }
-    }
-
-    for (const [userId, bytes] of metrics.userTrafficBytes.entries()) {
-      if (!metrics.statsCommandFailed && !metrics.statsBinaryNotFound) {
-        const stateKey = buildUserVpsTrafficStateKey(row.internal_uuid, userId);
-        perVpsUserTotals.set(stateKey, bytes);
-      }
-
-      if (!userAggregates.has(userId)) {
-        userAggregates.set(userId, {
-          currentIps: new Set<string>(),
-          monthIps: new Set<string>(),
-        });
-      }
-    }
-
-    for (const [userId, ips] of metrics.userCurrentIps.entries()) {
-      const aggregate = userAggregates.get(userId) ?? {
-        currentIps: new Set<string>(),
-        monthIps: new Set<string>(),
-      };
-
-      for (const ip of ips.values()) {
-        aggregate.currentIps.add(ip);
-      }
-
-      userAggregates.set(userId, aggregate);
-
-      if (aggregate.currentIps.size > userIpLimit) {
-        abusiveUsers.push(userId);
-        pendingAbuseEvents.push({
-          sshConfig,
-          event: {
-            internalUuid: row.internal_uuid,
-            userInternalUuid: userId,
-            ips: Array.from(aggregate.currentIps.values()),
-            ports,
-          },
-        });
-      }
-    }
-
-    for (const [userId, ips] of metrics.userMonthIps.entries()) {
-      const aggregate = userAggregates.get(userId) ?? {
-        currentIps: new Set<string>(),
-        monthIps: new Set<string>(),
-      };
-
-      for (const ip of ips.values()) {
-        aggregate.monthIps.add(ip);
-      }
-
-      userAggregates.set(userId, aggregate);
-    }
-
-    const { error: updateVpsError } = await supabase
-      .from("vps")
-      .update({
-        number_of_connections: metrics.activeIps.size,
-      })
-      .eq("internal_uuid", row.internal_uuid);
-
-    if (updateVpsError !== null) {
-      throw new Error("Failed to update VPS number_of_connections: " + updateVpsError.message);
-    }
-
-    nodeSummaries.push({
-      internalUuid: row.internal_uuid,
-      domain: row.domain,
-      activeIpCount: metrics.activeIps.size,
-      abusiveUsers,
-    });
   }
 
   let droppedUsers = 0;
