@@ -8,8 +8,9 @@ const DEFAULT_XRAY_STATS_SERVER = "127.0.0.1:10085";
 const DEFAULT_XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log";
 const DEFAULT_XRAY_LOG_TAIL_LINES = 5_000;
 const DEFAULT_USER_IP_CURRENT_WINDOW_MINUTES = 20;
-const DEFAULT_SYNC_SPEEDTEST_TARGET_HOST = "www.youtube.com";
-const DEFAULT_SYNC_SPEEDTEST_TARGET_URL = "https://www.youtube.com/";
+const DEFAULT_SYNC_SPEEDTEST_TARGET_HOST = "speedtest.myloc.de";
+const DEFAULT_SYNC_SPEEDTEST_TARGET_URL = "http://speedtest.myloc.de/files/100mb.bin";
+const DEFAULT_SYNC_SPEEDTEST_IPERF_PORT = 5200;
 const DEFAULT_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS = 5;
 const UUID_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
@@ -56,12 +57,20 @@ interface PerVpsMetrics {
   speedIperfStderrSample: string;
   speedCurlStdoutSample: string;
   speedCurlStderrSample: string;
+  speedIperfCommandFailed: boolean;
+  speedCurlCommandFailed: boolean;
   statsStdoutLength: number;
   statsStderrLength: number;
   statsStdoutSample: string;
   statsStderrSample: string;
   statsCommandFailed: boolean;
   statsBinaryNotFound: boolean;
+}
+
+interface SafeSshCommandResult {
+  stdout: string;
+  stderr: string;
+  failed: boolean;
 }
 
 interface UserVpsTrafficMonthlyStateRow {
@@ -359,6 +368,22 @@ function getSpeedtestTargetUrl(): string {
   return url === undefined || url.length === 0 ? DEFAULT_SYNC_SPEEDTEST_TARGET_URL : url;
 }
 
+function getSpeedtestIperfPort(): number {
+  const rawPort = process.env.VPS_SYNC_SPEEDTEST_IPERF_PORT;
+
+  if (rawPort === undefined || rawPort.length === 0) {
+    return DEFAULT_SYNC_SPEEDTEST_IPERF_PORT;
+  }
+
+  const parsed = Number.parseInt(rawPort, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error("VPS_SYNC_SPEEDTEST_IPERF_PORT must be between 1 and 65535.");
+  }
+
+  return parsed;
+}
+
 function getSpeedtestIperfDurationSeconds(): number {
   const rawDuration = process.env.VPS_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS;
 
@@ -460,31 +485,30 @@ function buildReadAccessLogsCommand(accessLogPath: string, tailLines: number): s
   );
 }
 
-function buildYoutubeIperfSpeedCommand(targetHost: string, durationSeconds: number): string {
+function buildYoutubeIperfSpeedCommand(
+  targetHost: string,
+  targetPort: number,
+  durationSeconds: number,
+): string {
   return (
     "if command -v iperf3 >/dev/null 2>&1; then " +
-    "TARGET_IP=''; " +
-    "if command -v getent >/dev/null 2>&1; then " +
-    'TARGET_IP="$(getent ahostsv4 ' +
+    "if command -v timeout >/dev/null 2>&1; then " +
+    "timeout 14 " +
+    "iperf3 -c " +
     shellQuote(targetHost) +
-    " 2>/dev/null | awk 'NR==1 {print $1}')\"; " +
-    "fi; " +
-    'if [ -z "$TARGET_IP" ] && command -v nslookup >/dev/null 2>&1; then ' +
-    'TARGET_IP="$(nslookup ' +
-    shellQuote(targetHost) +
-    " 2>/dev/null | awk '/^Address: / {print $2}' | tail -n1)\"; " +
-    "fi; " +
-    'if [ -z "$TARGET_IP" ] && command -v dig >/dev/null 2>&1; then ' +
-    'TARGET_IP="$(dig +short ' +
-    shellQuote(targetHost) +
-    ' A | head -n1)"; ' +
-    "fi; " +
-    'if [ -n "$TARGET_IP" ]; then ' +
-    'iperf3 -c "$TARGET_IP" -J -f m -t ' +
+    " -p " +
+    String(targetPort) +
+    " -J --connect-timeout 3000 -t " +
     String(durationSeconds) +
     " -P 1 || echo '__IPERF3_FAILED__'; " +
     "else " +
-    "echo '__YOUTUBE_IP_RESOLVE_FAILED__'; " +
+    "iperf3 -c " +
+    shellQuote(targetHost) +
+    " -p " +
+    String(targetPort) +
+    " -J --connect-timeout 3000 -t " +
+    String(durationSeconds) +
+    " -P 1 || echo '__IPERF3_FAILED__'; " +
     "fi; " +
     "else " +
     "echo '__IPERF3_NOT_FOUND__'; " +
@@ -495,9 +519,9 @@ function buildYoutubeIperfSpeedCommand(targetHost: string, durationSeconds: numb
 function buildYoutubeCurlSpeedCommand(targetUrl: string): string {
   return (
     "if command -v curl >/dev/null 2>&1; then " +
-    "curl -L --max-time 20 -o /dev/null -s -w '__CURL_SPEED_BYTES_PER_SEC__:%{speed_download}\\n' " +
+    "curl -L --connect-timeout 8 --max-time 20 -o /dev/null -s -w '__CURL_SPEED_BYTES_PER_SEC__:%{speed_download}\\n' " +
     shellQuote(targetUrl) +
-    "; " +
+    " || echo '__CURL_FAILED__'; " +
     "else " +
     "echo '__CURL_NOT_FOUND__'; " +
     "fi"
@@ -761,6 +785,10 @@ function parseIperfSpeedMbPerSecond(iperfStdout: string): number | null {
 }
 
 function parseCurlSpeedMbPerSecond(curlStdout: string): number | null {
+  if (curlStdout.includes("__CURL_NOT_FOUND__") || curlStdout.includes("__CURL_FAILED__")) {
+    return null;
+  }
+
   const match = curlStdout.match(/__CURL_SPEED_BYTES_PER_SEC__:(\d+(?:\.\d+)?)/u);
 
   if (match === null) {
@@ -776,6 +804,31 @@ function parseCurlSpeedMbPerSecond(curlStdout: string): number | null {
   return roundToTwoDecimals(bytesPerSecond / 1_000_000);
 }
 
+async function runVpsSshCommandSafe(
+  sshConfig: VpsSshConfig,
+  command: string,
+): Promise<SafeSshCommandResult> {
+  try {
+    const result = await runVpsSshCommandWithConfig(sshConfig, command);
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      failed: false,
+    };
+  } catch (error) {
+    const typedError = error as NodeJS.ErrnoException & { stdout?: unknown; stderr?: unknown };
+    const stdout = typeof typedError.stdout === "string" ? typedError.stdout : "";
+    const stderrFromError = typeof typedError.stderr === "string" ? typedError.stderr : "";
+    const message = error instanceof Error ? error.message : String(error);
+
+    return {
+      stdout,
+      stderr: [stderrFromError, message].filter((part) => part.length > 0).join("\n"),
+      failed: true,
+    };
+  }
+}
+
 async function collectVpsMetrics(
   sshConfig: VpsSshConfig,
   ports: number[],
@@ -786,28 +839,26 @@ async function collectVpsMetrics(
   const readLogsCommand = buildReadAccessLogsCommand(getXrayAccessLogPath(), getXrayLogTailLines());
   const youtubeIperfSpeedCommand = buildYoutubeIperfSpeedCommand(
     getSpeedtestTargetHost(),
+    getSpeedtestIperfPort(),
     getSpeedtestIperfDurationSeconds(),
   );
   const youtubeCurlSpeedCommand = buildYoutubeCurlSpeedCommand(getSpeedtestTargetUrl());
-  const skippedSpeedtestResult = {
+  const skippedSpeedtestResult: SafeSshCommandResult = {
     stdout: "__SPEEDTEST_SKIPPED_DISABLED_TRUE__",
     stderr: "",
+    failed: false,
   };
-  const speedIperfPromise = shouldRunSpeedtest
-    ? runVpsSshCommandWithConfig(sshConfig, youtubeIperfSpeedCommand)
-    : Promise.resolve(skippedSpeedtestResult);
-  const speedCurlPromise = shouldRunSpeedtest
-    ? runVpsSshCommandWithConfig(sshConfig, youtubeCurlSpeedCommand)
-    : Promise.resolve(skippedSpeedtestResult);
-
-  const [activeIpsResult, statsResult, logsResult, speedIperfResult, speedCurlResult] =
-    await Promise.all([
-      runVpsSshCommandWithConfig(sshConfig, activeIpsCommand),
-      runVpsSshCommandWithConfig(sshConfig, statsCommand),
-      runVpsSshCommandWithConfig(sshConfig, readLogsCommand),
-      speedIperfPromise,
-      speedCurlPromise,
-    ]);
+  const [activeIpsResult, statsResult, logsResult] = await Promise.all([
+    runVpsSshCommandWithConfig(sshConfig, activeIpsCommand),
+    runVpsSshCommandWithConfig(sshConfig, statsCommand),
+    runVpsSshCommandWithConfig(sshConfig, readLogsCommand),
+  ]);
+  const [speedIperfResult, speedCurlResult] = shouldRunSpeedtest
+    ? await Promise.all([
+        runVpsSshCommandSafe(sshConfig, youtubeIperfSpeedCommand),
+        runVpsSshCommandSafe(sshConfig, youtubeCurlSpeedCommand),
+      ])
+    : [skippedSpeedtestResult, skippedSpeedtestResult];
 
   const activeIps = parseDistinctIps(activeIpsResult.stdout);
   const statsCommandFailed = statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
@@ -835,6 +886,8 @@ async function collectVpsMetrics(
     speedIperfStderrSample: toLogSample(speedIperfResult.stderr),
     speedCurlStdoutSample: toLogSample(speedCurlResult.stdout),
     speedCurlStderrSample: toLogSample(speedCurlResult.stderr),
+    speedIperfCommandFailed: speedIperfResult.failed,
+    speedCurlCommandFailed: speedCurlResult.failed,
     statsStdoutLength: statsResult.stdout.length,
     statsStderrLength: statsResult.stderr.length,
     statsStdoutSample: toLogSample(statsResult.stdout),
@@ -1053,6 +1106,8 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "speedIperfStderrLength=" + String(metrics.speedIperfStderrLength),
           "speedCurlStdoutLength=" + String(metrics.speedCurlStdoutLength),
           "speedCurlStderrLength=" + String(metrics.speedCurlStderrLength),
+          "speedIperfCommandFailed=" + String(metrics.speedIperfCommandFailed),
+          "speedCurlCommandFailed=" + String(metrics.speedCurlCommandFailed),
           "statsCommandFailed=" + String(metrics.statsCommandFailed),
           "statsBinaryNotFound=" + String(metrics.statsBinaryNotFound),
         );
