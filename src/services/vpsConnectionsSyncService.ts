@@ -8,6 +8,9 @@ const DEFAULT_XRAY_STATS_SERVER = "127.0.0.1:10085";
 const DEFAULT_XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log";
 const DEFAULT_XRAY_LOG_TAIL_LINES = 5_000;
 const DEFAULT_USER_IP_CURRENT_WINDOW_MINUTES = 20;
+const DEFAULT_SYNC_SPEEDTEST_TARGET_HOST = "www.youtube.com";
+const DEFAULT_SYNC_SPEEDTEST_TARGET_URL = "https://www.youtube.com/";
+const DEFAULT_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS = 5;
 const UUID_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
 const IPV4_PATTERN = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/u;
@@ -43,6 +46,16 @@ interface PerVpsMetrics {
   userCurrentIps: Map<string, Set<string>>;
   userMonthIps: Map<string, Set<string>>;
   userTrafficBytes: Map<string, number>;
+  currentSpeedMbPerSecond: number;
+  speedSource: "iperf3" | "curl" | "none";
+  speedIperfStdoutLength: number;
+  speedIperfStderrLength: number;
+  speedCurlStdoutLength: number;
+  speedCurlStderrLength: number;
+  speedIperfStdoutSample: string;
+  speedIperfStderrSample: string;
+  speedCurlStdoutSample: string;
+  speedCurlStderrSample: string;
   statsStdoutLength: number;
   statsStderrLength: number;
   statsStdoutSample: string;
@@ -336,6 +349,32 @@ function getXrayLogTailLines(): number {
   return parsed;
 }
 
+function getSpeedtestTargetHost(): string {
+  const host = process.env.VPS_SYNC_SPEEDTEST_TARGET_HOST?.trim();
+  return host === undefined || host.length === 0 ? DEFAULT_SYNC_SPEEDTEST_TARGET_HOST : host;
+}
+
+function getSpeedtestTargetUrl(): string {
+  const url = process.env.VPS_SYNC_SPEEDTEST_TARGET_URL?.trim();
+  return url === undefined || url.length === 0 ? DEFAULT_SYNC_SPEEDTEST_TARGET_URL : url;
+}
+
+function getSpeedtestIperfDurationSeconds(): number {
+  const rawDuration = process.env.VPS_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS;
+
+  if (rawDuration === undefined || rawDuration.length === 0) {
+    return DEFAULT_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS;
+  }
+
+  const parsed = Number.parseInt(rawDuration, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 2 || parsed > 20) {
+    throw new Error("VPS_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS must be between 2 and 20.");
+  }
+
+  return parsed;
+}
+
 function isVerboseSyncLoggingEnabled(): boolean {
   return process.env.VPS_SYNC_VERBOSE?.trim().toLowerCase() === "true";
 }
@@ -417,6 +456,50 @@ function buildReadAccessLogsCommand(accessLogPath: string, tailLines: number): s
     "; " +
     "else " +
     "true; " +
+    "fi"
+  );
+}
+
+function buildYoutubeIperfSpeedCommand(targetHost: string, durationSeconds: number): string {
+  return (
+    "if command -v iperf3 >/dev/null 2>&1; then " +
+    "TARGET_IP=''; " +
+    "if command -v getent >/dev/null 2>&1; then " +
+    'TARGET_IP="$(getent ahostsv4 ' +
+    shellQuote(targetHost) +
+    " 2>/dev/null | awk 'NR==1 {print $1}')\"; " +
+    "fi; " +
+    'if [ -z "$TARGET_IP" ] && command -v nslookup >/dev/null 2>&1; then ' +
+    'TARGET_IP="$(nslookup ' +
+    shellQuote(targetHost) +
+    " 2>/dev/null | awk '/^Address: / {print $2}' | tail -n1)\"; " +
+    "fi; " +
+    'if [ -z "$TARGET_IP" ] && command -v dig >/dev/null 2>&1; then ' +
+    'TARGET_IP="$(dig +short ' +
+    shellQuote(targetHost) +
+    ' A | head -n1)"; ' +
+    "fi; " +
+    'if [ -n "$TARGET_IP" ]; then ' +
+    'iperf3 -c "$TARGET_IP" -J -f m -t ' +
+    String(durationSeconds) +
+    " -P 1 || echo '__IPERF3_FAILED__'; " +
+    "else " +
+    "echo '__YOUTUBE_IP_RESOLVE_FAILED__'; " +
+    "fi; " +
+    "else " +
+    "echo '__IPERF3_NOT_FOUND__'; " +
+    "fi"
+  );
+}
+
+function buildYoutubeCurlSpeedCommand(targetUrl: string): string {
+  return (
+    "if command -v curl >/dev/null 2>&1; then " +
+    "curl -L --max-time 20 -o /dev/null -s -w '__CURL_SPEED_BYTES_PER_SEC__:%{speed_download}\\n' " +
+    shellQuote(targetUrl) +
+    "; " +
+    "else " +
+    "echo '__CURL_NOT_FOUND__'; " +
     "fi"
   );
 }
@@ -609,28 +692,149 @@ function toRoundedMb(totalBytes: number): number {
   return Math.round(value);
 }
 
-async function collectVpsMetrics(sshConfig: VpsSshConfig, ports: number[]): Promise<PerVpsMetrics> {
+function roundToTwoDecimals(value: number): number {
+  return Number.parseFloat(value.toFixed(2));
+}
+
+function parseJsonObjectFromText(value: string): Record<string, unknown> | null {
+  const startIndex = value.indexOf("{");
+  const endIndex = value.lastIndexOf("}");
+
+  if (startIndex < 0 || endIndex <= startIndex) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value.slice(startIndex, endIndex + 1)) as unknown;
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readNestedNumber(source: unknown, path: string[]): number | null {
+  let current: unknown = source;
+
+  for (const key of path) {
+    if (typeof current !== "object" || current === null || !(key in current)) {
+      return null;
+    }
+
+    current = (current as Record<string, unknown>)[key];
+  }
+
+  return typeof current === "number" && Number.isFinite(current) ? current : null;
+}
+
+function parseIperfSpeedMbPerSecond(iperfStdout: string): number | null {
+  if (
+    iperfStdout.includes("__IPERF3_NOT_FOUND__") ||
+    iperfStdout.includes("__YOUTUBE_IP_RESOLVE_FAILED__") ||
+    iperfStdout.includes("__IPERF3_FAILED__")
+  ) {
+    return null;
+  }
+
+  const parsedObject = parseJsonObjectFromText(iperfStdout);
+
+  if (parsedObject === null) {
+    return null;
+  }
+
+  const candidateBitsPerSecondPaths = [
+    ["end", "sum_received", "bits_per_second"],
+    ["end", "sum_sent", "bits_per_second"],
+    ["end", "sum", "bits_per_second"],
+  ];
+
+  for (const path of candidateBitsPerSecondPaths) {
+    const bitsPerSecond = readNestedNumber(parsedObject, path);
+
+    if (bitsPerSecond !== null && bitsPerSecond >= 0) {
+      return roundToTwoDecimals(bitsPerSecond / 8 / 1_000_000);
+    }
+  }
+
+  return null;
+}
+
+function parseCurlSpeedMbPerSecond(curlStdout: string): number | null {
+  const match = curlStdout.match(/__CURL_SPEED_BYTES_PER_SEC__:(\d+(?:\.\d+)?)/u);
+
+  if (match === null) {
+    return null;
+  }
+
+  const bytesPerSecond = Number.parseFloat(match[1]);
+
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) {
+    return null;
+  }
+
+  return roundToTwoDecimals(bytesPerSecond / 1_000_000);
+}
+
+async function collectVpsMetrics(
+  sshConfig: VpsSshConfig,
+  ports: number[],
+  shouldRunSpeedtest: boolean,
+): Promise<PerVpsMetrics> {
   const activeIpsCommand = buildDistinctActiveIpCommand(ports);
   const statsCommand = buildStatsQueryCommand(getXrayStatsServer());
   const readLogsCommand = buildReadAccessLogsCommand(getXrayAccessLogPath(), getXrayLogTailLines());
+  const youtubeIperfSpeedCommand = buildYoutubeIperfSpeedCommand(
+    getSpeedtestTargetHost(),
+    getSpeedtestIperfDurationSeconds(),
+  );
+  const youtubeCurlSpeedCommand = buildYoutubeCurlSpeedCommand(getSpeedtestTargetUrl());
+  const skippedSpeedtestResult = {
+    stdout: "__SPEEDTEST_SKIPPED_DISABLED_TRUE__",
+    stderr: "",
+  };
+  const speedIperfPromise = shouldRunSpeedtest
+    ? runVpsSshCommandWithConfig(sshConfig, youtubeIperfSpeedCommand)
+    : Promise.resolve(skippedSpeedtestResult);
+  const speedCurlPromise = shouldRunSpeedtest
+    ? runVpsSshCommandWithConfig(sshConfig, youtubeCurlSpeedCommand)
+    : Promise.resolve(skippedSpeedtestResult);
 
-  const [activeIpsResult, statsResult, logsResult] = await Promise.all([
-    runVpsSshCommandWithConfig(sshConfig, activeIpsCommand),
-    runVpsSshCommandWithConfig(sshConfig, statsCommand),
-    runVpsSshCommandWithConfig(sshConfig, readLogsCommand),
-  ]);
+  const [activeIpsResult, statsResult, logsResult, speedIperfResult, speedCurlResult] =
+    await Promise.all([
+      runVpsSshCommandWithConfig(sshConfig, activeIpsCommand),
+      runVpsSshCommandWithConfig(sshConfig, statsCommand),
+      runVpsSshCommandWithConfig(sshConfig, readLogsCommand),
+      speedIperfPromise,
+      speedCurlPromise,
+    ]);
 
   const activeIps = parseDistinctIps(activeIpsResult.stdout);
   const statsCommandFailed = statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
   const statsBinaryNotFound = statsResult.stdout.includes("__XRAY_BINARY_NOT_FOUND__");
   const userTrafficBytes = parseUserTrafficBytesFromStats(statsResult.stdout);
   const userIpSets = parseUserIpSetsFromLogs(logsResult.stdout, getCurrentWindowMinutes());
+  const speedFromIperf = parseIperfSpeedMbPerSecond(speedIperfResult.stdout);
+  const speedFromCurl = parseCurlSpeedMbPerSecond(speedCurlResult.stdout);
+  const currentSpeedMbPerSecond = speedFromIperf ?? speedFromCurl ?? 0;
+  const speedSource: "iperf3" | "curl" | "none" =
+    speedFromIperf !== null ? "iperf3" : speedFromCurl !== null ? "curl" : "none";
 
   return {
     activeIps,
     userCurrentIps: userIpSets.userCurrentIps,
     userMonthIps: userIpSets.userMonthIps,
     userTrafficBytes,
+    currentSpeedMbPerSecond,
+    speedSource,
+    speedIperfStdoutLength: speedIperfResult.stdout.length,
+    speedIperfStderrLength: speedIperfResult.stderr.length,
+    speedCurlStdoutLength: speedCurlResult.stdout.length,
+    speedCurlStderrLength: speedCurlResult.stderr.length,
+    speedIperfStdoutSample: toLogSample(speedIperfResult.stdout),
+    speedIperfStderrSample: toLogSample(speedIperfResult.stderr),
+    speedCurlStdoutSample: toLogSample(speedCurlResult.stdout),
+    speedCurlStderrSample: toLogSample(speedCurlResult.stderr),
     statsStdoutLength: statsResult.stdout.length,
     statsStderrLength: statsResult.stderr.length,
     statsStdoutSample: toLogSample(statsResult.stdout),
@@ -833,16 +1037,22 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     try {
       const sshConfig = buildVpsSshConfig(row);
       const ports = extractVpsPorts(row.config_list);
-      const metrics = await collectVpsMetrics(sshConfig, ports);
+      const metrics = await collectVpsMetrics(sshConfig, ports, row.disabled !== true);
       if (verbose || metrics.userTrafficBytes.size === 0) {
         console.log(
           "[vps-sync][debug] vps metrics:",
           "internalUuid=" + row.internal_uuid,
           "domain=" + row.domain,
           "activeIps=" + String(metrics.activeIps.size),
+          "currentSpeedMbPerSec=" + metrics.currentSpeedMbPerSecond.toFixed(2),
+          "speedSource=" + metrics.speedSource,
           "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
           "statsStdoutLength=" + String(metrics.statsStdoutLength),
           "statsStderrLength=" + String(metrics.statsStderrLength),
+          "speedIperfStdoutLength=" + String(metrics.speedIperfStdoutLength),
+          "speedIperfStderrLength=" + String(metrics.speedIperfStderrLength),
+          "speedCurlStdoutLength=" + String(metrics.speedCurlStdoutLength),
+          "speedCurlStderrLength=" + String(metrics.speedCurlStderrLength),
           "statsCommandFailed=" + String(metrics.statsCommandFailed),
           "statsBinaryNotFound=" + String(metrics.statsBinaryNotFound),
         );
@@ -853,6 +1063,28 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
         if (metrics.statsStderrLength > 0) {
           console.log("[vps-sync][debug] stats stderr sample:", metrics.statsStderrSample);
+        }
+
+        if (metrics.speedIperfStdoutLength > 0) {
+          console.log(
+            "[vps-sync][debug] speed iperf stdout sample:",
+            metrics.speedIperfStdoutSample,
+          );
+        }
+
+        if (metrics.speedIperfStderrLength > 0) {
+          console.log(
+            "[vps-sync][debug] speed iperf stderr sample:",
+            metrics.speedIperfStderrSample,
+          );
+        }
+
+        if (metrics.speedCurlStdoutLength > 0) {
+          console.log("[vps-sync][debug] speed curl stdout sample:", metrics.speedCurlStdoutSample);
+        }
+
+        if (metrics.speedCurlStderrLength > 0) {
+          console.log("[vps-sync][debug] speed curl stderr sample:", metrics.speedCurlStderrSample);
         }
       }
 
@@ -925,6 +1157,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         .from("vps")
         .update({
           number_of_connections: metrics.activeIps.size,
+          current_speed: metrics.currentSpeedMbPerSecond,
           connection: true,
           disabled: false,
         })
@@ -952,6 +1185,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const { error: markDisconnectedError } = await supabase
         .from("vps")
         .update({
+          current_speed: 0,
           connection: false,
           disabled: true,
         })
