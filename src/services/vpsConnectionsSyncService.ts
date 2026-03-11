@@ -1073,7 +1073,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   }
 
   const allRows = data.map((rawRow) => parseVpsSyncRow(rawRow));
-  const parsedRows = allRows.filter((row) => row.disabled !== true || row.connection === false);
+  const parsedRows = allRows.filter((row) => row.disabled !== true);
 
   if (verbose) {
     const skippedDisabled = allRows.length - parsedRows.length;
@@ -1240,7 +1240,6 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const { error: markDisconnectedError } = await supabase
         .from("vps")
         .update({
-          current_speed: 0,
           connection: false,
           disabled: true,
         })
@@ -1374,7 +1373,18 @@ export function startVpsConnectionsSyncJob(): void {
   }
 
   const intervalMs = getSyncIntervalMs();
-  console.log("[vps-sync] starting; intervalMs=" + String(intervalMs));
+  console.log(
+    "[vps-sync] starting; intervalMs=" +
+      String(intervalMs) +
+      " speedtestHost=" +
+      getSpeedtestTargetHost() +
+      " speedtestUrl=" +
+      getSpeedtestTargetUrl() +
+      " speedtestIperfPort=" +
+      String(getSpeedtestIperfPort()) +
+      " speedtestIperfDurationSec=" +
+      String(getSpeedtestIperfDurationSeconds()),
+  );
   void runSyncSafely("startup");
 
   syncIntervalTimer = setInterval(() => {
