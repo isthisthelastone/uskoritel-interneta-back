@@ -16,6 +16,13 @@ const telegramMenuKeySchema = z.enum([
 const purchaseMethodSchema = z.enum(["tg_stars", "crypto_bot", "tbd_1", "tbd_2"]);
 const faqActionSchema = z.enum(["email", "rules"]);
 const referalsActionSchema = z.enum(["prolong"]);
+const settingsActionSchema = z.enum([
+  "whitelist_unblock",
+  "vless_websocket",
+  "trojan",
+  "trojan_obfuscated",
+  "shadowsocks_wifi",
+]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
 export const subscriptionPlanMonthsSchema = z.number().int().positive();
 const giftIndexSchema = z.number().int().nonnegative();
@@ -38,6 +45,7 @@ const invoicePayloadSchema = z.discriminatedUnion("action", [
 export type HowToPlatform = z.infer<typeof howToPlatformSchema>;
 export type HowToAction = { platform: HowToPlatform };
 export type FaqAction = { kind: z.infer<typeof faqActionSchema> };
+export type SettingsAction = { kind: z.infer<typeof settingsActionSchema> };
 export type ReferalsAction =
   | { kind: z.infer<typeof referalsActionSchema> }
   | { kind: "balance_plan"; months: number };
@@ -241,6 +249,23 @@ export function getReferalsActionFromCallbackData(data: string | undefined): Ref
   }
 
   return null;
+}
+
+export function getSettingsActionFromCallbackData(data: string | undefined): SettingsAction | null {
+  if (data === undefined || !data.startsWith("settings:")) {
+    return null;
+  }
+
+  const rawAction = data.slice("settings:".length);
+  const parsedAction = settingsActionSchema.safeParse(rawAction);
+
+  if (!parsedAction.success) {
+    return null;
+  }
+
+  return {
+    kind: parsedAction.data,
+  };
 }
 
 export function getGiftsActionFromCallbackData(data: string | undefined): GiftsAction | null {

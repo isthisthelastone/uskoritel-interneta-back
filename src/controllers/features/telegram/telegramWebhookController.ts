@@ -57,6 +57,7 @@ import {
   getMenuSectionText,
   getPurchaseActionFromCallbackData,
   getReferalsActionFromCallbackData,
+  getSettingsActionFromCallbackData,
   getTelegramCommand,
   hasAccessToServers,
   parseSubscriptionInvoicePayload,
@@ -375,6 +376,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const purchaseAction = getPurchaseActionFromCallbackData(callbackQuery.data);
     const faqAction = getFaqActionFromCallbackData(callbackQuery.data);
     const referalsAction = getReferalsActionFromCallbackData(callbackQuery.data);
+    const settingsAction = getSettingsActionFromCallbackData(callbackQuery.data);
     const giftsAction = getGiftsActionFromCallbackData(callbackQuery.data);
     const countriesAction = getCountriesActionFromCallbackData(callbackQuery.data);
     const howToAction = getHowToActionFromCallbackData(callbackQuery.data);
@@ -432,23 +434,25 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                   : giftsAction.kind === "plan"
                     ? "Opening payment..."
                     : "Opening gifts..."
-                : countriesAction !== null
-                  ? countriesAction.kind === "country"
-                    ? "Loading VPS list..."
-                    : "Sending configs..."
-                  : howToAction !== null
-                    ? "Opening guide..."
-                    : menuKey === null
-                      ? "Unknown action."
-                      : menuKey === "subscription_status"
-                        ? "Fetching subscription status..."
-                        : menuKey === "countries"
-                          ? "Loading countries..."
-                          : menuKey === "faq"
-                            ? "Opening FAQ..."
-                            : menuKey === "how_to_use"
-                              ? "Opening platforms..."
-                              : "Opening section...",
+                : settingsAction !== null
+                  ? "Opening protocol..."
+                  : countriesAction !== null
+                    ? countriesAction.kind === "country"
+                      ? "Loading VPS list..."
+                      : "Sending configs..."
+                    : howToAction !== null
+                      ? "Opening guide..."
+                      : menuKey === null
+                        ? "Unknown action."
+                        : menuKey === "subscription_status"
+                          ? "Fetching subscription status..."
+                          : menuKey === "countries"
+                            ? "Loading countries..."
+                            : menuKey === "faq"
+                              ? "Opening FAQ..."
+                              : menuKey === "how_to_use"
+                                ? "Opening platforms..."
+                                : "Opening section...",
       showAlert: false,
     });
 
@@ -465,6 +469,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       purchaseAction === null &&
       faqAction === null &&
       referalsAction === null &&
+      settingsAction === null &&
       giftsAction === null &&
       countriesAction === null &&
       howToAction === null
@@ -2067,6 +2072,91 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       return;
     }
 
+    if (menuKey === "settings") {
+      const settingsProtocolsResult = await sendTelegramInlineMenuMessage({
+        chatId: callbackChatId,
+        text: "Наши протоколы:",
+        inlineKeyboardRows: [
+          [
+            {
+              text: "🚨 Вайтлист + анблок (КОГДА ГЛУШАТ)",
+              callbackData: "settings:whitelist_unblock",
+            },
+          ],
+          [{ text: "🛰️ Vless Websocket", callbackData: "settings:vless_websocket" }],
+          [{ text: "🛡️ Trojan", callbackData: "settings:trojan" }],
+          [{ text: "🔐 Trojan obfuscated", callbackData: "settings:trojan_obfuscated" }],
+          [{ text: "📶 Shadowsocks (для WiFi)", callbackData: "settings:shadowsocks_wifi" }],
+        ],
+      });
+
+      if (!settingsProtocolsResult.ok) {
+        console.error(
+          "Failed to send settings protocols menu:",
+          settingsProtocolsResult.statusCode,
+          settingsProtocolsResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: settingsProtocolsResult.ok,
+      });
+      return;
+    }
+
+    if (settingsAction !== null) {
+      const protocolTextByAction: Record<typeof settingsAction.kind, string> = {
+        whitelist_unblock:
+          "🚨 Вайтлист + анблок (когда глушат)\n\n" +
+          "Не работает интернет в центре Москвы или в регионе? Открывается только часть сайтов вроде Яндекса и Госуслуг?\n\n" +
+          "Этот режим создан специально для обхода белых списков и большей части сетевых ограничений. Он помогает восстановить доступ к обычному интернету там, где другие протоколы режутся.\n\n" +
+          "Подходит для всех устройств.",
+        vless_websocket:
+          "🛰️ Vless Websocket\n\n" +
+          "VLESS через WebSocket маскирует VPN-трафик под обычный HTTPS и лучше проходит через DPI-фильтры.\n\n" +
+          "Обычный VLESS без WebSocket обычно менее устойчив в сетях с глубокой фильтрацией и может быть проще для трекинга.\n\n" +
+          "Подходит для всех устройств.",
+        trojan:
+          "🛡️ Trojan\n\n" +
+          "Trojan использует TLS и выглядит как стандартный зашифрованный трафик, поэтому сохраняет хорошую стабильность и приватность.\n\n" +
+          "Это универсальный протокол для повседневного использования.\n\n" +
+          "Подходит для всех устройств.",
+        trojan_obfuscated:
+          "🔐 Trojan obfuscated\n\n" +
+          "Это Trojan с дополнительной обфускацией: трафик сложнее отличить от обычного веб-трафика.\n\n" +
+          "Полезен в сетях с агрессивной фильтрацией, когда стандартные варианты работают нестабильно.\n\n" +
+          "Подходит для всех устройств.",
+        shadowsocks_wifi:
+          "📶 Shadowsocks (для WiFi / LAN)\n\n" +
+          "Стабильный и быстрый режим для домашних и офисных сетей. Хорошо подходит для соединений по WiFi и кабелю.\n\n" +
+          "Важно: этот вариант не рассчитан на мобильную сеть оператора и обычно работает только через WiFi/LAN.",
+      };
+
+      const settingsInfoResult = await sendTelegramTextMessage({
+        chatId: callbackChatId,
+        text: protocolTextByAction[settingsAction.kind],
+      });
+
+      if (!settingsInfoResult.ok) {
+        console.error(
+          "Failed to send settings protocol info message:",
+          settingsInfoResult.statusCode,
+          settingsInfoResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: settingsInfoResult.ok,
+      });
+      return;
+    }
+
     if (howToAction !== null) {
       const sent = await handleHowToGuideAction(callbackChatId, howToAction.platform);
       res.status(200).json({
@@ -2401,10 +2491,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
     const callbackTelegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
 
-    if (
-      menuKey === "admin_panel" &&
-      (callbackTelegramUser === null || !callbackTelegramUser.isAdmin)
-    ) {
+    if (callbackTelegramUser === null || !callbackTelegramUser.isAdmin) {
       const deniedResult = await sendTelegramTextMessage({
         chatId: callbackChatId,
         text: "Нет доступа к админ панели.",
@@ -2428,7 +2515,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     const menuPayload = buildTelegramMenu("unknown", {
-      isAdmin: callbackTelegramUser?.isAdmin === true,
+      isAdmin: callbackTelegramUser.isAdmin,
     });
     const editResult = await editTelegramInlineMenuMessage({
       chatId: callbackChatId,
