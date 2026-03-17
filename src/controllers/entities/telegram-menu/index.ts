@@ -63,17 +63,7 @@ export function buildVpsButtonText(input: {
     : 0;
   const speedEmoji = getSpeedEmoji(speed);
   const loadEmoji = getLoadEmoji(connections);
-  const speedLabel = Math.round(speed).toString();
-  const line =
-    displayName +
-    " | Скорость " +
-    speedEmoji +
-    " " +
-    speedLabel +
-    " | Загруженность " +
-    loadEmoji +
-    " " +
-    String(connections);
+  const line = displayName + " | Скорость " + speedEmoji + " | Загруженность " + loadEmoji;
 
   return trimButtonLabel(line);
 }
