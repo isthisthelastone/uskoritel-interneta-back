@@ -21,11 +21,11 @@ export function getMenuSectionText(menuKey: TelegramMenuKey): string {
 
 function getSpeedEmoji(speedMbPerSec: number): string {
   if (speedMbPerSec < 50) {
-    return "🔴";
+    return "🟠";
   }
 
   if (speedMbPerSec < 100) {
-    return "🟠";
+    return "🟡";
   }
 
   return "🟢";
@@ -37,10 +37,10 @@ function getLoadEmoji(numberOfConnections: number): string {
   }
 
   if (numberOfConnections <= 50) {
-    return "🟠";
+    return "🟡";
   }
 
-  return "🔴";
+  return "🟠";
 }
 
 function trimButtonLabel(value: string): string {
