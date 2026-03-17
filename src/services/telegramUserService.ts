@@ -25,6 +25,7 @@ const telegramGiftSchema = z.object({
 
 const telegramUserRowSchema = z.object({
   internal_uuid: z.uuid(),
+  created_at: z.string(),
   tg_nickname: z.string().nullable(),
   tg_id: z.string(),
   subscription_active: z.boolean(),
@@ -41,6 +42,8 @@ const telegramUserRowSchema = z.object({
   promo: z.string().nullable(),
   current_discount: z.number().int().nonnegative().max(100),
   has_purchased: z.boolean(),
+  connections_by_server: z.record(z.string(), z.number().nonnegative()).optional().default({}),
+  isBanned: z.boolean().optional().default(false),
   isAdmin: z.boolean().optional().default(false),
 });
 
@@ -125,6 +128,7 @@ interface ApplyPromoToTelegramUserInput {
 
 const telegramUserSelectFields = [
   "internal_uuid",
+  "created_at",
   "tg_nickname",
   "tg_id",
   "subscription_active",
@@ -141,6 +145,8 @@ const telegramUserSelectFields = [
   "promo",
   "current_discount",
   "has_purchased",
+  "connections_by_server",
+  '"isBanned"',
   '"isAdmin"',
 ].join(", ");
 

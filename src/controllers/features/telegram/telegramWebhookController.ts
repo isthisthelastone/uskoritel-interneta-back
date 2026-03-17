@@ -4,7 +4,6 @@ import {
   answerTelegramCallbackQuery,
   answerTelegramPreCheckoutQuery,
   clearTelegramChatHistoryBySweep,
-  editTelegramInlineMenuMessage,
   sendTelegramInlineMenuMessage,
   sendTelegramStarsInvoice,
   sendTelegramTextMessage,
@@ -36,11 +35,24 @@ import {
   updateCryptoBotInvoiceStatus,
 } from "../../../services/cryptoBotService";
 import {
+  banTelegramUserByNickname,
+  disableAdminVpsServer,
+  disconnectTelegramUserConnectionsByNickname,
+  enableAdminVpsServer,
+  getAdminUserDetailsByTgId,
+  getAdminVpsServerByInternalUuid,
+  listAdminUsersPage,
+  listAdminVpsServers,
+  reloadAdminVpsServer,
+  unbanTelegramUserByNickname,
+} from "../../../services/telegramAdminService";
+import {
   issueOrGetUserVpsConfigUrls,
   listUniqueVpsCountries,
   listVpsByCountry,
 } from "../../../services/vpsCatalogService";
 import {
+  getAdminActionFromCallbackData,
   buildGiftInvoicePayload,
   buildVpsButtonText,
   buildSubscriptionInvoicePayload,
@@ -54,7 +66,6 @@ import {
   getHowToActionFromCallbackData,
   getGiftsActionFromCallbackData,
   getMenuKeyFromCallbackData,
-  getMenuSectionText,
   getPurchaseActionFromCallbackData,
   getReferalsActionFromCallbackData,
   getSettingsActionFromCallbackData,
@@ -116,11 +127,20 @@ const telegramUpdateSchema = z.object({
 
 const pendingGiftRecipientInputByTgId = new Map<string, number>();
 const pendingPromoInputByTgId = new Map<string, number>();
+type PendingAdminUserInputAction = "ban" | "unban" | "disconnect_all";
+interface PendingAdminUserInputState {
+  action: PendingAdminUserInputAction;
+  createdAt: number;
+}
+const pendingAdminUserInputByTgId = new Map<string, PendingAdminUserInputState>();
 const pendingGiftRecipientInputTtlMs = 15 * 60 * 1000;
 const pendingPromoInputTtlMs = 15 * 60 * 1000;
+const pendingAdminUserInputTtlMs = 15 * 60 * 1000;
 const clearQueueMaxPending = 5;
 const clearQueueSweepLimit = 5000;
 const clearQueueOverloadedErrorCode = "CLEAR_QUEUE_OVERLOADED";
+const adminUsersPageSize = 10;
+const supportTelegramHandle = process.env.SUPPORT_TG_USERNAME?.trim() || "@starlinkacc";
 
 interface ClearQueueTask {
   chatId: number;
@@ -190,6 +210,122 @@ function hasPendingPromoInput(tgId: string): boolean {
   }
 
   return true;
+}
+
+function startPendingAdminUserInput(tgId: string, action: PendingAdminUserInputAction): void {
+  pendingAdminUserInputByTgId.set(tgId, {
+    action,
+    createdAt: Date.now(),
+  });
+}
+
+function clearPendingAdminUserInput(tgId: string): void {
+  pendingAdminUserInputByTgId.delete(tgId);
+}
+
+function getPendingAdminUserInputAction(tgId: string): PendingAdminUserInputAction | null {
+  const state = pendingAdminUserInputByTgId.get(tgId);
+
+  if (state === undefined) {
+    return null;
+  }
+
+  if (Date.now() - state.createdAt > pendingAdminUserInputTtlMs) {
+    pendingAdminUserInputByTgId.delete(tgId);
+    return null;
+  }
+
+  return state.action;
+}
+
+function getBannedUserMessage(): string {
+  return "Вы забанены, обратитесь в поддержку: " + supportTelegramHandle;
+}
+
+function formatSubscriptionStatusLabel(status: "live" | "ending" | null): string {
+  if (status === "live") {
+    return "LIVE";
+  }
+
+  if (status === "ending") {
+    return "ENDING";
+  }
+
+  return "NOT_FOUND";
+}
+
+function buildAdminPanelRootKeyboard() {
+  return [
+    [{ text: "👥 Пользователи", callbackData: "admin:users" }],
+    [{ text: "🖥️ Серверы", callbackData: "admin:servers" }],
+  ];
+}
+
+function buildAdminUsersMenuKeyboard() {
+  return [
+    [{ text: "📄 Список пользователей", callbackData: "admin:users:list:1" }],
+    [{ text: "⛔ Забанить пользователя", callbackData: "admin:users:prompt:ban" }],
+    [{ text: "✅ Разбанить пользователя", callbackData: "admin:users:prompt:unban" }],
+    [
+      {
+        text: "🔌 Отключить пользователю все соединения",
+        callbackData: "admin:users:prompt:disconnect_all",
+      },
+    ],
+    [{ text: "⬅️ Назад в админ панель", callbackData: "admin:root" }],
+  ];
+}
+
+function buildAdminUsersPaginationRows(params: {
+  page: number;
+  totalPages: number;
+}): Array<Array<{ text: string; callbackData: string }>> {
+  const rows: Array<Array<{ text: string; callbackData: string }>> = [];
+
+  if (params.totalPages > 1) {
+    rows.push([
+      {
+        text: "⬅️",
+        callbackData: "admin:users:list:" + String(Math.max(1, params.page - 1)),
+      },
+      {
+        text: "Стр. " + String(params.page) + "/" + String(params.totalPages),
+        callbackData: "admin:users:list:" + String(params.page),
+      },
+      {
+        text: "➡️",
+        callbackData: "admin:users:list:" + String(Math.min(params.totalPages, params.page + 1)),
+      },
+    ]);
+
+    const pageButtons: Array<{ text: string; callbackData: string }> = [];
+    const start = Math.max(1, params.page - 2);
+    const end = Math.min(params.totalPages, start + 4);
+
+    for (let nextPage = start; nextPage <= end; nextPage += 1) {
+      pageButtons.push({
+        text: nextPage === params.page ? "• " + String(nextPage) : String(nextPage),
+        callbackData: "admin:users:list:" + String(nextPage),
+      });
+    }
+
+    rows.push(pageButtons);
+  }
+
+  rows.push([{ text: "⬅️ Назад к пользователям", callbackData: "admin:users" }]);
+  return rows;
+}
+
+function formatAdminServerStatus(server: { connection: boolean; disabled: boolean }): string {
+  if (server.disabled) {
+    return "🔴 OFF";
+  }
+
+  if (!server.connection) {
+    return "🟠 DOWN";
+  }
+
+  return "🟢 UP";
 }
 
 function getClearQueueLoad(): number {
@@ -377,6 +513,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     const faqAction = getFaqActionFromCallbackData(callbackQuery.data);
     const referalsAction = getReferalsActionFromCallbackData(callbackQuery.data);
     const settingsAction = getSettingsActionFromCallbackData(callbackQuery.data);
+    const adminAction = getAdminActionFromCallbackData(callbackQuery.data);
     const giftsAction = getGiftsActionFromCallbackData(callbackQuery.data);
     const countriesAction = getCountriesActionFromCallbackData(callbackQuery.data);
     const howToAction = getHowToActionFromCallbackData(callbackQuery.data);
@@ -436,23 +573,35 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                     : "Opening gifts..."
                 : settingsAction !== null
                   ? "Opening protocol..."
-                  : countriesAction !== null
-                    ? countriesAction.kind === "country"
-                      ? "Loading VPS list..."
-                      : "Sending configs..."
-                    : howToAction !== null
-                      ? "Opening guide..."
-                      : menuKey === null
-                        ? "Unknown action."
-                        : menuKey === "subscription_status"
-                          ? "Fetching subscription status..."
-                          : menuKey === "countries"
-                            ? "Loading countries..."
-                            : menuKey === "faq"
-                              ? "Opening FAQ..."
-                              : menuKey === "how_to_use"
-                                ? "Opening platforms..."
-                                : "Opening section...",
+                  : adminAction !== null
+                    ? adminAction.kind === "users_list"
+                      ? "Loading users..."
+                      : adminAction.kind === "users_detail"
+                        ? "Loading user..."
+                        : adminAction.kind === "servers"
+                          ? "Loading servers..."
+                          : adminAction.kind === "servers_detail"
+                            ? "Loading server..."
+                            : adminAction.kind === "servers_action"
+                              ? "Processing server action..."
+                              : "Opening admin..."
+                    : countriesAction !== null
+                      ? countriesAction.kind === "country"
+                        ? "Loading VPS list..."
+                        : "Sending configs..."
+                      : howToAction !== null
+                        ? "Opening guide..."
+                        : menuKey === null
+                          ? "Unknown action."
+                          : menuKey === "subscription_status"
+                            ? "Fetching subscription status..."
+                            : menuKey === "countries"
+                              ? "Loading countries..."
+                              : menuKey === "faq"
+                                ? "Opening FAQ..."
+                                : menuKey === "how_to_use"
+                                  ? "Opening platforms..."
+                                  : "Opening section...",
       showAlert: false,
     });
 
@@ -470,6 +619,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       faqAction === null &&
       referalsAction === null &&
       settingsAction === null &&
+      adminAction === null &&
       giftsAction === null &&
       countriesAction === null &&
       howToAction === null
@@ -490,6 +640,431 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         reason: "Callback chat is missing.",
       });
       return;
+    }
+
+    const callbackTelegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+
+    if (callbackTelegramUser !== null && callbackTelegramUser.isBanned) {
+      const bannedResult = await sendTelegramTextMessage({
+        chatId: callbackChatId,
+        text: getBannedUserMessage(),
+      });
+
+      if (!bannedResult.ok) {
+        console.error(
+          "Failed to send banned user message on callback:",
+          bannedResult.statusCode,
+          bannedResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: bannedResult.ok,
+      });
+      return;
+    }
+
+    if (menuKey === "admin_panel" || adminAction !== null) {
+      if (callbackTelegramUser === null || !callbackTelegramUser.isAdmin) {
+        const deniedResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "Нет доступа к админ панели.",
+        });
+
+        if (!deniedResult.ok) {
+          console.error(
+            "Failed to send admin panel access denied message:",
+            deniedResult.statusCode,
+            deniedResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: deniedResult.ok,
+        });
+        return;
+      }
+
+      try {
+        if (menuKey === "admin_panel" || adminAction?.kind === "root") {
+          const adminRootResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: "Админ панель:",
+            inlineKeyboardRows: buildAdminPanelRootKeyboard(),
+          });
+
+          if (!adminRootResult.ok) {
+            console.error(
+              "Failed to send admin panel root menu:",
+              adminRootResult.statusCode,
+              adminRootResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: adminRootResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "users") {
+          const usersMenuResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: "Управление пользователями:",
+            inlineKeyboardRows: buildAdminUsersMenuKeyboard(),
+          });
+
+          if (!usersMenuResult.ok) {
+            console.error(
+              "Failed to send admin users menu:",
+              usersMenuResult.statusCode,
+              usersMenuResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: usersMenuResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "users_prompt") {
+          const actionTextMap: Record<PendingAdminUserInputAction, string> = {
+            ban: "Введите логин пользователя в Telegram вместе с @ для бана:",
+            unban: "Введите логин пользователя в Telegram вместе с @ для разбана:",
+            disconnect_all:
+              "Введите логин пользователя в Telegram вместе с @, чтобы отключить все его соединения:",
+          };
+
+          startPendingAdminUserInput(String(callbackQuery.from.id), adminAction.action);
+          const promptResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: actionTextMap[adminAction.action],
+          });
+
+          if (!promptResult.ok) {
+            console.error(
+              "Failed to send admin users prompt message:",
+              promptResult.statusCode,
+              promptResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: promptResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "users_list") {
+          const usersPage = await listAdminUsersPage(adminAction.page, adminUsersPageSize);
+          const userRows = usersPage.users.map((user) => [
+            {
+              text:
+                (user.isBanned ? "⛔ " : "") +
+                "@" +
+                (user.tgNickname ?? user.tgId) +
+                " • " +
+                user.tgId,
+              callbackData: "admin:users:detail:" + user.tgId,
+            },
+          ]);
+          const paginationRows = buildAdminUsersPaginationRows({
+            page: usersPage.page,
+            totalPages: usersPage.totalPages,
+          });
+          const usersListResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text:
+              "Пользователи: " +
+              String(usersPage.totalCount) +
+              "\nСтраница: " +
+              String(usersPage.page) +
+              "/" +
+              String(usersPage.totalPages),
+            inlineKeyboardRows:
+              usersPage.users.length === 0
+                ? [
+                    [{ text: "Пользователей пока нет", callbackData: "admin:users:list:1" }],
+                    [{ text: "⬅️ Назад к пользователям", callbackData: "admin:users" }],
+                  ]
+                : [...userRows, ...paginationRows],
+          });
+
+          if (!usersListResult.ok) {
+            console.error(
+              "Failed to send admin users paginated list:",
+              usersListResult.statusCode,
+              usersListResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: usersListResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "users_detail") {
+          const details = await getAdminUserDetailsByTgId(adminAction.tgId);
+          const userDetailsText =
+            details === null
+              ? "Пользователь не найден."
+              : [
+                  "👤 Пользователь",
+                  "Ник в тг: @" + (details.tgNickname ?? "—"),
+                  "ТГ айди: " + details.tgId,
+                  "Всего траффика: " + String(details.trafficConsumedMb) + " MB",
+                  "Статус подписки: " + formatSubscriptionStatusLabel(details.subscriptionStatus),
+                  "Подписка до: " + (details.subscriptionUntill ?? "—"),
+                  "Дата создания: " + details.createdAt,
+                  "Заработано с рефералки: $" + details.earnedMoney.toFixed(2),
+                  "Подарки: " + String(details.giftsCount),
+                  "Скидка: " + String(details.currentDiscount) + "%",
+                  "Покупал подписку: " + (details.hasPurchased ? "Да" : "Нет"),
+                  "Забанен: " + (details.isBanned ? "Да" : "Нет"),
+                  "Подключен к: " + (details.connectedToServers.join(", ") || "—"),
+                  "Всего подключений сейчас: " + String(details.numberOfConnections),
+                  details.connectionsByServer.length === 0
+                    ? "Карта подключений по серверам: —"
+                    : "Карта подключений по серверам: " +
+                      details.connectionsByServer
+                        .map((entry) => entry.label + " = " + String(entry.activeConnections))
+                        .join("; "),
+                ].join("\n");
+
+          const userDetailsResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: userDetailsText,
+            inlineKeyboardRows: [
+              [{ text: "⬅️ Назад к пользователям", callbackData: "admin:users" }],
+            ],
+          });
+
+          if (!userDetailsResult.ok) {
+            console.error(
+              "Failed to send admin user details:",
+              userDetailsResult.statusCode,
+              userDetailsResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: userDetailsResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "servers") {
+          const servers = await listAdminVpsServers();
+          const serversResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: "Серверы: " + String(servers.length),
+            inlineKeyboardRows:
+              servers.length === 0
+                ? [[{ text: "Серверов пока нет", callbackData: "admin:servers" }]]
+                : [
+                    ...servers.map((server) => [
+                      {
+                        text:
+                          formatAdminServerStatus(server) +
+                          " " +
+                          (server.nickname ??
+                            "VPS " + server.internalUuid.slice(0, 8).toUpperCase()) +
+                          " (" +
+                          server.countryEmoji +
+                          " " +
+                          server.country +
+                          ")",
+                        callbackData: "admin:servers:detail:" + server.internalUuid,
+                      },
+                    ]),
+                    [{ text: "⬅️ Назад в админ панель", callbackData: "admin:root" }],
+                  ],
+          });
+
+          if (!serversResult.ok) {
+            console.error(
+              "Failed to send admin servers list:",
+              serversResult.statusCode,
+              serversResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: serversResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "servers_detail") {
+          const server = await getAdminVpsServerByInternalUuid(adminAction.internalUuid);
+          const serverText =
+            server === null
+              ? "Сервер не найден."
+              : [
+                  "🖥️ Сервер",
+                  "internal_uuid: " + server.internalUuid,
+                  "nickname: " + (server.nickname ?? "—"),
+                  "country: " + server.country + " " + server.countryEmoji,
+                  "api_address: " + server.apiAddress,
+                  "domain: " + server.domain,
+                  "ssh_key: " + server.sshKey,
+                  "password: " + server.password,
+                  "optional_passsword: " + (server.optionalPasssword ?? "null"),
+                  "number_of_connections: " + String(server.numberOfConnections),
+                  "current_speed: " + server.currentSpeed.toFixed(2) + " MB/s",
+                  "connection: " + (server.connection ? "true" : "false"),
+                  "disabled: " + (server.disabled ? "true" : "false"),
+                  "users_kv_count: " + String(server.usersKvCount),
+                  "users_kv_map_keys: " + (server.usersKvMapKeys.join(", ") || "—"),
+                  "config_list_count: " + String(server.configList.length),
+                  "config_list: " + (server.configList.join(" | ") || "—"),
+                  "created_at: " + server.createdAt,
+                  "updated_at: " + server.updatedAt,
+                ].join("\n");
+
+          const serverActionsRows =
+            server === null
+              ? [[{ text: "⬅️ Назад к серверам", callbackData: "admin:servers" }]]
+              : [
+                  ...(server.disabled || !server.connection
+                    ? [
+                        [
+                          {
+                            text: "✅ Включить сервер",
+                            callbackData: "admin:servers:action:enable:" + server.internalUuid,
+                          },
+                        ],
+                      ]
+                    : []),
+                  [
+                    {
+                      text: "🔄 Перезагрузить",
+                      callbackData: "admin:servers:action:reload:" + server.internalUuid,
+                    },
+                  ],
+                  [
+                    {
+                      text: "⛔ Отключить сервер",
+                      callbackData: "admin:servers:action:disable:" + server.internalUuid,
+                    },
+                  ],
+                  [{ text: "⬅️ Назад к серверам", callbackData: "admin:servers" }],
+                ];
+
+          const serverDetailsResult = await sendTelegramInlineMenuMessage({
+            chatId: callbackChatId,
+            text: serverText,
+            inlineKeyboardRows: serverActionsRows,
+          });
+
+          if (!serverDetailsResult.ok) {
+            console.error(
+              "Failed to send admin server details:",
+              serverDetailsResult.statusCode,
+              serverDetailsResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: serverDetailsResult.ok,
+          });
+          return;
+        }
+
+        if (adminAction?.kind === "servers_action") {
+          const refreshedServer =
+            adminAction.action === "enable"
+              ? await enableAdminVpsServer(adminAction.internalUuid)
+              : adminAction.action === "reload"
+                ? await reloadAdminVpsServer(adminAction.internalUuid)
+                : await disableAdminVpsServer(adminAction.internalUuid);
+
+          const actionTitle =
+            adminAction.action === "enable"
+              ? "Сервер включен"
+              : adminAction.action === "reload"
+                ? "Сервер перезагружен"
+                : "Сервер отключен";
+
+          const serverActionResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text:
+              "✅ " +
+              actionTitle +
+              "\nСервер: " +
+              (refreshedServer.nickname ?? refreshedServer.internalUuid) +
+              "\nСтатус: " +
+              formatAdminServerStatus(refreshedServer),
+          });
+
+          if (!serverActionResult.ok) {
+            console.error(
+              "Failed to send admin server action result:",
+              serverActionResult.statusCode,
+              serverActionResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: serverActionResult.ok,
+          });
+          return;
+        }
+      } catch (error) {
+        console.error("Admin panel action failed:", error);
+        const failedResult = await sendTelegramTextMessage({
+          chatId: callbackChatId,
+          text: "Не удалось выполнить действие админ панели. Проверьте логи.",
+        });
+
+        if (!failedResult.ok) {
+          console.error(
+            "Failed to send admin action failure message:",
+            failedResult.statusCode,
+            failedResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: failedResult.ok,
+        });
+        return;
+      }
     }
 
     if (purchaseAction !== null) {
@@ -2480,63 +3055,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       return;
     }
 
-    if (menuKey === null) {
-      res.status(200).json({
-        ok: true,
-        processed: true,
-        callbackHandled: false,
-      });
-      return;
-    }
-
-    const callbackTelegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
-
-    if (callbackTelegramUser === null || !callbackTelegramUser.isAdmin) {
-      const deniedResult = await sendTelegramTextMessage({
-        chatId: callbackChatId,
-        text: "Нет доступа к админ панели.",
-      });
-
-      if (!deniedResult.ok) {
-        console.error(
-          "Failed to send admin access denied message:",
-          deniedResult.statusCode,
-          deniedResult.error,
-        );
-      }
-
-      res.status(200).json({
-        ok: true,
-        processed: true,
-        callbackHandled: true,
-        edited: false,
-      });
-      return;
-    }
-
-    const menuPayload = buildTelegramMenu("unknown", {
-      isAdmin: callbackTelegramUser.isAdmin,
-    });
-    const editResult = await editTelegramInlineMenuMessage({
-      chatId: callbackChatId,
-      messageId: callbackMessageId,
-      text: getMenuSectionText(menuKey),
-      inlineKeyboardRows: menuPayload.inlineKeyboardRows,
-    });
-
-    if (!editResult.ok) {
-      console.error(
-        "Failed to edit Telegram menu message:",
-        editResult.statusCode,
-        editResult.error,
-      );
-    }
-
     res.status(200).json({
       ok: true,
       processed: true,
-      callbackHandled: true,
-      edited: editResult.ok,
+      callbackHandled: false,
     });
     return;
   }
@@ -2799,6 +3321,154 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       reason: "Sender/chat mismatch detected.",
     });
     return;
+  }
+
+  if (
+    message.from !== undefined &&
+    message.text !== undefined &&
+    getPendingAdminUserInputAction(String(message.from.id)) !== null &&
+    !message.text.trim().startsWith("/")
+  ) {
+    const adminAction = getPendingAdminUserInputAction(String(message.from.id));
+    const requesterUser = await getTelegramUserByTgId(String(message.from.id));
+
+    if (adminAction === null || requesterUser === null || !requesterUser.isAdmin) {
+      clearPendingAdminUserInput(String(message.from.id));
+      const deniedResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Нет доступа к админ панели.",
+      });
+
+      if (!deniedResult.ok) {
+        console.error(
+          "Failed to send admin input access denied message:",
+          deniedResult.statusCode,
+          deniedResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingAdminInput: false,
+        sent: deniedResult.ok,
+      });
+      return;
+    }
+
+    const rawNicknameInput = message.text.trim();
+
+    if (!/^@[a-zA-Z0-9_]{5,32}$/u.test(rawNicknameInput)) {
+      const invalidInputResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Введите корректный логин пользователя в формате @username.",
+      });
+
+      if (!invalidInputResult.ok) {
+        console.error(
+          "Failed to send invalid admin user input message:",
+          invalidInputResult.statusCode,
+          invalidInputResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingAdminInput: true,
+        sent: invalidInputResult.ok,
+      });
+      return;
+    }
+
+    try {
+      let successText = "";
+
+      if (adminAction === "ban") {
+        const actionResult = await banTelegramUserByNickname({
+          nickname: rawNicknameInput,
+        });
+        successText =
+          "✅ Пользователь забанен и отключен от серверов.\nТГ ID: " +
+          actionResult.userTgId +
+          "\nЗатронуто серверов: " +
+          String(actionResult.touchedServers) +
+          "\nОтключено IP: " +
+          String(actionResult.disconnectedIps);
+      } else if (adminAction === "unban") {
+        const actionResult = await unbanTelegramUserByNickname({
+          nickname: rawNicknameInput,
+        });
+        successText = "✅ Пользователь разбанен.\nТГ ID: " + actionResult.userTgId;
+      } else {
+        const actionResult = await disconnectTelegramUserConnectionsByNickname({
+          nickname: rawNicknameInput,
+        });
+        successText =
+          "✅ Соединения пользователя отключены.\nТГ ID: " +
+          actionResult.userTgId +
+          "\nПроверено серверов: " +
+          String(actionResult.touchedServers) +
+          "\nОтключено IP: " +
+          String(actionResult.disconnectedIps);
+      }
+
+      clearPendingAdminUserInput(String(message.from.id));
+
+      const successResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: successText,
+      });
+
+      if (!successResult.ok) {
+        console.error(
+          "Failed to send admin input success message:",
+          successResult.statusCode,
+          successResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingAdminInput: false,
+        sent: successResult.ok,
+      });
+      return;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "UNKNOWN";
+      const userNotFound = errorMessage.includes("USER_NOT_FOUND");
+      const cannotBanAdmin = errorMessage.includes("CANNOT_BAN_ADMIN");
+
+      const failedResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: userNotFound
+          ? "Пользователь не найден."
+          : cannotBanAdmin
+            ? "Нельзя забанить администратора."
+            : "Не удалось выполнить действие. Проверьте логи и повторите попытку.",
+      });
+
+      if (!failedResult.ok) {
+        console.error(
+          "Failed to send admin input failure message:",
+          failedResult.statusCode,
+          failedResult.error,
+        );
+      }
+
+      if (!userNotFound && !cannotBanAdmin) {
+        console.error("Failed to process pending admin user action:", error);
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingAdminInput: true,
+        sent: failedResult.ok,
+      });
+      return;
+    }
   }
 
   if (
@@ -3110,6 +3780,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     if (message.from !== undefined) {
       clearPendingGiftRecipientInput(String(message.from.id));
       clearPendingPromoInput(String(message.from.id));
+      clearPendingAdminUserInput(String(message.from.id));
     }
 
     try {
@@ -3216,6 +3887,29 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       ok: true,
       processed: false,
       reason: "Failed to sync user profile.",
+    });
+    return;
+  }
+
+  if (userSyncResult.user.isBanned) {
+    const bannedResult = await sendTelegramTextMessage({
+      chatId: message.chat.id,
+      text: getBannedUserMessage(),
+    });
+
+    if (!bannedResult.ok) {
+      console.error(
+        "Failed to send banned user message on command:",
+        bannedResult.statusCode,
+        bannedResult.error,
+      );
+    }
+
+    res.status(200).json({
+      ok: true,
+      processed: true,
+      command,
+      sent: bannedResult.ok,
     });
     return;
   }

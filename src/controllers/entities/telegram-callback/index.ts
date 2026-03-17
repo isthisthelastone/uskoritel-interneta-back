@@ -23,10 +23,13 @@ const settingsActionSchema = z.enum([
   "trojan_obfuscated",
   "shadowsocks_wifi",
 ]);
+const adminUsersActionSchema = z.enum(["ban", "unban", "disconnect_all"]);
+const adminServersActionSchema = z.enum(["enable", "reload", "disable"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
 export const subscriptionPlanMonthsSchema = z.number().int().positive();
 const giftIndexSchema = z.number().int().nonnegative();
 const cryptoBotInvoiceIdSchema = z.number().int().positive();
+const adminUsersPageSchema = z.number().int().positive();
 const tgIdSchema = z.string().regex(/^[1-9]\d{0,19}$/u);
 const invoicePayloadSchema = z.discriminatedUnion("action", [
   z.object({
@@ -46,6 +49,19 @@ export type HowToPlatform = z.infer<typeof howToPlatformSchema>;
 export type HowToAction = { platform: HowToPlatform };
 export type FaqAction = { kind: z.infer<typeof faqActionSchema> };
 export type SettingsAction = { kind: z.infer<typeof settingsActionSchema> };
+export type AdminAction =
+  | { kind: "root" }
+  | { kind: "users" }
+  | { kind: "users_list"; page: number }
+  | { kind: "users_detail"; tgId: string }
+  | { kind: "users_prompt"; action: z.infer<typeof adminUsersActionSchema> }
+  | { kind: "servers" }
+  | { kind: "servers_detail"; internalUuid: string }
+  | {
+      kind: "servers_action";
+      action: z.infer<typeof adminServersActionSchema>;
+      internalUuid: string;
+    };
 export type ReferalsAction =
   | { kind: z.infer<typeof referalsActionSchema> }
   | { kind: "balance_plan"; months: number };
@@ -266,6 +282,103 @@ export function getSettingsActionFromCallbackData(data: string | undefined): Set
   return {
     kind: parsedAction.data,
   };
+}
+
+export function getAdminActionFromCallbackData(data: string | undefined): AdminAction | null {
+  if (data === undefined || !data.startsWith("admin:")) {
+    return null;
+  }
+
+  if (data === "admin:root") {
+    return { kind: "root" };
+  }
+
+  if (data === "admin:users") {
+    return { kind: "users" };
+  }
+
+  if (data.startsWith("admin:users:list:")) {
+    const pageRaw = Number.parseInt(data.slice("admin:users:list:".length), 10);
+    const parsedPage = adminUsersPageSchema.safeParse(pageRaw);
+
+    if (!parsedPage.success) {
+      return null;
+    }
+
+    return {
+      kind: "users_list",
+      page: parsedPage.data,
+    };
+  }
+
+  if (data.startsWith("admin:users:detail:")) {
+    const tgIdRaw = data.slice("admin:users:detail:".length);
+    const parsedTgId = tgIdSchema.safeParse(tgIdRaw);
+
+    if (!parsedTgId.success) {
+      return null;
+    }
+
+    return {
+      kind: "users_detail",
+      tgId: parsedTgId.data,
+    };
+  }
+
+  if (data.startsWith("admin:users:prompt:")) {
+    const actionRaw = data.slice("admin:users:prompt:".length);
+    const parsedAction = adminUsersActionSchema.safeParse(actionRaw);
+
+    if (!parsedAction.success) {
+      return null;
+    }
+
+    return {
+      kind: "users_prompt",
+      action: parsedAction.data,
+    };
+  }
+
+  if (data === "admin:servers") {
+    return { kind: "servers" };
+  }
+
+  if (data.startsWith("admin:servers:detail:")) {
+    const internalUuidRaw = data.slice("admin:servers:detail:".length);
+    const parsedUuid = z.uuid().safeParse(internalUuidRaw);
+
+    if (!parsedUuid.success) {
+      return null;
+    }
+
+    return {
+      kind: "servers_detail",
+      internalUuid: parsedUuid.data,
+    };
+  }
+
+  if (data.startsWith("admin:servers:action:")) {
+    const parts = data.split(":");
+
+    if (parts.length !== 5) {
+      return null;
+    }
+
+    const parsedAction = adminServersActionSchema.safeParse(parts[3]);
+    const parsedUuid = z.uuid().safeParse(parts[4]);
+
+    if (!parsedAction.success || !parsedUuid.success) {
+      return null;
+    }
+
+    return {
+      kind: "servers_action",
+      action: parsedAction.data,
+      internalUuid: parsedUuid.data,
+    };
+  }
+
+  return null;
 }
 
 export function getGiftsActionFromCallbackData(data: string | undefined): GiftsAction | null {

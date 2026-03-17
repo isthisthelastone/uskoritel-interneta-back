@@ -12,6 +12,11 @@ interface EnsureVpsTrojanClientInput {
   password: string;
 }
 
+interface RemoveVpsTrojanClientInput {
+  sshConfig: VpsSshConfig;
+  userInternalUuid: string;
+}
+
 type JsonObject = Record<string, unknown>;
 
 interface XrayConfigDocument extends JsonObject {
@@ -129,6 +134,38 @@ function upsertTrojanClientByEmail(
   return true;
 }
 
+function removeTrojanClientByEmail(
+  config: XrayConfigDocument,
+  inboundTag: string,
+  userInternalUuid: string,
+): boolean {
+  const inbound = config.inbounds.find(
+    (item) => typeof item.tag === "string" && item.tag === inboundTag,
+  );
+
+  if (inbound === undefined) {
+    throw new Error("Xray inbound tag is missing: " + inboundTag);
+  }
+
+  const clients = getInboundClients(inbound, inboundTag);
+  const initialLength = clients.length;
+  const nextClients = clients.filter((client) => client.email !== userInternalUuid);
+
+  if (nextClients.length === initialLength) {
+    return false;
+  }
+
+  const settingsRaw = inbound.settings;
+
+  if (typeof settingsRaw !== "object" || settingsRaw === null || Array.isArray(settingsRaw)) {
+    throw new Error("Xray inbound " + inboundTag + " has invalid settings object.");
+  }
+
+  const settings = settingsRaw as JsonObject;
+  settings.clients = nextClients;
+  return true;
+}
+
 async function readRemoteXrayConfig(
   sshConfig: VpsSshConfig,
   configPath: string,
@@ -184,6 +221,28 @@ export async function ensureVpsTrojanClient(input: EnsureVpsTrojanClientInput): 
     runtimeConfig.obfsTag,
     input.userInternalUuid,
     input.password,
+  );
+
+  if (!directChanged && !obfsChanged) {
+    return false;
+  }
+
+  await writeRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath, xrayConfig);
+  return true;
+}
+
+export async function removeVpsTrojanClient(input: RemoveVpsTrojanClientInput): Promise<boolean> {
+  const runtimeConfig = getXrayRuntimeConfig();
+  const xrayConfig = await readRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath);
+  const directChanged = removeTrojanClientByEmail(
+    xrayConfig,
+    runtimeConfig.directTag,
+    input.userInternalUuid,
+  );
+  const obfsChanged = removeTrojanClientByEmail(
+    xrayConfig,
+    runtimeConfig.obfsTag,
+    input.userInternalUuid,
   );
 
   if (!directChanged && !obfsChanged) {

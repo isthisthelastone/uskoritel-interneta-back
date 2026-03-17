@@ -1082,6 +1082,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     }
   }
   const userAggregates = new Map<string, UserAggregate>();
+  const userConnectionsByServer = new Map<string, Record<string, number>>();
   const perVpsUserTotals = new Map<string, number>();
   const pendingAbuseEvents: Array<{ sshConfig: VpsSshConfig; event: AbuseEvent }> = [];
   const nodeSummaries: VpsNodeSyncSummary[] = [];
@@ -1153,6 +1154,10 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
             monthIps: new Set<string>(),
           });
         }
+
+        if (!userConnectionsByServer.has(userId)) {
+          userConnectionsByServer.set(userId, {});
+        }
       }
 
       for (const [userId, bytes] of metrics.userTrafficBytes.entries()) {
@@ -1167,6 +1172,10 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
             monthIps: new Set<string>(),
           });
         }
+
+        if (!userConnectionsByServer.has(userId)) {
+          userConnectionsByServer.set(userId, {});
+        }
       }
 
       for (const [userId, ips] of metrics.userCurrentIps.entries()) {
@@ -1180,6 +1189,22 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         }
 
         userAggregates.set(userId, aggregate);
+
+        const previousConnectionsByServerMap = userConnectionsByServer.get(userId) ?? {};
+        const serverConnectionCount = ips.size;
+        const nextConnectionsByServerMap =
+          serverConnectionCount > 0
+            ? {
+                ...previousConnectionsByServerMap,
+                [row.internal_uuid]: serverConnectionCount,
+              }
+            : Object.fromEntries(
+                Object.entries(previousConnectionsByServerMap).filter(
+                  ([internalUuid]) => internalUuid !== row.internal_uuid,
+                ),
+              );
+
+        userConnectionsByServer.set(userId, nextConnectionsByServerMap);
 
         if (aggregate.currentIps.size > userIpLimit) {
           abusiveUsers.push(userId);
@@ -1310,9 +1335,11 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       number_of_connections: number;
       number_of_connections_last_month: number;
       traffic_consumed_mb?: number;
+      connections_by_server: Record<string, number>;
     } = {
       number_of_connections: aggregate.currentIps.size,
       number_of_connections_last_month: aggregate.monthIps.size,
+      connections_by_server: userConnectionsByServer.get(userId) ?? {},
     };
 
     if (monthTrafficBytesByUser.has(userId)) {
