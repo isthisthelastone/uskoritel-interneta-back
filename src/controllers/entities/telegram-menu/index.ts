@@ -13,6 +13,7 @@ export function getMenuSectionText(menuKey: TelegramMenuKey): string {
     gifts: "Подарки и промокоды",
     settings: "Настройки: язык, уведомления и параметры аккаунта.",
     countries: "Список стран",
+    admin_panel: "Админ панель: раздел в разработке.",
   };
 
   return menuSectionTextMap[menuKey];

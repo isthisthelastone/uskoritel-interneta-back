@@ -41,6 +41,7 @@ const telegramUserRowSchema = z.object({
   promo: z.string().nullable(),
   current_discount: z.number().int().nonnegative().max(100),
   has_purchased: z.boolean(),
+  isAdmin: z.boolean().optional().default(false),
 });
 
 export type TelegramUserRecord = z.infer<typeof telegramUserRowSchema>;
@@ -140,6 +141,7 @@ const telegramUserSelectFields = [
   "promo",
   "current_discount",
   "has_purchased",
+  '"isAdmin"',
 ].join(", ");
 
 function parseTelegramUserRow(rawRow: unknown): TelegramUserRecord {

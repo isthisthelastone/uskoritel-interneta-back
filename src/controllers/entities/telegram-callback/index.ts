@@ -10,6 +10,7 @@ const telegramMenuKeySchema = z.enum([
   "gifts",
   "settings",
   "countries",
+  "admin_panel",
 ]);
 
 const purchaseMethodSchema = z.enum(["tg_stars", "crypto_bot", "tbd_1", "tbd_2"]);

@@ -2399,7 +2399,37 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       return;
     }
 
-    const menuPayload = buildTelegramMenu("unknown");
+    const callbackTelegramUser = await getTelegramUserByTgId(String(callbackQuery.from.id));
+
+    if (
+      menuKey === "admin_panel" &&
+      (callbackTelegramUser === null || !callbackTelegramUser.isAdmin)
+    ) {
+      const deniedResult = await sendTelegramTextMessage({
+        chatId: callbackChatId,
+        text: "Нет доступа к админ панели.",
+      });
+
+      if (!deniedResult.ok) {
+        console.error(
+          "Failed to send admin access denied message:",
+          deniedResult.statusCode,
+          deniedResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        edited: false,
+      });
+      return;
+    }
+
+    const menuPayload = buildTelegramMenu("unknown", {
+      isAdmin: callbackTelegramUser?.isAdmin === true,
+    });
     const editResult = await editTelegramInlineMenuMessage({
       chatId: callbackChatId,
       messageId: callbackMessageId,
@@ -3104,7 +3134,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
   }
 
   const menuSubscriptionStatus = mapTelegramUserToMenuSubscriptionStatus(userSyncResult.user);
-  const menuPayload = buildTelegramMenu(menuSubscriptionStatus);
+  const menuPayload = buildTelegramMenu(menuSubscriptionStatus, {
+    isAdmin: userSyncResult.user.isAdmin,
+  });
   const isStartCommand = command === "/start";
 
   const telegramSendResult = await sendTelegramInlineMenuMessage({

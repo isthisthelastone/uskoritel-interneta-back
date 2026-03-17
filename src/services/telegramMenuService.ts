@@ -6,7 +6,8 @@ export type TelegramMenuKey =
   | "referals"
   | "gifts"
   | "settings"
-  | "countries";
+  | "countries"
+  | "admin_panel";
 
 export interface TelegramMenuItem {
   key: TelegramMenuKey;
@@ -37,8 +38,10 @@ const subscriptionStatusEmojiMap: Record<TelegramSubscriptionStatus, string> = {
 
 export function buildTelegramMenu(
   subscriptionStatus: TelegramSubscriptionStatus,
+  options?: { isAdmin?: boolean },
 ): TelegramMenuResponse {
   const statusEmoji = subscriptionStatusEmojiMap[subscriptionStatus];
+  const isAdmin = options?.isAdmin === true;
 
   const menu: TelegramMenuItem[] = [
     {
@@ -86,6 +89,17 @@ export function buildTelegramMenu(
   ];
 
   const keyboardRows = [[menu[0]], [menu[1], menu[2]], [menu[3], menu[4]], [menu[5], menu[6]]];
+
+  if (isAdmin) {
+    const adminButton: TelegramMenuItem = {
+      key: "admin_panel",
+      label: "🛠️ Админ панель",
+      sizeFr: 1,
+      callbackData: "menu:admin_panel",
+    };
+    menu.push(adminButton);
+    keyboardRows.push([adminButton]);
+  }
 
   return {
     subscriptionStatus,
