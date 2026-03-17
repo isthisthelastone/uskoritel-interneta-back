@@ -42,6 +42,7 @@ import {
 } from "../../../services/vpsCatalogService";
 import {
   buildGiftInvoicePayload,
+  buildVpsButtonText,
   buildSubscriptionInvoicePayload,
   buildSubscriptionStatusTextFromDb,
   encodeCountryCallbackValue,
@@ -2194,8 +2195,12 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                   text: "Серверы в " + countriesAction.country + ":",
                   inlineKeyboardRows: vpsList.map((vpsItem) => [
                     {
-                      text:
-                        vpsItem.nickname ?? "VPS " + vpsItem.internalUuid.slice(0, 8).toUpperCase(),
+                      text: buildVpsButtonText({
+                        nickname: vpsItem.nickname,
+                        internalUuid: vpsItem.internalUuid,
+                        currentSpeed: vpsItem.currentSpeed,
+                        numberOfConnections: vpsItem.numberOfConnections,
+                      }),
                       callbackData: "countries:vps:" + vpsItem.internalUuid,
                     },
                   ]),

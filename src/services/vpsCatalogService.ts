@@ -14,6 +14,8 @@ const vpsByCountryRowSchema = z.object({
   nickname: z.string().nullable(),
   country: z.string().min(1),
   country_emoji: z.string().min(1),
+  current_speed: z.union([z.number(), z.string()]).nullable().optional(),
+  number_of_connections: z.union([z.number(), z.string()]).nullable().optional(),
 });
 
 const vpsConfigRowSchema = z.object({
@@ -49,6 +51,8 @@ export interface VpsByCountryOption {
   nickname: string | null;
   country: string;
   countryEmoji: string;
+  currentSpeed: number;
+  numberOfConnections: number;
 }
 
 export interface VpsConfigDetails {
@@ -69,6 +73,20 @@ function parseVpsCountryRow(rawRow: unknown): z.infer<typeof vpsCountryRowSchema
 
 function parseVpsByCountryRow(rawRow: unknown): z.infer<typeof vpsByCountryRowSchema> {
   return vpsByCountryRowSchema.parse(rawRow);
+}
+
+function parseNonNegativeNumberOrZero(rawValue: string | number | null | undefined): number {
+  if (rawValue === null || rawValue === undefined) {
+    return 0;
+  }
+
+  const parsedValue = typeof rawValue === "number" ? rawValue : Number.parseFloat(rawValue.trim());
+
+  if (!Number.isFinite(parsedValue) || parsedValue < 0) {
+    return 0;
+  }
+
+  return parsedValue;
 }
 
 function parseVpsConfigRow(rawRow: unknown): z.infer<typeof vpsConfigRowSchema> {
@@ -294,7 +312,7 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
   const supabase = getSupabaseAdminClient();
   const { data, error } = await supabase
     .from("vps")
-    .select("internal_uuid, nickname, country, country_emoji")
+    .select("internal_uuid, nickname, country, country_emoji, current_speed, number_of_connections")
     .eq("country", country)
     .or("disabled.is.null,disabled.eq.false")
     .order("nickname", { ascending: true });
@@ -310,6 +328,8 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
       nickname: row.nickname,
       country: row.country,
       countryEmoji: row.country_emoji,
+      currentSpeed: parseNonNegativeNumberOrZero(row.current_speed),
+      numberOfConnections: parseNonNegativeNumberOrZero(row.number_of_connections),
     };
   });
 }
