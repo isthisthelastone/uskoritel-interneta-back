@@ -957,7 +957,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                         [
                           {
                             text: "✅ Включить сервер",
-                            callbackData: "admin:servers:action:enable:" + server.internalUuid,
+                            callbackData: "admin:servers:act:enable:" + server.internalUuid,
                           },
                         ],
                       ]
@@ -965,13 +965,13 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                   [
                     {
                       text: "🔄 Перезагрузить",
-                      callbackData: "admin:servers:action:reload:" + server.internalUuid,
+                      callbackData: "admin:servers:act:reload:" + server.internalUuid,
                     },
                   ],
                   [
                     {
                       text: "⛔ Отключить сервер",
-                      callbackData: "admin:servers:action:disable:" + server.internalUuid,
+                      callbackData: "admin:servers:act:disable:" + server.internalUuid,
                     },
                   ],
                   [{ text: "⬅️ Назад к серверам", callbackData: "admin:servers" }],

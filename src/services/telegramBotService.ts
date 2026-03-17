@@ -68,6 +68,7 @@ interface ClearTrackedTelegramChatHistoryResult {
 
 const trackedMessageIdsByChat = new Map<number, number[]>();
 const maxTrackedMessagesPerChat = 500;
+const maxTelegramCallbackDataBytes = 64;
 
 function buildTelegramInlineButtonPayload(button: TelegramInlineButton): Record<string, string> {
   if (button.url !== undefined && button.url.length > 0) {
@@ -77,9 +78,27 @@ function buildTelegramInlineButtonPayload(button: TelegramInlineButton): Record<
     };
   }
 
+  const callbackData = button.callbackData ?? "noop";
+  const callbackDataBytes = Buffer.byteLength(callbackData, "utf8");
+
+  if (callbackDataBytes > maxTelegramCallbackDataBytes) {
+    console.error(
+      "[telegram-bot] callback_data exceeds Telegram limit:",
+      "bytes=" + String(callbackDataBytes),
+      "maxBytes=" + String(maxTelegramCallbackDataBytes),
+      "text=" + button.text,
+      "callbackData=" + callbackData,
+    );
+
+    return {
+      text: button.text,
+      callback_data: "noop",
+    };
+  }
+
   return {
     text: button.text,
-    callback_data: button.callbackData ?? "noop",
+    callback_data: callbackData,
   };
 }
 

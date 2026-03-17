@@ -357,7 +357,7 @@ export function getAdminActionFromCallbackData(data: string | undefined): AdminA
     };
   }
 
-  if (data.startsWith("admin:servers:action:")) {
+  if (data.startsWith("admin:servers:act:")) {
     const parts = data.split(":");
 
     if (parts.length !== 5) {
