@@ -2,7 +2,7 @@ import { z } from "zod";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
 import { findTelegramUserByNickname, getTelegramUserByTgId } from "./telegramUserService";
 import { runVpsSshCommandWithConfig, type VpsSshConfig } from "./vpsSshService";
-import { removeVpsTrojanClient } from "./vpsXrayService";
+import { removeVpsXrayUserFromAllProtocols } from "./vpsXrayService";
 
 const DEFAULT_XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log";
 const DEFAULT_XRAY_ACCESS_LOG_TAIL_LINES = 5_000;
@@ -108,6 +108,7 @@ export interface AdminVpsServer {
 interface ParsedVpsUserKvEntry {
   directUrl?: string;
   obfsUrl?: string;
+  protocolUrls: string[];
 }
 
 function parseAdminUsersListRow(rawRow: unknown): z.infer<typeof adminUsersListRowSchema> {
@@ -249,14 +250,44 @@ function parseUsersKvMapLoose(rawValue: unknown): Partial<Record<string, ParsedV
     }
 
     const entry = value as Record<string, unknown>;
-    const parsedEntry: ParsedVpsUserKvEntry = {};
+    const parsedEntry: ParsedVpsUserKvEntry = {
+      protocolUrls: [],
+    };
 
     if (typeof entry.directUrl === "string" && entry.directUrl.length > 0) {
       parsedEntry.directUrl = entry.directUrl;
+      parsedEntry.protocolUrls.push(entry.directUrl);
     }
 
     if (typeof entry.obfsUrl === "string" && entry.obfsUrl.length > 0) {
       parsedEntry.obfsUrl = entry.obfsUrl;
+      parsedEntry.protocolUrls.push(entry.obfsUrl);
+    }
+
+    if (
+      typeof entry.protocols === "object" &&
+      entry.protocols !== null &&
+      !Array.isArray(entry.protocols)
+    ) {
+      for (const protocolEntry of Object.values(entry.protocols as Record<string, unknown>)) {
+        if (
+          typeof protocolEntry !== "object" ||
+          protocolEntry === null ||
+          Array.isArray(protocolEntry)
+        ) {
+          continue;
+        }
+
+        const url = (protocolEntry as Record<string, unknown>).url;
+
+        if (typeof url === "string" && url.length > 0) {
+          parsedEntry.protocolUrls.push(url);
+        }
+      }
+    }
+
+    if (parsedEntry.protocolUrls.length > 1) {
+      parsedEntry.protocolUrls = Array.from(new Set(parsedEntry.protocolUrls));
     }
 
     nextEntries[key] = parsedEntry;
@@ -474,6 +505,10 @@ function removeUserUrlsFromConfigList(
   }
 
   const blocked = new Set<string>();
+
+  for (const protocolUrl of entry.protocolUrls) {
+    blocked.add(protocolUrl);
+  }
 
   if (entry.directUrl !== undefined) {
     blocked.add(entry.directUrl);
@@ -729,11 +764,17 @@ export async function banTelegramUserByNickname(input: {
   let touchedServers = 0;
 
   for (const row of vpsRows) {
-    const usersKvMap = parseUsersKvMapLoose(row.users_kv_map);
+    const rawUsersKvMap =
+      typeof row.users_kv_map === "object" &&
+      row.users_kv_map !== null &&
+      !Array.isArray(row.users_kv_map)
+        ? (row.users_kv_map as Record<string, unknown>)
+        : {};
+    const usersKvMap = parseUsersKvMapLoose(rawUsersKvMap);
     const existingEntry = usersKvMap[user.internal_uuid];
-    const hadUserInKvMap = Object.hasOwn(usersKvMap, user.internal_uuid);
+    const hadUserInKvMap = Object.hasOwn(rawUsersKvMap, user.internal_uuid);
     const nextUsersKvMap = Object.fromEntries(
-      Object.entries(usersKvMap).filter(([entryKey]) => entryKey !== user.internal_uuid),
+      Object.entries(rawUsersKvMap).filter(([entryKey]) => entryKey !== user.internal_uuid),
     );
 
     const removedFromConfigList = removeUserUrlsFromConfigList(row.config_list, existingEntry);
@@ -746,7 +787,7 @@ export async function banTelegramUserByNickname(input: {
         user.internal_uuid,
         ports,
       );
-      await removeVpsTrojanClient({
+      await removeVpsXrayUserFromAllProtocols({
         sshConfig,
         userInternalUuid: user.internal_uuid,
       });

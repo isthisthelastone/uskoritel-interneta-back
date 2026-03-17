@@ -47,7 +47,8 @@ import {
   unbanTelegramUserByNickname,
 } from "../../../services/telegramAdminService";
 import {
-  issueOrGetUserVpsConfigUrls,
+  getVpsProtocolDisplayName,
+  issueOrGetUserVpsConfigUrl,
   listUniqueVpsCountries,
   listVpsByCountry,
 } from "../../../services/vpsCatalogService";
@@ -328,6 +329,72 @@ function formatAdminServerStatus(server: { connection: boolean; disabled: boolea
   return "🟢 UP";
 }
 
+function buildHowToPlatformsInlineRows(): Array<Array<{ text: string; callbackData: string }>> {
+  return [
+    [{ text: "🍎 iOS", callbackData: "howto:ios" }],
+    [{ text: "🤖 Android", callbackData: "howto:android" }],
+    [{ text: "💻 macOS", callbackData: "howto:macos" }],
+    [{ text: "🪟 Windows", callbackData: "howto:windows" }],
+    [{ text: "📺 Android TV", callbackData: "howto:android_tv" }],
+  ];
+}
+
+function buildSettingsProtocolsInlineRows(): Array<Array<{ text: string; callbackData: string }>> {
+  return [
+    [
+      {
+        text: "🚨 Вайтлист + анблок (КОГДА ГЛУШАТ)",
+        callbackData: "settings:whitelist_unblock",
+      },
+    ],
+    [{ text: "🛰️ Vless Websocket", callbackData: "settings:vless_websocket" }],
+    [{ text: "🛡️ Trojan", callbackData: "settings:trojan" }],
+    [{ text: "🔐 Trojan obfuscated", callbackData: "settings:trojan_obfuscated" }],
+    [{ text: "📶 Shadowsocks (для WiFi)", callbackData: "settings:shadowsocks_wifi" }],
+  ];
+}
+
+function buildCountriesProtocolSelectionRows(
+  internalUuid: string,
+): Array<Array<{ text: string; callbackData: string }>> {
+  return [
+    [{ text: "🛡️ Trojan", callbackData: "c:p:" + internalUuid + ":t" }],
+    [
+      {
+        text: "🔐 Trojan Obfuscated",
+        callbackData: "c:p:" + internalUuid + ":to",
+      },
+    ],
+    [
+      {
+        text: "📶 ShadowSocks (WiFi & LAN)",
+        callbackData: "c:p:" + internalUuid + ":s",
+      },
+    ],
+    [{ text: "🛰️ VLESS + WS", callbackData: "c:p:" + internalUuid + ":v" }],
+    [
+      { text: "🤔 В чем разница?", callbackData: "c:h:d" },
+      { text: "📱 Как подключиться", callbackData: "c:h:c" },
+    ],
+  ];
+}
+
+async function sendHowToPlatformsMenu(chatId: number) {
+  return sendTelegramInlineMenuMessage({
+    chatId,
+    text: "Выберите устройство:",
+    inlineKeyboardRows: buildHowToPlatformsInlineRows(),
+  });
+}
+
+async function sendSettingsProtocolsMenu(chatId: number) {
+  return sendTelegramInlineMenuMessage({
+    chatId,
+    text: "Наши протоколы:",
+    inlineKeyboardRows: buildSettingsProtocolsInlineRows(),
+  });
+}
+
 function getClearQueueLoad(): number {
   return clearQueueTasks.length + (isClearQueueWorkerRunning ? 1 : 0);
 }
@@ -588,7 +655,13 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                     : countriesAction !== null
                       ? countriesAction.kind === "country"
                         ? "Loading VPS list..."
-                        : "Sending configs..."
+                        : countriesAction.kind === "vps"
+                          ? "Loading protocols..."
+                          : countriesAction.kind === "vps_protocol"
+                            ? "Generating config..."
+                            : countriesAction.kind === "help_diff"
+                              ? "Opening protocol details..."
+                              : "Opening guide..."
                       : howToAction !== null
                         ? "Opening guide..."
                         : menuKey === null
@@ -2618,17 +2691,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     if (menuKey === "how_to_use") {
-      const howToMenuResult = await sendTelegramInlineMenuMessage({
-        chatId: callbackChatId,
-        text: "Выберите устройство:",
-        inlineKeyboardRows: [
-          [{ text: "🍎 iOS", callbackData: "howto:ios" }],
-          [{ text: "🤖 Android", callbackData: "howto:android" }],
-          [{ text: "💻 macOS", callbackData: "howto:macos" }],
-          [{ text: "🪟 Windows", callbackData: "howto:windows" }],
-          [{ text: "📺 Android TV", callbackData: "howto:android_tv" }],
-        ],
-      });
+      const howToMenuResult = await sendHowToPlatformsMenu(callbackChatId);
 
       if (!howToMenuResult.ok) {
         console.error(
@@ -2648,22 +2711,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     if (menuKey === "settings") {
-      const settingsProtocolsResult = await sendTelegramInlineMenuMessage({
-        chatId: callbackChatId,
-        text: "Наши протоколы:",
-        inlineKeyboardRows: [
-          [
-            {
-              text: "🚨 Вайтлист + анблок (КОГДА ГЛУШАТ)",
-              callbackData: "settings:whitelist_unblock",
-            },
-          ],
-          [{ text: "🛰️ Vless Websocket", callbackData: "settings:vless_websocket" }],
-          [{ text: "🛡️ Trojan", callbackData: "settings:trojan" }],
-          [{ text: "🔐 Trojan obfuscated", callbackData: "settings:trojan_obfuscated" }],
-          [{ text: "📶 Shadowsocks (для WiFi)", callbackData: "settings:shadowsocks_wifi" }],
-        ],
-      });
+      const settingsProtocolsResult = await sendSettingsProtocolsMenu(callbackChatId);
 
       if (!settingsProtocolsResult.ok) {
         console.error(
@@ -2898,10 +2946,75 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         }
       }
 
+      if (countriesAction.kind === "vps") {
+        const protocolMenuResult = await sendTelegramInlineMenuMessage({
+          chatId: callbackChatId,
+          text: "Выберите протокол подключения:",
+          inlineKeyboardRows: buildCountriesProtocolSelectionRows(countriesAction.internalUuid),
+        });
+
+        if (!protocolMenuResult.ok) {
+          console.error(
+            "Failed to send protocol selection menu for VPS:",
+            protocolMenuResult.statusCode,
+            protocolMenuResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: protocolMenuResult.ok,
+        });
+        return;
+      }
+
+      if (countriesAction.kind === "help_diff") {
+        const settingsProtocolsResult = await sendSettingsProtocolsMenu(callbackChatId);
+
+        if (!settingsProtocolsResult.ok) {
+          console.error(
+            "Failed to send protocol difference info for countries flow:",
+            settingsProtocolsResult.statusCode,
+            settingsProtocolsResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: settingsProtocolsResult.ok,
+        });
+        return;
+      }
+
+      if (countriesAction.kind === "help_connect") {
+        const howToMenuResult = await sendHowToPlatformsMenu(callbackChatId);
+
+        if (!howToMenuResult.ok) {
+          console.error(
+            "Failed to send how-to menu for countries flow:",
+            howToMenuResult.statusCode,
+            howToMenuResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          callbackHandled: true,
+          sent: howToMenuResult.ok,
+        });
+        return;
+      }
+
       try {
-        const vpsConfig = await issueOrGetUserVpsConfigUrls(
+        const vpsConfig = await issueOrGetUserVpsConfigUrl(
           countriesAction.internalUuid,
           telegramUser.internal_uuid,
+          countriesAction.protocol,
         );
 
         let sent = true;
@@ -2923,7 +3036,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         } else {
           const introResult = await sendTelegramTextMessage({
             chatId: callbackChatId,
-            text: "Ваши персональные ссылки для приложения:",
+            text:
+              "Ваша персональная ссылка (" +
+              getVpsProtocolDisplayName(countriesAction.protocol) +
+              "):",
             protectContent: true,
           });
 
@@ -2936,28 +3052,24 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             sent = false;
           }
 
-          const configUrls = [vpsConfig.directUrl, vpsConfig.obfsUrl];
+          const escapedConfigUrl = vpsConfig.url
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;");
+          const configMessageResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "<code>" + escapedConfigUrl + "</code>",
+            protectContent: true,
+            parseMode: "HTML",
+          });
 
-          for (const configUrl of configUrls) {
-            const escapedConfigUrl = configUrl
-              .replaceAll("&", "&amp;")
-              .replaceAll("<", "&lt;")
-              .replaceAll(">", "&gt;");
-            const configMessageResult = await sendTelegramTextMessage({
-              chatId: callbackChatId,
-              text: "<code>" + escapedConfigUrl + "</code>",
-              protectContent: true,
-              parseMode: "HTML",
-            });
-
-            if (!configMessageResult.ok) {
-              console.error(
-                "Failed to send protected VPS config URL:",
-                configMessageResult.statusCode,
-                configMessageResult.error,
-              );
-              sent = false;
-            }
+          if (!configMessageResult.ok) {
+            console.error(
+              "Failed to send protected VPS config URL:",
+              configMessageResult.statusCode,
+              configMessageResult.error,
+            );
+            sent = false;
           }
         }
 
@@ -2969,7 +3081,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         });
         return;
       } catch (error) {
-        console.error("Failed to issue VPS config list for user:", error);
+        console.error("Failed to issue VPS config URL for user and protocol:", error);
         const failedResult = await sendTelegramTextMessage({
           chatId: callbackChatId,
           text: "Ошибка при подключении к серверу, попробуйте выбрать другой",

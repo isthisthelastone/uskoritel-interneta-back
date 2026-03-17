@@ -23,6 +23,7 @@ const settingsActionSchema = z.enum([
   "trojan_obfuscated",
   "shadowsocks_wifi",
 ]);
+const countriesProtocolSchema = z.enum(["trojan", "trojan_obfuscated", "shadowsocks", "vless_ws"]);
 const adminUsersActionSchema = z.enum(["ban", "unban", "disconnect_all"]);
 const adminServersActionSchema = z.enum(["enable", "reload", "disable"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
@@ -75,7 +76,14 @@ export type GiftsAction =
   | { kind: "plan"; months: number; recipientTgId: string };
 export type CountriesAction =
   | { kind: "country"; country: string }
-  | { kind: "vps"; internalUuid: string };
+  | { kind: "vps"; internalUuid: string }
+  | {
+      kind: "vps_protocol";
+      internalUuid: string;
+      protocol: z.infer<typeof countriesProtocolSchema>;
+    }
+  | { kind: "help_diff" }
+  | { kind: "help_connect" };
 export type PurchaseAction =
   | { kind: "open" }
   | { kind: "method"; method: z.infer<typeof purchaseMethodSchema> }
@@ -479,6 +487,18 @@ export function getCountriesActionFromCallbackData(
     return null;
   }
 
+  if (data === "countries:help:diff" || data === "c:h:d") {
+    return {
+      kind: "help_diff",
+    };
+  }
+
+  if (data === "countries:help:connect" || data === "c:h:c") {
+    return {
+      kind: "help_connect",
+    };
+  }
+
   if (data.startsWith("countries:country:")) {
     const encodedCountry = data.slice("countries:country:".length);
     const decodedCountry = decodeBase64Url(encodedCountry)?.trim();
@@ -504,6 +524,58 @@ export function getCountriesActionFromCallbackData(
     return {
       kind: "vps",
       internalUuid: parsedUuid.data,
+    };
+  }
+
+  if (data.startsWith("countries:proto:")) {
+    const parts = data.split(":");
+
+    if (parts.length !== 4) {
+      return null;
+    }
+
+    const parsedUuid = z.uuid().safeParse(parts[2]);
+    const parsedProtocol = countriesProtocolSchema.safeParse(parts[3]);
+
+    if (!parsedUuid.success || !parsedProtocol.success) {
+      return null;
+    }
+
+    return {
+      kind: "vps_protocol",
+      internalUuid: parsedUuid.data,
+      protocol: parsedProtocol.data,
+    };
+  }
+
+  if (data.startsWith("c:p:")) {
+    const parts = data.split(":");
+
+    if (parts.length !== 4) {
+      return null;
+    }
+
+    const parsedUuid = z.uuid().safeParse(parts[2]);
+    const protocolShort =
+      parts[3] === "t"
+        ? "trojan"
+        : parts[3] === "to"
+          ? "trojan_obfuscated"
+          : parts[3] === "s"
+            ? "shadowsocks"
+            : parts[3] === "v"
+              ? "vless_ws"
+              : null;
+    const parsedProtocol = countriesProtocolSchema.safeParse(protocolShort);
+
+    if (!parsedUuid.success || !parsedProtocol.success) {
+      return null;
+    }
+
+    return {
+      kind: "vps_protocol",
+      internalUuid: parsedUuid.data,
+      protocol: parsedProtocol.data,
     };
   }
 

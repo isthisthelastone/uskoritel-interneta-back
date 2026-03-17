@@ -1,8 +1,19 @@
+import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { randomBytes } from "node:crypto";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
-import { ensureVpsTrojanClient } from "./vpsXrayService";
+import { ensureVpsXrayClient } from "./vpsXrayService";
 import type { VpsSshConfig } from "./vpsSshService";
+
+export const vpsConfigProtocolSchema = z.enum([
+  "trojan",
+  "trojan_obfuscated",
+  "vless_ws",
+  "shadowsocks",
+]);
+export type VpsConfigProtocol = z.infer<typeof vpsConfigProtocolSchema>;
+
+const DEFAULT_TROJAN_DIRECT_PORT = 443;
+const DEFAULT_TROJAN_OBFS_PORT = 9000;
 
 const vpsCountryRowSchema = z.object({
   country: z.string().min(1),
@@ -32,14 +43,38 @@ const vpsIssueConfigRowSchema = vpsConfigRowSchema.extend({
   disabled: z.boolean().nullable().optional(),
 });
 
-const vpsUserCredentialEntrySchema = z.object({
-  passwordBase64: z.string().min(1),
-  directUrl: z.string().min(1),
-  obfsUrl: z.string().min(1),
+const vpsUserProtocolCredentialEntrySchema = z.object({
+  secretBase64: z.string().min(1),
+  url: z.string().min(1),
   createdAt: z.string().min(1),
   active: z.boolean().optional(),
 });
-type VpsUserCredentialEntry = z.infer<typeof vpsUserCredentialEntrySchema>;
+
+const vpsUserProtocolsSchema = z
+  .object({
+    trojan: vpsUserProtocolCredentialEntrySchema.optional(),
+    trojan_obfuscated: vpsUserProtocolCredentialEntrySchema.optional(),
+    vless_ws: vpsUserProtocolCredentialEntrySchema.optional(),
+    shadowsocks: vpsUserProtocolCredentialEntrySchema.optional(),
+  })
+  .partial();
+
+const vpsUserCredentialEntrySchema = z.object({
+  createdAt: z.string().optional(),
+  active: z.boolean().optional(),
+  protocols: vpsUserProtocolsSchema.optional(),
+  passwordBase64: z.string().optional(),
+  directUrl: z.string().optional(),
+  obfsUrl: z.string().optional(),
+});
+
+type VpsUserProtocolCredentialEntry = z.infer<typeof vpsUserProtocolCredentialEntrySchema>;
+
+interface VpsUserCredentialEntry {
+  createdAt: string;
+  active?: boolean;
+  protocols: Partial<Record<VpsConfigProtocol, VpsUserProtocolCredentialEntry>>;
+}
 
 export interface VpsCountryOption {
   country: string;
@@ -58,6 +93,13 @@ export interface VpsByCountryOption {
 export interface VpsConfigDetails {
   nickname: string | null;
   configList: string[];
+}
+
+export interface VpsUserConfigUrl {
+  nickname: string;
+  protocol: VpsConfigProtocol;
+  url: string;
+  created: boolean;
 }
 
 export interface VpsUserConfigUrls {
@@ -111,13 +153,112 @@ function parseUsersKvMap(rawValue: unknown): Partial<Record<string, VpsUserCrede
       continue;
     }
 
-    nextEntries[entryKey] = parsedEntry.data;
+    const normalizedProtocols: Partial<Record<VpsConfigProtocol, VpsUserProtocolCredentialEntry>> =
+      {};
+
+    if (parsedEntry.data.protocols !== undefined) {
+      for (const protocol of vpsConfigProtocolSchema.options) {
+        const protocolEntry = parsedEntry.data.protocols[protocol];
+
+        if (protocolEntry !== undefined) {
+          normalizedProtocols[protocol] = protocolEntry;
+        }
+      }
+    }
+
+    if (
+      parsedEntry.data.passwordBase64 !== undefined &&
+      parsedEntry.data.directUrl !== undefined &&
+      normalizedProtocols.trojan === undefined
+    ) {
+      normalizedProtocols.trojan = {
+        secretBase64: parsedEntry.data.passwordBase64,
+        url: parsedEntry.data.directUrl,
+        createdAt: parsedEntry.data.createdAt ?? new Date(0).toISOString(),
+        active: parsedEntry.data.active,
+      };
+    }
+
+    if (
+      parsedEntry.data.passwordBase64 !== undefined &&
+      parsedEntry.data.obfsUrl !== undefined &&
+      normalizedProtocols.trojan_obfuscated === undefined
+    ) {
+      normalizedProtocols.trojan_obfuscated = {
+        secretBase64: parsedEntry.data.passwordBase64,
+        url: parsedEntry.data.obfsUrl,
+        createdAt: parsedEntry.data.createdAt ?? new Date(0).toISOString(),
+        active: parsedEntry.data.active,
+      };
+    }
+
+    if (Object.keys(normalizedProtocols).length === 0) {
+      continue;
+    }
+
+    const firstProtocolCreatedAt = Object.values(normalizedProtocols)[0].createdAt;
+    const fallbackCreatedAt = parsedEntry.data.createdAt ?? firstProtocolCreatedAt;
+
+    nextEntries[entryKey] = {
+      createdAt: fallbackCreatedAt,
+      active: parsedEntry.data.active,
+      protocols: normalizedProtocols,
+    };
   }
 
   return nextEntries;
 }
 
-function buildGeneratedPassword(): string {
+function serializeUsersKvMapEntry(entry: VpsUserCredentialEntry): Record<string, unknown> {
+  const serialized: Record<string, unknown> = {
+    createdAt: entry.createdAt,
+    active: entry.active ?? true,
+    protocols: entry.protocols,
+  };
+
+  const directEntry = entry.protocols.trojan;
+  const obfsEntry = entry.protocols.trojan_obfuscated;
+
+  if (directEntry !== undefined) {
+    serialized.passwordBase64 = directEntry.secretBase64;
+    serialized.directUrl = directEntry.url;
+  }
+
+  if (obfsEntry !== undefined) {
+    if (serialized.passwordBase64 === undefined) {
+      serialized.passwordBase64 = obfsEntry.secretBase64;
+    }
+    serialized.obfsUrl = obfsEntry.url;
+  }
+
+  return serialized;
+}
+
+function serializeUsersKvMap(
+  map: Partial<Record<string, VpsUserCredentialEntry>>,
+): Record<string, unknown> {
+  const nextMap: Record<string, unknown> = {};
+
+  for (const [userInternalUuid, entry] of Object.entries(map)) {
+    if (entry === undefined) {
+      continue;
+    }
+
+    if (Object.keys(entry.protocols).length === 0) {
+      continue;
+    }
+
+    nextMap[userInternalUuid] = serializeUsersKvMapEntry(entry);
+  }
+
+  return nextMap;
+}
+
+function buildGeneratedSecret(protocol: VpsConfigProtocol): string {
+  if (protocol === "vless_ws") {
+    return randomUUID();
+  }
+
   return randomBytes(18).toString("base64url");
 }
 
@@ -150,18 +291,199 @@ function decodeBase64Strict(rawValue: string): string {
   const decoded = Buffer.from(rawValue, "base64").toString("utf8");
 
   if (decoded.length === 0) {
-    throw new Error("Stored user passwordBase64 is invalid.");
+    throw new Error("Stored user secretBase64 is invalid.");
   }
 
   return decoded;
 }
 
-function buildTrojanUrlFromTemplate(templateUrl: string, password: string, label: string): string {
-  let parsedUrl: URL;
+function normalizeBase64ForDecode(rawValue: string): string {
+  let normalized = rawValue.replaceAll("-", "+").replaceAll("_", "/");
+  const rest = normalized.length % 4;
 
+  if (rest > 0) {
+    normalized += "=".repeat(4 - rest);
+  }
+
+  return normalized;
+}
+
+function decodeBase64Flexible(rawValue: string): string | null {
   try {
-    parsedUrl = new URL(templateUrl);
+    const decoded = Buffer.from(normalizeBase64ForDecode(rawValue), "base64").toString("utf8");
+    return decoded.length > 0 ? decoded : null;
   } catch {
+    return null;
+  }
+}
+
+function tryParseUrl(configUrl: string): URL | null {
+  try {
+    return new URL(configUrl);
+  } catch {
+    return null;
+  }
+}
+
+function parseSchemeFromConfigUrl(configUrl: string): string | null {
+  const parsed = tryParseUrl(configUrl);
+
+  if (parsed !== null) {
+    return parsed.protocol.toLowerCase().replace(/:$/u, "");
+  }
+
+  if (configUrl.startsWith("trojan://")) {
+    return "trojan";
+  }
+
+  if (configUrl.startsWith("vless://")) {
+    return "vless";
+  }
+
+  if (configUrl.startsWith("ss://")) {
+    return "ss";
+  }
+
+  return null;
+}
+
+function parsePortFromConfigUrl(configUrl: string): number | null {
+  const parsed = tryParseUrl(configUrl);
+
+  if (parsed === null) {
+    return null;
+  }
+
+  if (parsed.port.length === 0) {
+    return null;
+  }
+
+  const parsedPort = Number.parseInt(parsed.port, 10);
+
+  if (!Number.isFinite(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+    return null;
+  }
+
+  return parsedPort;
+}
+
+function parseLabelFromConfigUrl(configUrl: string): string {
+  const parsed = tryParseUrl(configUrl);
+
+  if (parsed !== null) {
+    return decodeURIComponent(parsed.hash.replace(/^#/u, "")).toUpperCase();
+  }
+
+  const hashIndex = configUrl.lastIndexOf("#");
+
+  if (hashIndex < 0 || hashIndex === configUrl.length - 1) {
+    return "";
+  }
+
+  return decodeURIComponent(configUrl.slice(hashIndex + 1)).toUpperCase();
+}
+
+function isObfuscatedTrojanTemplate(configUrl: string): boolean {
+  const normalizedLabel = parseLabelFromConfigUrl(configUrl);
+  const normalizedUrl = configUrl.toUpperCase();
+
+  return (
+    normalizedLabel.includes("OBF") ||
+    normalizedLabel.includes("OBFUSCATED") ||
+    normalizedUrl.includes("OBF") ||
+    normalizedUrl.includes("OBFUSCATED")
+  );
+}
+
+function getTrojanDirectPort(): number {
+  const parsed = Number.parseInt(process.env.XRAY_TROJAN_DIRECT_PORT ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= 65535
+    ? parsed
+    : DEFAULT_TROJAN_DIRECT_PORT;
+}
+
+function getTrojanObfsPort(): number {
+  const parsed = Number.parseInt(process.env.XRAY_TROJAN_OBFS_PORT ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= 65535
+    ? parsed
+    : DEFAULT_TROJAN_OBFS_PORT;
+}
+
+function pickTemplateForProtocol(configList: string[], protocol: VpsConfigProtocol): string {
+  if (configList.length === 0) {
+    throw new Error("VPS config_list is empty.");
+  }
+
+  if (protocol === "trojan" || protocol === "trojan_obfuscated") {
+    const trojanTemplates = configList.filter((url) => parseSchemeFromConfigUrl(url) === "trojan");
+
+    if (trojanTemplates.length === 0) {
+      throw new Error("VPS trojan template is missing in config_list.");
+    }
+
+    if (protocol === "trojan_obfuscated") {
+      const templateByObfuscation = trojanTemplates.find((url) => isObfuscatedTrojanTemplate(url));
+
+      if (templateByObfuscation !== undefined) {
+        return templateByObfuscation;
+      }
+
+      const templateByPort = trojanTemplates.find(
+        (url) => parsePortFromConfigUrl(url) === getTrojanObfsPort(),
+      );
+
+      if (templateByPort !== undefined) {
+        return templateByPort;
+      }
+
+      return trojanTemplates[1] ?? trojanTemplates[0];
+    }
+
+    return (
+      trojanTemplates.find((url) => !isObfuscatedTrojanTemplate(url)) ??
+      trojanTemplates.find((url) => parsePortFromConfigUrl(url) === getTrojanDirectPort()) ??
+      trojanTemplates[0]
+    );
+  }
+
+  if (protocol === "vless_ws") {
+    const vlessTemplates = configList.filter((url) => parseSchemeFromConfigUrl(url) === "vless");
+
+    if (vlessTemplates.length === 0) {
+      throw new Error("VPS vless template is missing in config_list.");
+    }
+
+    return (
+      vlessTemplates.find((url) => parseLabelFromConfigUrl(url).includes("VLESS")) ??
+      vlessTemplates[0]
+    );
+  }
+
+  const shadowsocksTemplates = configList.filter((url) => parseSchemeFromConfigUrl(url) === "ss");
+
+  if (shadowsocksTemplates.length === 0) {
+    throw new Error("VPS shadowsocks template is missing in config_list.");
+  }
+
+  return (
+    shadowsocksTemplates.find((url) => parseLabelFromConfigUrl(url).includes("SS")) ??
+    shadowsocksTemplates.find((url) => parseLabelFromConfigUrl(url).includes("SHADOW")) ??
+    shadowsocksTemplates[0]
+  );
+}
+
+function appendConfigUrlIfMissing(currentConfigList: string[], url: string): string[] {
+  if (currentConfigList.includes(url)) {
+    return currentConfigList;
+  }
+
+  return [...currentConfigList, url];
+}
+
+function buildTrojanUrlFromTemplate(templateUrl: string, password: string, label: string): string {
+  const parsedUrl = tryParseUrl(templateUrl);
+
+  if (parsedUrl === null || parsedUrl.protocol !== "trojan:") {
     throw new Error("Invalid trojan template URL in VPS config_list.");
   }
 
@@ -170,46 +492,100 @@ function buildTrojanUrlFromTemplate(templateUrl: string, password: string, label
   return parsedUrl.toString();
 }
 
-function pickDirectAndObfsTemplates(configList: string[]): {
-  directTemplate: string;
-  obfsTemplate: string;
-} {
-  if (configList.length === 0) {
-    throw new Error("VPS config_list is empty.");
+function buildVlessUrlFromTemplate(templateUrl: string, clientId: string, label: string): string {
+  const parsedUrl = tryParseUrl(templateUrl);
+
+  if (parsedUrl === null || parsedUrl.protocol !== "vless:") {
+    throw new Error("Invalid vless template URL in VPS config_list.");
   }
 
-  const obfsTemplate =
-    configList.find((url) => url.toLowerCase().includes("obfus")) ??
-    configList.find((url) => url.includes(":8443")) ??
-    configList[1];
-
-  const directTemplate =
-    configList.find((url) => url !== obfsTemplate) ??
-    configList.find((url) => url.includes(":443")) ??
-    configList[0];
-
-  return {
-    directTemplate,
-    obfsTemplate,
-  };
+  parsedUrl.username = clientId;
+  parsedUrl.hash = label;
+  return parsedUrl.toString();
 }
 
-function appendUserUrlsToConfigList(
-  currentConfigList: string[],
-  directUrl: string,
-  obfsUrl: string,
-): string[] {
-  const nextConfigList = [...currentConfigList];
+function buildShadowsocksUrlFromTemplate(
+  templateUrl: string,
+  password: string,
+  label: string,
+): string {
+  const parsedUrl = tryParseUrl(templateUrl);
 
-  if (!nextConfigList.includes(directUrl)) {
-    nextConfigList.push(directUrl);
+  if (parsedUrl === null || parsedUrl.protocol !== "ss:") {
+    throw new Error("Invalid shadowsocks template URL in VPS config_list.");
   }
 
-  if (!nextConfigList.includes(obfsUrl)) {
-    nextConfigList.push(obfsUrl);
+  if (parsedUrl.password.length > 0) {
+    parsedUrl.password = password;
+    parsedUrl.hash = label;
+    return parsedUrl.toString();
   }
 
-  return nextConfigList;
+  const rawUsername = decodeURIComponent(parsedUrl.username);
+  const decodedUsername = decodeBase64Flexible(rawUsername);
+  const usernameCandidate = decodedUsername ?? rawUsername;
+  const method = usernameCandidate.includes(":")
+    ? usernameCandidate.split(":", 2)[0]
+    : "aes-256-gcm";
+  const encodedCredentials = Buffer.from(method + ":" + password, "utf8").toString("base64");
+
+  parsedUrl.username = encodedCredentials;
+  parsedUrl.password = "";
+  parsedUrl.hash = label;
+  return parsedUrl.toString();
+}
+
+function buildConfigUrlFromTemplate(
+  protocol: VpsConfigProtocol,
+  templateUrl: string,
+  secret: string,
+  label: string,
+): string {
+  if (protocol === "trojan" || protocol === "trojan_obfuscated") {
+    return buildTrojanUrlFromTemplate(templateUrl, secret, label);
+  }
+
+  if (protocol === "vless_ws") {
+    return buildVlessUrlFromTemplate(templateUrl, secret, label);
+  }
+
+  return buildShadowsocksUrlFromTemplate(templateUrl, secret, label);
+}
+
+function buildProtocolSuffix(protocol: VpsConfigProtocol): string {
+  if (protocol === "trojan") {
+    return "TROJAN";
+  }
+
+  if (protocol === "trojan_obfuscated") {
+    return "TROJAN_OBFUSCATED";
+  }
+
+  if (protocol === "vless_ws") {
+    return "VLESS";
+  }
+
+  return "SS";
+}
+
+function buildProtocolLabel(nickname: string, protocol: VpsConfigProtocol): string {
+  return nickname + " " + buildProtocolSuffix(protocol);
+}
+
+export function getVpsProtocolDisplayName(protocol: VpsConfigProtocol): string {
+  if (protocol === "trojan") {
+    return "Trojan";
+  }
+
+  if (protocol === "trojan_obfuscated") {
+    return "Trojan Obfuscated";
+  }
+
+  if (protocol === "vless_ws") {
+    return "VLESS + WS";
+  }
+
+  return "Shadowsocks (WiFi & LAN)";
 }
 
 function parseSshKey(sshKey: string): { user: string; host: string | null; port: number | null } {
@@ -360,10 +736,12 @@ export async function getVpsConfigByInternalUuid(
   };
 }
 
-export async function issueOrGetUserVpsConfigUrls(
+export async function issueOrGetUserVpsConfigUrl(
   internalUuid: string,
   userInternalUuid: string,
-): Promise<VpsUserConfigUrls | null> {
+  protocol: VpsConfigProtocol,
+): Promise<VpsUserConfigUrl | null> {
+  const parsedProtocol = vpsConfigProtocolSchema.parse(protocol);
   const supabase = getSupabaseAdminClient();
   const { data, error } = await supabase
     .from("vps")
@@ -389,59 +767,73 @@ export async function issueOrGetUserVpsConfigUrls(
 
   const usersKvMap = parseUsersKvMap(row.users_kv_map);
   const existingEntry = usersKvMap[userInternalUuid];
+  const existingProtocolEntry = existingEntry?.protocols[parsedProtocol];
   const nickname = row.nickname ?? "VPS";
   const sshConfig = buildVpsSshConfig(row);
 
   if (
     existingEntry !== undefined &&
     existingEntry.active !== false &&
-    existingEntry.directUrl.length > 0 &&
-    existingEntry.obfsUrl.length > 0
+    existingProtocolEntry !== undefined &&
+    existingProtocolEntry.active !== false &&
+    existingProtocolEntry.url.length > 0
   ) {
-    await ensureVpsTrojanClient({
+    await ensureVpsXrayClient({
       sshConfig,
       userInternalUuid,
-      password: decodeBase64Strict(existingEntry.passwordBase64),
+      protocol: parsedProtocol,
+      secret: decodeBase64Strict(existingProtocolEntry.secretBase64),
     });
 
     return {
       nickname,
-      directUrl: existingEntry.directUrl,
-      obfsUrl: existingEntry.obfsUrl,
+      protocol: parsedProtocol,
+      url: existingProtocolEntry.url,
       created: false,
     };
   }
 
-  const templates = pickDirectAndObfsTemplates(row.config_list);
-  const passwordRaw = buildGeneratedPassword();
-  const passwordBase64 = Buffer.from(passwordRaw, "utf8").toString("base64");
-  const directLabel = nickname;
-  const obfsLabel = nickname + " OBFUSCATED";
-  const directUrl = buildTrojanUrlFromTemplate(templates.directTemplate, passwordRaw, directLabel);
-  const obfsUrl = buildTrojanUrlFromTemplate(templates.obfsTemplate, passwordRaw, obfsLabel);
+  const template = pickTemplateForProtocol(row.config_list, parsedProtocol);
+  const secretRaw = buildGeneratedSecret(parsedProtocol);
+  const secretBase64 = Buffer.from(secretRaw, "utf8").toString("base64");
+  const label = buildProtocolLabel(nickname, parsedProtocol);
+  const generatedUrl = buildConfigUrlFromTemplate(parsedProtocol, template, secretRaw, label);
 
-  await ensureVpsTrojanClient({
+  await ensureVpsXrayClient({
     sshConfig,
     userInternalUuid,
-    password: passwordRaw,
+    protocol: parsedProtocol,
+    secret: secretRaw,
   });
 
-  const nextUsersKvMap = {
+  const currentEntry: VpsUserCredentialEntry = existingEntry ?? {
+    createdAt: new Date().toISOString(),
+    active: true,
+    protocols: {},
+  };
+  const nextUsersKvMap: Partial<Record<string, VpsUserCredentialEntry>> = {
     ...usersKvMap,
     [userInternalUuid]: {
-      passwordBase64,
-      directUrl,
-      obfsUrl,
-      createdAt: new Date().toISOString(),
+      ...currentEntry,
       active: true,
+      protocols: {
+        ...currentEntry.protocols,
+        [parsedProtocol]: {
+          secretBase64,
+          url: generatedUrl,
+          createdAt: new Date().toISOString(),
+          active: true,
+        },
+      },
     },
   };
-  const nextConfigList = appendUserUrlsToConfigList(row.config_list, directUrl, obfsUrl);
+  const serializedUsersKvMap = serializeUsersKvMap(nextUsersKvMap);
+  const nextConfigList = appendConfigUrlIfMissing(row.config_list, generatedUrl);
 
   const { error: updateError } = await supabase
     .from("vps")
     .update({
-      users_kv_map: nextUsersKvMap,
+      users_kv_map: serializedUsersKvMap,
       config_list: nextConfigList,
     })
     .eq("internal_uuid", internalUuid);
@@ -452,8 +844,36 @@ export async function issueOrGetUserVpsConfigUrls(
 
   return {
     nickname,
-    directUrl,
-    obfsUrl,
+    protocol: parsedProtocol,
+    url: generatedUrl,
     created: true,
+  };
+}
+
+export async function issueOrGetUserVpsConfigUrls(
+  internalUuid: string,
+  userInternalUuid: string,
+): Promise<VpsUserConfigUrls | null> {
+  const directConfig = await issueOrGetUserVpsConfigUrl(internalUuid, userInternalUuid, "trojan");
+
+  if (directConfig === null) {
+    return null;
+  }
+
+  const obfsConfig = await issueOrGetUserVpsConfigUrl(
+    internalUuid,
+    userInternalUuid,
+    "trojan_obfuscated",
+  );
+
+  if (obfsConfig === null) {
+    return null;
+  }
+
+  return {
+    nickname: directConfig.nickname,
+    directUrl: directConfig.url,
+    obfsUrl: obfsConfig.url,
+    created: directConfig.created || obfsConfig.created,
   };
 }
