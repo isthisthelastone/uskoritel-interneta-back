@@ -116,6 +116,78 @@ function getInboundByTag(
   return inbound;
 }
 
+function getInboundTagValue(inbound: JsonObject): string | null {
+  const rawTag = inbound.tag;
+  return typeof rawTag === "string" && rawTag.trim().length > 0 ? rawTag : null;
+}
+
+function getInboundStreamNetwork(inbound: JsonObject): string | null {
+  const streamSettingsRaw = inbound.streamSettings;
+
+  if (
+    typeof streamSettingsRaw !== "object" ||
+    streamSettingsRaw === null ||
+    Array.isArray(streamSettingsRaw)
+  ) {
+    return null;
+  }
+
+  const networkRaw = (streamSettingsRaw as JsonObject).network;
+  return typeof networkRaw === "string" && networkRaw.trim().length > 0
+    ? networkRaw.trim().toLowerCase()
+    : null;
+}
+
+function resolveInboundForProtocol(input: {
+  config: XrayConfigDocument;
+  runtimeConfig: ReturnType<typeof getXrayRuntimeConfig>;
+  protocol: VpsClientProtocol;
+  required: boolean;
+}): { inbound: JsonObject; inboundTag: string } | null {
+  const expectedTag = getInboundTagByProtocol(input.runtimeConfig, input.protocol);
+  const byExpectedTag = getInboundByTag(input.config, expectedTag, false);
+
+  if (byExpectedTag !== null) {
+    return {
+      inbound: byExpectedTag,
+      inboundTag: expectedTag,
+    };
+  }
+
+  if (input.protocol === "vless_ws") {
+    const vlessInbounds = input.config.inbounds.filter((item) => item.protocol === "vless");
+
+    if (vlessInbounds.length > 0) {
+      const inbound =
+        vlessInbounds.find((item) => getInboundStreamNetwork(item) === "ws") ?? vlessInbounds[0];
+      return {
+        inbound,
+        inboundTag: getInboundTagValue(inbound) ?? expectedTag,
+      };
+    }
+  }
+
+  if (input.protocol === "shadowsocks") {
+    const shadowsocksInbound = input.config.inbounds.find(
+      (item) => item.protocol === "shadowsocks",
+    );
+
+    if (shadowsocksInbound !== undefined) {
+      const inbound = shadowsocksInbound;
+      return {
+        inbound,
+        inboundTag: getInboundTagValue(inbound) ?? expectedTag,
+      };
+    }
+  }
+
+  if (!input.required) {
+    return null;
+  }
+
+  throw new Error("Xray inbound tag is missing: " + expectedTag);
+}
+
 function getInboundSettings(inbound: JsonObject, inboundTag: string): JsonObject {
   const settingsRaw = inbound.settings;
 
@@ -445,12 +517,19 @@ export async function ensureVpsXrayClient(input: EnsureVpsClientInput): Promise<
   const parsedProtocol = vpsClientProtocolSchema.parse(input.protocol);
   const runtimeConfig = getXrayRuntimeConfig();
   const xrayConfig = await readRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath);
-  const inboundTag = getInboundTagByProtocol(runtimeConfig, parsedProtocol);
-  const inbound = getInboundByTag(xrayConfig, inboundTag, true);
+  const inboundTarget = resolveInboundForProtocol({
+    config: xrayConfig,
+    runtimeConfig,
+    protocol: parsedProtocol,
+    required: true,
+  });
 
-  if (inbound === null) {
-    throw new Error("Xray inbound tag is missing: " + inboundTag);
+  if (inboundTarget === null) {
+    throw new Error("Xray inbound resolution failed for protocol: " + parsedProtocol);
   }
+
+  const inboundTag = inboundTarget.inboundTag;
+  const inbound = inboundTarget.inbound;
 
   let changed = false;
 
@@ -496,12 +575,18 @@ export async function removeVpsXrayClient(input: RemoveVpsClientInput): Promise<
   const parsedProtocol = vpsClientProtocolSchema.parse(input.protocol);
   const runtimeConfig = getXrayRuntimeConfig();
   const xrayConfig = await readRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath);
-  const inboundTag = getInboundTagByProtocol(runtimeConfig, parsedProtocol);
-  const inbound = getInboundByTag(xrayConfig, inboundTag, false);
+  const inboundTarget = resolveInboundForProtocol({
+    config: xrayConfig,
+    runtimeConfig,
+    protocol: parsedProtocol,
+    required: false,
+  });
 
-  if (inbound === null) {
+  if (inboundTarget === null) {
     return false;
   }
+  const inboundTag = inboundTarget.inboundTag;
+  const inbound = inboundTarget.inbound;
 
   let changed = false;
 

@@ -396,6 +396,74 @@ async function sendSettingsProtocolsMenu(chatId: number) {
   });
 }
 
+async function sendUnblockVpsConfigMessage(input: {
+  chatId: number;
+  internalUuid: string;
+  userInternalUuid: string;
+}): Promise<boolean> {
+  const vpsConfig = await issueOrGetUserVpsConfigUrl(
+    input.internalUuid,
+    input.userInternalUuid,
+    "vless_ws",
+  );
+  let sent = true;
+
+  if (vpsConfig === null) {
+    const notFoundResult = await sendTelegramTextMessage({
+      chatId: input.chatId,
+      text: "Конфигурация сервера не найдена.",
+    });
+
+    if (!notFoundResult.ok) {
+      console.error(
+        "Failed to send missing unblock VPS config message:",
+        notFoundResult.statusCode,
+        notFoundResult.error,
+      );
+      sent = false;
+    }
+
+    return sent;
+  }
+
+  const introResult = await sendTelegramTextMessage({
+    chatId: input.chatId,
+    text: "Ваша персональная ссылка (VLESS + WS):",
+    protectContent: true,
+  });
+
+  if (!introResult.ok) {
+    console.error(
+      "Failed to send unblock config intro message:",
+      introResult.statusCode,
+      introResult.error,
+    );
+    sent = false;
+  }
+
+  const escapedConfigUrl = vpsConfig.url
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+  const configMessageResult = await sendTelegramTextMessage({
+    chatId: input.chatId,
+    text: "<code>" + escapedConfigUrl + "</code>",
+    protectContent: true,
+    parseMode: "HTML",
+  });
+
+  if (!configMessageResult.ok) {
+    console.error(
+      "Failed to send unblock protected VPS config URL:",
+      configMessageResult.statusCode,
+      configMessageResult.error,
+    );
+    sent = false;
+  }
+
+  return sent;
+}
+
 function getClearQueueLoad(): number {
   return clearQueueTasks.length + (isClearQueueWorkerRunning ? 1 : 0);
 }
@@ -2899,6 +2967,26 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
       if (countriesAction.kind === "country" || countriesAction.kind === "country_ref") {
         try {
+          if (countriesAction.kind === "country_ref") {
+            const routeInfo = await getVpsRouteInfoByInternalUuid(countriesAction.internalUuid);
+
+            if (routeInfo !== null && routeInfo.isUnblock) {
+              const sent = await sendUnblockVpsConfigMessage({
+                chatId: callbackChatId,
+                internalUuid: countriesAction.internalUuid,
+                userInternalUuid: telegramUser.internal_uuid,
+              });
+
+              res.status(200).json({
+                ok: true,
+                processed: true,
+                callbackHandled: true,
+                sent,
+              });
+              return;
+            }
+          }
+
           const countryToList =
             countriesAction.kind === "country_ref"
               ? await getVpsCountryByInternalUuid(countriesAction.internalUuid)
@@ -3031,63 +3119,11 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             return;
           }
 
-          const vpsConfig = await issueOrGetUserVpsConfigUrl(
-            countriesAction.internalUuid,
-            telegramUser.internal_uuid,
-            "vless_ws",
-          );
-          let sent = true;
-
-          if (vpsConfig === null) {
-            const notFoundResult = await sendTelegramTextMessage({
-              chatId: callbackChatId,
-              text: "Конфигурация сервера не найдена.",
-            });
-
-            if (!notFoundResult.ok) {
-              console.error(
-                "Failed to send missing unblock VPS config message:",
-                notFoundResult.statusCode,
-                notFoundResult.error,
-              );
-              sent = false;
-            }
-          } else {
-            const introResult = await sendTelegramTextMessage({
-              chatId: callbackChatId,
-              text: "Ваша персональная ссылка (VLESS + WS):",
-              protectContent: true,
-            });
-
-            if (!introResult.ok) {
-              console.error(
-                "Failed to send unblock config intro message:",
-                introResult.statusCode,
-                introResult.error,
-              );
-              sent = false;
-            }
-
-            const escapedConfigUrl = vpsConfig.url
-              .replaceAll("&", "&amp;")
-              .replaceAll("<", "&lt;")
-              .replaceAll(">", "&gt;");
-            const configMessageResult = await sendTelegramTextMessage({
-              chatId: callbackChatId,
-              text: "<code>" + escapedConfigUrl + "</code>",
-              protectContent: true,
-              parseMode: "HTML",
-            });
-
-            if (!configMessageResult.ok) {
-              console.error(
-                "Failed to send unblock protected VPS config URL:",
-                configMessageResult.statusCode,
-                configMessageResult.error,
-              );
-              sent = false;
-            }
-          }
+          const sent = await sendUnblockVpsConfigMessage({
+            chatId: callbackChatId,
+            internalUuid: countriesAction.internalUuid,
+            userInternalUuid: telegramUser.internal_uuid,
+          });
 
           res.status(200).json({
             ok: true,
