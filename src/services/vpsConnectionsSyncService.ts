@@ -12,6 +12,7 @@ const DEFAULT_SYNC_SPEEDTEST_TARGET_HOST = "speedtest.myloc.de";
 const DEFAULT_SYNC_SPEEDTEST_TARGET_URL = "http://speedtest.myloc.de/files/100mb.bin";
 const DEFAULT_SYNC_SPEEDTEST_IPERF_PORT = 5200;
 const DEFAULT_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS = 5;
+const DEFAULT_UNBLOCK_SSH_USER = "unluckypleasure";
 const UUID_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
 const IPV4_PATTERN = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/u;
@@ -20,8 +21,10 @@ const vpsSyncRowSchema = z.object({
   internal_uuid: z.uuid(),
   domain: z.string().min(1),
   api_address: z.string().min(1),
-  ssh_key: z.string().min(1),
-  password: z.string().min(1),
+  ssh_key: z.string().nullable().optional(),
+  ssh_connection_key: z.string().nullable().optional(),
+  isUnblock: z.boolean().nullable().optional(),
+  password: z.string().nullable().optional(),
   optional_passsword: z.string().nullable(),
   config_list: z.array(z.string()),
   users_kv_map: z.unknown(),
@@ -134,6 +137,11 @@ function decodeBase64OrKeepRaw(rawValue: string): string {
   return normalizedDecoded === normalizedSource ? decoded : normalizedRaw;
 }
 
+function getUnblockSshUser(): string {
+  const rawUser = process.env.VPS_UNBLOCK_SSH_USER?.trim();
+  return rawUser !== undefined && rawUser.length > 0 ? rawUser : DEFAULT_UNBLOCK_SSH_USER;
+}
+
 function parseSshKey(sshKey: string): { user: string; host: string | null; port: number | null } {
   const trimmed = sshKey.trim();
 
@@ -180,8 +188,30 @@ function parseSshKey(sshKey: string): { user: string; host: string | null; port:
 }
 
 function buildVpsSshConfig(row: z.infer<typeof vpsSyncRowSchema>): VpsSshConfig {
-  const parsedSshKey = parseSshKey(row.ssh_key);
-  const decodedMainPassword = decodeBase64OrKeepRaw(row.password);
+  if (row.isUnblock === true) {
+    const sshConnectionKey = row.ssh_connection_key?.trim();
+
+    if (sshConnectionKey === undefined || sshConnectionKey.length === 0) {
+      throw new Error("VPS ssh_connection_key is empty for unblock server " + row.internal_uuid);
+    }
+
+    return {
+      host: row.api_address,
+      user: getUnblockSshUser(),
+      port: 22,
+      privateKeyPath: sshConnectionKey,
+    };
+  }
+
+  const sshKey = row.ssh_key?.trim();
+
+  if (sshKey === undefined || sshKey.length === 0) {
+    throw new Error("VPS ssh_key is empty for " + row.internal_uuid);
+  }
+
+  const parsedSshKey = parseSshKey(sshKey);
+  const decodedMainPassword =
+    row.password !== undefined && row.password !== null ? decodeBase64OrKeepRaw(row.password) : "";
   const optionalPassword =
     row.optional_passsword !== null && row.optional_passsword.trim().length > 0
       ? decodeBase64OrKeepRaw(row.optional_passsword)
@@ -1065,7 +1095,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
   const { data, error } = await supabase
     .from("vps")
     .select(
-      "internal_uuid, domain, api_address, ssh_key, password, optional_passsword, config_list, users_kv_map, disabled, connection",
+      'internal_uuid, domain, api_address, ssh_key, ssh_connection_key, "isUnblock", password, optional_passsword, config_list, users_kv_map, disabled, connection',
     );
 
   if (error !== null) {

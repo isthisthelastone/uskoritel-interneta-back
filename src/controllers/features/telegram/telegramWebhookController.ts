@@ -47,6 +47,7 @@ import {
   unbanTelegramUserByNickname,
 } from "../../../services/telegramAdminService";
 import {
+  getVpsRouteInfoByInternalUuid,
   getVpsProtocolDisplayName,
   issueOrGetUserVpsConfigUrl,
   listUniqueVpsCountries,
@@ -656,7 +657,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                       ? countriesAction.kind === "country"
                         ? "Loading VPS list..."
                         : countriesAction.kind === "vps"
-                          ? "Loading protocols..."
+                          ? "Processing server..."
                           : countriesAction.kind === "vps_protocol"
                             ? "Generating config..."
                             : countriesAction.kind === "help_diff"
@@ -1006,8 +1007,10 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                   "country: " + server.country + " " + server.countryEmoji,
                   "api_address: " + server.apiAddress,
                   "domain: " + server.domain,
-                  "ssh_key: " + server.sshKey,
-                  "password: " + server.password,
+                  "ssh_key: " + (server.sshKey ?? "—"),
+                  "ssh_connection_key: " + (server.sshConnectionKey ?? "—"),
+                  "isUnblock: " + (server.isUnblock ? "true" : "false"),
+                  "password: " + (server.password ?? "—"),
                   "optional_passsword: " + (server.optionalPasssword ?? "null"),
                   "number_of_connections: " + String(server.numberOfConnections),
                   "current_speed: " + server.currentSpeed.toFixed(2) + " MB/s",
@@ -2911,6 +2914,8 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                       text: buildVpsButtonText({
                         nickname: vpsItem.nickname,
                         internalUuid: vpsItem.internalUuid,
+                        countryEmoji: vpsItem.countryEmoji,
+                        isUnblock: vpsItem.isUnblock,
                         currentSpeed: vpsItem.currentSpeed,
                         numberOfConnections: vpsItem.numberOfConnections,
                       }),
@@ -2947,27 +2952,144 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       }
 
       if (countriesAction.kind === "vps") {
-        const protocolMenuResult = await sendTelegramInlineMenuMessage({
-          chatId: callbackChatId,
-          text: "Выберите протокол подключения:",
-          inlineKeyboardRows: buildCountriesProtocolSelectionRows(countriesAction.internalUuid),
-        });
+        try {
+          const routeInfo = await getVpsRouteInfoByInternalUuid(countriesAction.internalUuid);
 
-        if (!protocolMenuResult.ok) {
-          console.error(
-            "Failed to send protocol selection menu for VPS:",
-            protocolMenuResult.statusCode,
-            protocolMenuResult.error,
+          if (routeInfo === null) {
+            const notFoundResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Конфигурация сервера не найдена.",
+            });
+
+            if (!notFoundResult.ok) {
+              console.error(
+                "Failed to send missing VPS route info message:",
+                notFoundResult.statusCode,
+                notFoundResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: notFoundResult.ok,
+            });
+            return;
+          }
+
+          if (!routeInfo.isUnblock) {
+            const protocolMenuResult = await sendTelegramInlineMenuMessage({
+              chatId: callbackChatId,
+              text: "Выберите протокол подключения:",
+              inlineKeyboardRows: buildCountriesProtocolSelectionRows(countriesAction.internalUuid),
+            });
+
+            if (!protocolMenuResult.ok) {
+              console.error(
+                "Failed to send protocol selection menu for VPS:",
+                protocolMenuResult.statusCode,
+                protocolMenuResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: protocolMenuResult.ok,
+            });
+            return;
+          }
+
+          const vpsConfig = await issueOrGetUserVpsConfigUrl(
+            countriesAction.internalUuid,
+            telegramUser.internal_uuid,
+            "vless_ws",
           );
-        }
+          let sent = true;
 
-        res.status(200).json({
-          ok: true,
-          processed: true,
-          callbackHandled: true,
-          sent: protocolMenuResult.ok,
-        });
-        return;
+          if (vpsConfig === null) {
+            const notFoundResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Конфигурация сервера не найдена.",
+            });
+
+            if (!notFoundResult.ok) {
+              console.error(
+                "Failed to send missing unblock VPS config message:",
+                notFoundResult.statusCode,
+                notFoundResult.error,
+              );
+              sent = false;
+            }
+          } else {
+            const introResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Ваша персональная ссылка (VLESS + WS):",
+              protectContent: true,
+            });
+
+            if (!introResult.ok) {
+              console.error(
+                "Failed to send unblock config intro message:",
+                introResult.statusCode,
+                introResult.error,
+              );
+              sent = false;
+            }
+
+            const escapedConfigUrl = vpsConfig.url
+              .replaceAll("&", "&amp;")
+              .replaceAll("<", "&lt;")
+              .replaceAll(">", "&gt;");
+            const configMessageResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "<code>" + escapedConfigUrl + "</code>",
+              protectContent: true,
+              parseMode: "HTML",
+            });
+
+            if (!configMessageResult.ok) {
+              console.error(
+                "Failed to send unblock protected VPS config URL:",
+                configMessageResult.statusCode,
+                configMessageResult.error,
+              );
+              sent = false;
+            }
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to route VPS click action:", error);
+          const failedResult = await sendTelegramTextMessage({
+            chatId: callbackChatId,
+            text: "Ошибка при подключении к серверу, попробуйте выбрать другой",
+          });
+
+          if (!failedResult.ok) {
+            console.error(
+              "Failed to send VPS route failure message:",
+              failedResult.statusCode,
+              failedResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: failedResult.ok,
+          });
+          return;
+        }
       }
 
       if (countriesAction.kind === "help_diff") {

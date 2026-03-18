@@ -54,10 +54,22 @@ function trimButtonLabel(value: string): string {
 export function buildVpsButtonText(input: {
   nickname: string | null;
   internalUuid: string;
+  countryEmoji?: string;
+  isUnblock?: boolean;
   currentSpeed: number;
   numberOfConnections: number;
 }): string {
   const displayName = input.nickname ?? "VPS " + input.internalUuid.slice(0, 8).toUpperCase();
+
+  if (input.isUnblock === true) {
+    const unblockLabel =
+      input.countryEmoji !== undefined && input.countryEmoji.length > 0
+        ? displayName + " " + input.countryEmoji
+        : displayName;
+
+    return trimButtonLabel(unblockLabel);
+  }
+
   const speed = Number.isFinite(input.currentSpeed) ? Math.max(0, input.currentSpeed) : 0;
   const connections = Number.isFinite(input.numberOfConnections)
     ? Math.max(0, Math.round(input.numberOfConnections))

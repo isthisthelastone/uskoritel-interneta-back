@@ -14,6 +14,7 @@ export type VpsConfigProtocol = z.infer<typeof vpsConfigProtocolSchema>;
 
 const DEFAULT_TROJAN_DIRECT_PORT = 443;
 const DEFAULT_TROJAN_OBFS_PORT = 9000;
+const DEFAULT_UNBLOCK_SSH_USER = "unluckypleasure";
 
 const vpsCountryRowSchema = z.object({
   country: z.string().min(1),
@@ -25,6 +26,7 @@ const vpsByCountryRowSchema = z.object({
   nickname: z.string().nullable(),
   country: z.string().min(1),
   country_emoji: z.string().min(1),
+  isUnblock: z.boolean().nullable().optional(),
   current_speed: z.union([z.number(), z.string()]).nullable().optional(),
   number_of_connections: z.union([z.number(), z.string()]).nullable().optional(),
 });
@@ -37,10 +39,20 @@ const vpsConfigRowSchema = z.object({
 
 const vpsIssueConfigRowSchema = vpsConfigRowSchema.extend({
   api_address: z.string().min(1),
-  password: z.string().min(1),
-  ssh_key: z.string().min(1),
+  password: z.string().nullable().optional(),
+  ssh_key: z.string().nullable().optional(),
+  ssh_connection_key: z.string().nullable().optional(),
+  isUnblock: z.boolean().nullable().optional(),
   optional_passsword: z.string().nullable(),
   disabled: z.boolean().nullable().optional(),
+});
+
+const vpsRouteRowSchema = z.object({
+  internal_uuid: z.uuid(),
+  nickname: z.string().nullable(),
+  country_emoji: z.string().min(1),
+  disabled: z.boolean().nullable().optional(),
+  isUnblock: z.boolean().nullable().optional(),
 });
 
 const vpsUserProtocolCredentialEntrySchema = z.object({
@@ -86,8 +98,16 @@ export interface VpsByCountryOption {
   nickname: string | null;
   country: string;
   countryEmoji: string;
+  isUnblock: boolean;
   currentSpeed: number;
   numberOfConnections: number;
+}
+
+export interface VpsRouteInfo {
+  internalUuid: string;
+  nickname: string | null;
+  countryEmoji: string;
+  isUnblock: boolean;
 }
 
 export interface VpsConfigDetails {
@@ -137,6 +157,10 @@ function parseVpsConfigRow(rawRow: unknown): z.infer<typeof vpsConfigRowSchema> 
 
 function parseVpsIssueConfigRow(rawRow: unknown): z.infer<typeof vpsIssueConfigRowSchema> {
   return vpsIssueConfigRowSchema.parse(rawRow);
+}
+
+function parseVpsRouteRow(rawRow: unknown): z.infer<typeof vpsRouteRowSchema> {
+  return vpsRouteRowSchema.parse(rawRow);
 }
 
 function parseUsersKvMap(rawValue: unknown): Partial<Record<string, VpsUserCredentialEntry>> {
@@ -409,6 +433,11 @@ function getTrojanObfsPort(): number {
     : DEFAULT_TROJAN_OBFS_PORT;
 }
 
+function getUnblockSshUser(): string {
+  const rawUser = process.env.VPS_UNBLOCK_SSH_USER?.trim();
+  return rawUser !== undefined && rawUser.length > 0 ? rawUser : DEFAULT_UNBLOCK_SSH_USER;
+}
+
 function pickTemplateForProtocol(configList: string[], protocol: VpsConfigProtocol): string {
   if (configList.length === 0) {
     throw new Error("VPS config_list is empty.");
@@ -568,7 +597,15 @@ function buildProtocolSuffix(protocol: VpsConfigProtocol): string {
   return "SS";
 }
 
-function buildProtocolLabel(nickname: string, protocol: VpsConfigProtocol): string {
+function buildProtocolLabel(
+  nickname: string,
+  protocol: VpsConfigProtocol,
+  isUnblock: boolean,
+): string {
+  if (isUnblock && protocol === "vless_ws") {
+    return nickname;
+  }
+
   return nickname + " " + buildProtocolSuffix(protocol);
 }
 
@@ -634,8 +671,30 @@ function parseSshKey(sshKey: string): { user: string; host: string | null; port:
 }
 
 function buildVpsSshConfig(row: z.infer<typeof vpsIssueConfigRowSchema>): VpsSshConfig {
-  const parsedSshKey = parseSshKey(row.ssh_key);
-  const decodedMainPassword = decodeBase64OrKeepRaw(row.password);
+  if (row.isUnblock === true) {
+    const sshConnectionKey = row.ssh_connection_key?.trim();
+
+    if (sshConnectionKey === undefined || sshConnectionKey.length === 0) {
+      throw new Error("VPS ssh_connection_key is empty for unblock server.");
+    }
+
+    return {
+      host: row.api_address,
+      user: getUnblockSshUser(),
+      port: 22,
+      privateKeyPath: sshConnectionKey,
+    };
+  }
+
+  const sshKey = row.ssh_key?.trim();
+
+  if (sshKey === undefined || sshKey.length === 0) {
+    throw new Error("VPS ssh_key is empty for selected server.");
+  }
+
+  const parsedSshKey = parseSshKey(sshKey);
+  const decodedMainPassword =
+    row.password !== undefined && row.password !== null ? decodeBase64OrKeepRaw(row.password) : "";
   const optionalPassword =
     row.optional_passsword !== null && row.optional_passsword.trim().length > 0
       ? decodeBase64OrKeepRaw(row.optional_passsword)
@@ -688,7 +747,9 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
   const supabase = getSupabaseAdminClient();
   const { data, error } = await supabase
     .from("vps")
-    .select("internal_uuid, nickname, country, country_emoji, current_speed, number_of_connections")
+    .select(
+      'internal_uuid, nickname, country, country_emoji, "isUnblock", current_speed, number_of_connections',
+    )
     .eq("country", country)
     .or("disabled.is.null,disabled.eq.false")
     .order("nickname", { ascending: true });
@@ -704,10 +765,43 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
       nickname: row.nickname,
       country: row.country,
       countryEmoji: row.country_emoji,
+      isUnblock: row.isUnblock === true,
       currentSpeed: parseNonNegativeNumberOrZero(row.current_speed),
       numberOfConnections: parseNonNegativeNumberOrZero(row.number_of_connections),
     };
   });
+}
+
+export async function getVpsRouteInfoByInternalUuid(
+  internalUuid: string,
+): Promise<VpsRouteInfo | null> {
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("vps")
+    .select('internal_uuid, nickname, country_emoji, disabled, "isUnblock"')
+    .eq("internal_uuid", internalUuid)
+    .maybeSingle();
+
+  if (error !== null) {
+    throw new Error("Failed to fetch VPS route info: " + error.message);
+  }
+
+  if (data === null) {
+    return null;
+  }
+
+  const row = parseVpsRouteRow(data);
+
+  if (row.disabled === true) {
+    return null;
+  }
+
+  return {
+    internalUuid: row.internal_uuid,
+    nickname: row.nickname,
+    countryEmoji: row.country_emoji,
+    isUnblock: row.isUnblock === true,
+  };
 }
 
 export async function getVpsConfigByInternalUuid(
@@ -746,7 +840,7 @@ export async function issueOrGetUserVpsConfigUrl(
   const { data, error } = await supabase
     .from("vps")
     .select(
-      "nickname, config_list, users_kv_map, api_address, password, ssh_key, optional_passsword, disabled",
+      'nickname, config_list, users_kv_map, api_address, password, ssh_key, ssh_connection_key, "isUnblock", optional_passsword, disabled',
     )
     .eq("internal_uuid", internalUuid)
     .maybeSingle();
@@ -763,6 +857,10 @@ export async function issueOrGetUserVpsConfigUrl(
 
   if (row.disabled === true) {
     return null;
+  }
+
+  if (row.isUnblock === true && parsedProtocol !== "vless_ws") {
+    throw new Error("Unblock server supports only VLESS + WS.");
   }
 
   const usersKvMap = parseUsersKvMap(row.users_kv_map);
@@ -796,7 +894,7 @@ export async function issueOrGetUserVpsConfigUrl(
   const template = pickTemplateForProtocol(row.config_list, parsedProtocol);
   const secretRaw = buildGeneratedSecret(parsedProtocol);
   const secretBase64 = Buffer.from(secretRaw, "utf8").toString("base64");
-  const label = buildProtocolLabel(nickname, parsedProtocol);
+  const label = buildProtocolLabel(nickname, parsedProtocol, row.isUnblock === true);
   const generatedUrl = buildConfigUrlFromTemplate(parsedProtocol, template, secretRaw, label);
 
   await ensureVpsXrayClient({
