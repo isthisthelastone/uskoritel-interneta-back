@@ -88,6 +88,26 @@ function looksLikePublicSshKey(rawValue: string): boolean {
   return /^(ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp)/u.test(trimmed);
 }
 
+function normalizeInlinePrivateKey(rawValue: string): string {
+  let normalized = rawValue.trim();
+
+  if (
+    (normalized.startsWith('"') && normalized.endsWith('"')) ||
+    (normalized.startsWith("'") && normalized.endsWith("'"))
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+
+  normalized = normalized.replaceAll("\r", "");
+  normalized = normalized.replaceAll("\\n", "\n");
+
+  if (!normalized.endsWith("\n")) {
+    normalized += "\n";
+  }
+
+  return normalized;
+}
+
 function tryDecodeBase64ToPrivateKey(rawValue: string): string | null {
   const trimmed = rawValue.trim();
 
@@ -131,7 +151,7 @@ async function validateVpsSshConfig(config: VpsSshConfig): Promise<VpsSshConfig>
 
   if (privateKeyPath !== undefined && privateKey === undefined) {
     if (looksLikeInlinePrivateKey(privateKeyPath)) {
-      privateKey = privateKeyPath;
+      privateKey = normalizeInlinePrivateKey(privateKeyPath);
       privateKeyPath = undefined;
     } else if (looksLikePublicSshKey(privateKeyPath)) {
       throw new Error(
@@ -141,10 +161,14 @@ async function validateVpsSshConfig(config: VpsSshConfig): Promise<VpsSshConfig>
       const decodedPrivateKey = tryDecodeBase64ToPrivateKey(privateKeyPath);
 
       if (decodedPrivateKey !== null) {
-        privateKey = decodedPrivateKey;
+        privateKey = normalizeInlinePrivateKey(decodedPrivateKey);
         privateKeyPath = undefined;
       }
     }
+  }
+
+  if (privateKey !== undefined) {
+    privateKey = normalizeInlinePrivateKey(privateKey);
   }
 
   if (privateKey !== undefined && looksLikePublicSshKey(privateKey.trim())) {
