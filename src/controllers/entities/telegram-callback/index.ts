@@ -98,6 +98,12 @@ export type PurchaseAction =
   | { kind: "crypto_cancel_abort"; invoiceId: z.infer<typeof cryptoBotInvoiceIdSchema> };
 export type SubscriptionInvoicePayload = z.infer<typeof invoicePayloadSchema>;
 
+function parseCallbackUuid(rawValue: string): string | null {
+  const normalized = rawValue.trim().toLowerCase();
+  const parsedUuid = z.uuid().safeParse(normalized);
+  return parsedUuid.success ? parsedUuid.data : null;
+}
+
 export function getMenuKeyFromCallbackData(data: string | undefined): TelegramMenuKey | null {
   if (data === undefined || !data.startsWith("menu:")) {
     return null;
@@ -515,15 +521,29 @@ export function getCountriesActionFromCallbackData(
 
   if (data.startsWith("countries:vps:")) {
     const internalUuidRaw = data.slice("countries:vps:".length);
-    const parsedUuid = z.uuid().safeParse(internalUuidRaw);
+    const parsedUuid = parseCallbackUuid(internalUuidRaw);
 
-    if (!parsedUuid.success) {
+    if (parsedUuid === null) {
       return null;
     }
 
     return {
       kind: "vps",
-      internalUuid: parsedUuid.data,
+      internalUuid: parsedUuid,
+    };
+  }
+
+  if (data.startsWith("c:v:")) {
+    const internalUuidRaw = data.slice("c:v:".length);
+    const parsedUuid = parseCallbackUuid(internalUuidRaw);
+
+    if (parsedUuid === null) {
+      return null;
+    }
+
+    return {
+      kind: "vps",
+      internalUuid: parsedUuid,
     };
   }
 
@@ -534,16 +554,16 @@ export function getCountriesActionFromCallbackData(
       return null;
     }
 
-    const parsedUuid = z.uuid().safeParse(parts[2]);
+    const parsedUuid = parseCallbackUuid(parts[2]);
     const parsedProtocol = countriesProtocolSchema.safeParse(parts[3]);
 
-    if (!parsedUuid.success || !parsedProtocol.success) {
+    if (parsedUuid === null || !parsedProtocol.success) {
       return null;
     }
 
     return {
       kind: "vps_protocol",
-      internalUuid: parsedUuid.data,
+      internalUuid: parsedUuid,
       protocol: parsedProtocol.data,
     };
   }
@@ -555,7 +575,7 @@ export function getCountriesActionFromCallbackData(
       return null;
     }
 
-    const parsedUuid = z.uuid().safeParse(parts[2]);
+    const parsedUuid = parseCallbackUuid(parts[2]);
     const protocolShort =
       parts[3] === "t"
         ? "trojan"
@@ -568,13 +588,13 @@ export function getCountriesActionFromCallbackData(
               : null;
     const parsedProtocol = countriesProtocolSchema.safeParse(protocolShort);
 
-    if (!parsedUuid.success || !parsedProtocol.success) {
+    if (parsedUuid === null || !parsedProtocol.success) {
       return null;
     }
 
     return {
       kind: "vps_protocol",
-      internalUuid: parsedUuid.data,
+      internalUuid: parsedUuid,
       protocol: parsedProtocol.data,
     };
   }

@@ -758,7 +758,7 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
     throw new Error("Failed to fetch VPS by country: " + error.message);
   }
 
-  return data.map((rawRow) => {
+  const mapped = data.map((rawRow) => {
     const row = parseVpsByCountryRow(rawRow);
     return {
       internalUuid: row.internal_uuid,
@@ -770,6 +770,30 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
       numberOfConnections: parseNonNegativeNumberOrZero(row.number_of_connections),
     };
   });
+
+  mapped.sort((left, right) => {
+    const leftUnblockWeight = left.isUnblock ? 0 : 1;
+    const rightUnblockWeight = right.isUnblock ? 0 : 1;
+
+    if (leftUnblockWeight !== rightUnblockWeight) {
+      return leftUnblockWeight - rightUnblockWeight;
+    }
+
+    const leftName = (left.nickname ?? "").toLocaleLowerCase();
+    const rightName = (right.nickname ?? "").toLocaleLowerCase();
+
+    if (leftName < rightName) {
+      return -1;
+    }
+
+    if (leftName > rightName) {
+      return 1;
+    }
+
+    return left.internalUuid.localeCompare(right.internalUuid);
+  });
+
+  return mapped;
 }
 
 export async function getVpsRouteInfoByInternalUuid(
