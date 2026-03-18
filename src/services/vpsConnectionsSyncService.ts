@@ -497,18 +497,18 @@ function buildStatsQueryCommand(statsServer: string): string {
 
 function buildReadAccessLogsCommand(accessLogPath: string, tailLines: number): string {
   return (
-    "if [ -f " +
+    "if [ -r " +
     shellQuote(accessLogPath) +
     " ]; then " +
     "tail -n " +
     String(tailLines) +
     " " +
     shellQuote(accessLogPath) +
-    "; " +
+    " 2>/dev/null || true; " +
     "elif command -v journalctl >/dev/null 2>&1; then " +
     "journalctl -u xray --no-pager -n " +
     String(tailLines) +
-    "; " +
+    " 2>/dev/null || true; " +
     "else " +
     "true; " +
     "fi"
