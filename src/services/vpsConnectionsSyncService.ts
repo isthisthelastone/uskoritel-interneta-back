@@ -1296,13 +1296,12 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         .from("vps")
         .update({
           connection: false,
-          disabled: true,
         })
         .eq("internal_uuid", row.internal_uuid);
 
       if (markDisconnectedError !== null) {
         console.error(
-          "[vps-sync] failed to mark VPS as disconnected+disabled:",
+          "[vps-sync] failed to mark VPS as disconnected:",
           row.internal_uuid,
           markDisconnectedError.message,
         );

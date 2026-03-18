@@ -457,7 +457,18 @@ async function readRemoteXrayConfig(
   sshConfig: VpsSshConfig,
   configPath: string,
 ): Promise<XrayConfigDocument> {
-  const readResult = await runVpsSshCommandWithConfig(sshConfig, "cat " + shellQuote(configPath));
+  const readResult = await runVpsSshCommandWithConfig(
+    sshConfig,
+    "set -eu; " +
+      "config_path=" +
+      shellQuote(configPath) +
+      "; " +
+      "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then " +
+      'sudo -n cat "$config_path"; ' +
+      "else " +
+      'cat "$config_path"; ' +
+      "fi",
+  );
   return parseXrayConfig(readResult.stdout);
 }
 
@@ -480,15 +491,20 @@ async function writeRemoteXrayConfig(
     "printf %s " +
     shellQuote(base64Payload) +
     ' | base64 -d > "$tmp_path"; ' +
-    'if command -v xray >/dev/null 2>&1; then xray -test -config "$tmp_path"; fi; ' +
-    'cp "$tmp_path" "$config_path"; ' +
+    "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then " +
+    "SUDO='sudo -n'; " +
+    "else " +
+    "SUDO=''; " +
+    "fi; " +
+    'if command -v xray >/dev/null 2>&1; then $SUDO xray -test -config "$tmp_path"; fi; ' +
+    '$SUDO cp "$tmp_path" "$config_path"; ' +
     'rm -f "$tmp_path"; ' +
     "if command -v systemctl >/dev/null 2>&1; then " +
-    "systemctl reload xray || systemctl restart xray; " +
+    "$SUDO systemctl reload xray || $SUDO systemctl restart xray; " +
     "elif command -v service >/dev/null 2>&1; then " +
-    "service xray reload || service xray restart; " +
+    "$SUDO service xray reload || $SUDO service xray restart; " +
     "else " +
-    "pkill -HUP xray || true; " +
+    "$SUDO pkill -HUP xray || true; " +
     "fi";
 
   await runVpsSshCommandWithConfig(sshConfig, command);
