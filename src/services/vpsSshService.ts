@@ -8,6 +8,7 @@ import { join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_SSH_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+const DEFAULT_SSH_BINARY_CANDIDATES = ["ssh", "/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"];
 
 export interface VpsSshConfig {
   host: string;
@@ -55,6 +56,58 @@ function getSshMaxBufferBytes(): number {
   }
 
   return parsedMaxBuffer;
+}
+
+function getSshBinaryCandidates(): string[] {
+  const configured = process.env.VPS_SSH_BINARY_PATH?.trim();
+  const candidates = [
+    configured !== undefined && configured.length > 0 ? configured : null,
+    ...DEFAULT_SSH_BINARY_CANDIDATES,
+  ].filter((item): item is string => item !== null && item.length > 0);
+
+  return Array.from(new Set(candidates));
+}
+
+function isExecutableNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+async function execSshWithFallback(
+  args: string[],
+  options: Parameters<typeof execFileAsync>[2],
+): Promise<{ stdout: string; stderr: string }> {
+  const candidates = getSshBinaryCandidates();
+  let missingBinaryCount = 0;
+
+  for (const candidate of candidates) {
+    try {
+      const { stdout, stderr } = await execFileAsync(candidate, args, options);
+      return {
+        stdout: typeof stdout === "string" ? stdout : stdout.toString("utf8"),
+        stderr: typeof stderr === "string" ? stderr : stderr.toString("utf8"),
+      };
+    } catch (error) {
+      if (isExecutableNotFoundError(error)) {
+        missingBinaryCount += 1;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  if (missingBinaryCount > 0) {
+    throw new Error(
+      "SSH client is not installed in runtime image. Install openssh-client or set VPS_SSH_BINARY_PATH.",
+    );
+  }
+
+  throw new Error("Failed to run SSH command: no valid SSH binary candidate.");
 }
 
 async function ensureReadablePrivateKey(privateKeyPath: string | undefined): Promise<void> {
@@ -250,7 +303,7 @@ async function runSshCommandWithPassword(
     );
     await chmod(askPassPath, 0o700);
 
-    const { stdout, stderr } = await execFileAsync("ssh", sshArgs, {
+    const { stdout, stderr } = await execSshWithFallback(sshArgs, {
       timeout: 20_000,
       maxBuffer,
       env: {
@@ -320,7 +373,7 @@ async function runSshCommandWithConfig(
       );
     }
 
-    const { stdout, stderr } = await execFileAsync("ssh", [...sshArgs, command], {
+    const { stdout, stderr } = await execSshWithFallback([...sshArgs, command], {
       timeout: 20_000,
       maxBuffer,
     });
