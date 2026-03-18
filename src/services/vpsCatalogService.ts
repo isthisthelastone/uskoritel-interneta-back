@@ -17,6 +17,7 @@ const DEFAULT_TROJAN_OBFS_PORT = 9000;
 const DEFAULT_UNBLOCK_SSH_USER = "unluckypleasure";
 
 const vpsCountryRowSchema = z.object({
+  internal_uuid: z.uuid(),
   country: z.string().min(1),
   country_emoji: z.string().min(1),
 });
@@ -89,6 +90,7 @@ interface VpsUserCredentialEntry {
 }
 
 export interface VpsCountryOption {
+  internalUuid: string;
   country: string;
   countryEmoji: string;
 }
@@ -718,7 +720,7 @@ export async function listUniqueVpsCountries(): Promise<VpsCountryOption[]> {
   const supabase = getSupabaseAdminClient();
   const { data, error } = await supabase
     .from("vps")
-    .select("country, country_emoji")
+    .select("internal_uuid, country, country_emoji")
     .or("disabled.is.null,disabled.eq.false")
     .order("country", { ascending: true });
 
@@ -734,13 +736,46 @@ export async function listUniqueVpsCountries(): Promise<VpsCountryOption[]> {
 
     if (!uniqueMap.has(dedupeKey)) {
       uniqueMap.set(dedupeKey, {
+        internalUuid: row.internal_uuid,
         country: row.country,
         countryEmoji: row.country_emoji,
       });
     }
   }
 
-  return Array.from(uniqueMap.values());
+  const countryOptions = Array.from(uniqueMap.values());
+
+  countryOptions.sort((left, right) => {
+    const leftIsUnblockLike = /unblock|whitelist|анблок|вайтлист/iu.test(left.country);
+    const rightIsUnblockLike = /unblock|whitelist|анблок|вайтлист/iu.test(right.country);
+
+    if (leftIsUnblockLike !== rightIsUnblockLike) {
+      return leftIsUnblockLike ? -1 : 1;
+    }
+
+    return left.country.localeCompare(right.country, "ru");
+  });
+
+  return countryOptions;
+}
+
+export async function getVpsCountryByInternalUuid(internalUuid: string): Promise<string | null> {
+  const supabase = getSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("vps")
+    .select("country, disabled")
+    .eq("internal_uuid", internalUuid)
+    .maybeSingle();
+
+  if (error !== null) {
+    throw new Error("Failed to resolve VPS country: " + error.message);
+  }
+
+  if (data === null || data.disabled === true || typeof data.country !== "string") {
+    return null;
+  }
+
+  return data.country;
 }
 
 export async function listVpsByCountry(country: string): Promise<VpsByCountryOption[]> {
@@ -771,9 +806,23 @@ export async function listVpsByCountry(country: string): Promise<VpsByCountryOpt
     };
   });
 
+  const hasUnblockLikeNickname = (nickname: string | null): boolean => {
+    if (nickname === null) {
+      return false;
+    }
+
+    const normalized = nickname.toLocaleLowerCase();
+    return (
+      normalized.includes("unblock") ||
+      normalized.includes("whitelist") ||
+      normalized.includes("анблок") ||
+      normalized.includes("вайтлист")
+    );
+  };
+
   mapped.sort((left, right) => {
-    const leftUnblockWeight = left.isUnblock ? 0 : 1;
-    const rightUnblockWeight = right.isUnblock ? 0 : 1;
+    const leftUnblockWeight = left.isUnblock || hasUnblockLikeNickname(left.nickname) ? 0 : 1;
+    const rightUnblockWeight = right.isUnblock || hasUnblockLikeNickname(right.nickname) ? 0 : 1;
 
     if (leftUnblockWeight !== rightUnblockWeight) {
       return leftUnblockWeight - rightUnblockWeight;

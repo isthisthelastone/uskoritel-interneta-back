@@ -47,6 +47,7 @@ import {
   unbanTelegramUserByNickname,
 } from "../../../services/telegramAdminService";
 import {
+  getVpsCountryByInternalUuid,
   getVpsRouteInfoByInternalUuid,
   getVpsProtocolDisplayName,
   issueOrGetUserVpsConfigUrl,
@@ -59,7 +60,6 @@ import {
   buildVpsButtonText,
   buildSubscriptionInvoicePayload,
   buildSubscriptionStatusTextFromDb,
-  encodeCountryCallbackValue,
   getSubscriptionPaymentMethodInlineKeyboardRows,
   getCountriesActionFromCallbackData,
   getFaqActionFromCallbackData,
@@ -656,13 +656,15 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                     : countriesAction !== null
                       ? countriesAction.kind === "country"
                         ? "Loading VPS list..."
-                        : countriesAction.kind === "vps"
-                          ? "Processing server..."
-                          : countriesAction.kind === "vps_protocol"
-                            ? "Generating config..."
-                            : countriesAction.kind === "help_diff"
-                              ? "Opening protocol details..."
-                              : "Opening guide..."
+                        : countriesAction.kind === "country_ref"
+                          ? "Loading VPS list..."
+                          : countriesAction.kind === "vps"
+                            ? "Processing server..."
+                            : countriesAction.kind === "vps_protocol"
+                              ? "Generating config..."
+                              : countriesAction.kind === "help_diff"
+                                ? "Opening protocol details..."
+                                : "Opening guide..."
                       : howToAction !== null
                         ? "Opening guide..."
                         : menuKey === null
@@ -2836,8 +2838,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                 inlineKeyboardRows: countries.map((countryOption) => [
                   {
                     text: countryOption.country + " " + countryOption.countryEmoji,
-                    callbackData:
-                      "countries:country:" + encodeCountryCallbackValue(countryOption.country),
+                    callbackData: "c:c:" + countryOption.internalUuid,
                   },
                 ]),
               });
@@ -2896,19 +2897,47 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         return;
       }
 
-      if (countriesAction.kind === "country") {
+      if (countriesAction.kind === "country" || countriesAction.kind === "country_ref") {
         try {
-          const vpsList = await listVpsByCountry(countriesAction.country);
+          const countryToList =
+            countriesAction.kind === "country_ref"
+              ? await getVpsCountryByInternalUuid(countriesAction.internalUuid)
+              : countriesAction.country;
+
+          if (countryToList === null) {
+            const notFoundResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Страна для выбранного сервера не найдена.",
+            });
+
+            if (!notFoundResult.ok) {
+              console.error(
+                "Failed to send missing VPS country message:",
+                notFoundResult.statusCode,
+                notFoundResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: notFoundResult.ok,
+            });
+            return;
+          }
+
+          const vpsList = await listVpsByCountry(countryToList);
 
           const vpsListResult =
             vpsList.length === 0
               ? await sendTelegramTextMessage({
                   chatId: callbackChatId,
-                  text: "Для страны " + countriesAction.country + " серверы пока не добавлены.",
+                  text: "Для страны " + countryToList + " серверы пока не добавлены.",
                 })
               : await sendTelegramInlineMenuMessage({
                   chatId: callbackChatId,
-                  text: "Серверы в " + countriesAction.country + ":",
+                  text: "Серверы в " + countryToList + ":",
                   inlineKeyboardRows: vpsList.map((vpsItem) => [
                     {
                       text: buildVpsButtonText({
@@ -2919,7 +2948,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                         currentSpeed: vpsItem.currentSpeed,
                         numberOfConnections: vpsItem.numberOfConnections,
                       }),
-                      callbackData: "countries:vps:" + vpsItem.internalUuid,
+                      callbackData: "c:v:" + vpsItem.internalUuid,
                     },
                   ]),
                 });
