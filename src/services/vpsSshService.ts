@@ -15,6 +15,7 @@ export interface VpsSshConfig {
   port: number;
   password?: string;
   privateKeyPath?: string;
+  privateKey?: string;
 }
 
 export interface VpsSshCommandResult {
@@ -64,6 +65,48 @@ async function ensureReadablePrivateKey(privateKeyPath: string | undefined): Pro
   await access(privateKeyPath, fsConstants.R_OK);
 }
 
+function looksLikeInlinePrivateKey(rawValue: string): boolean {
+  const trimmed = rawValue.trim();
+
+  if (trimmed.length === 0) {
+    return false;
+  }
+
+  if (trimmed.includes("BEGIN") && trimmed.includes("PRIVATE KEY")) {
+    return true;
+  }
+
+  if (trimmed.includes("\n")) {
+    return true;
+  }
+
+  return false;
+}
+
+function looksLikePublicSshKey(rawValue: string): boolean {
+  const trimmed = rawValue.trim();
+  return /^(ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp)/u.test(trimmed);
+}
+
+function tryDecodeBase64ToPrivateKey(rawValue: string): string | null {
+  const trimmed = rawValue.trim();
+
+  if (trimmed.length < 48 || /\s/u.test(trimmed)) {
+    return null;
+  }
+
+  try {
+    const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+    if (decoded.includes("BEGIN") && decoded.includes("PRIVATE KEY")) {
+      return decoded;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
 async function validateVpsSshConfig(config: VpsSshConfig): Promise<VpsSshConfig> {
   if (config.host.trim().length === 0) {
     throw new Error("VPS SSH host is not configured.");
@@ -77,7 +120,40 @@ async function validateVpsSshConfig(config: VpsSshConfig): Promise<VpsSshConfig>
     throw new Error("VPS SSH port is invalid.");
   }
 
-  await ensureReadablePrivateKey(config.privateKeyPath);
+  let privateKeyPath =
+    config.privateKeyPath !== undefined && config.privateKeyPath.trim().length > 0
+      ? config.privateKeyPath.trim()
+      : undefined;
+  let privateKey =
+    config.privateKey !== undefined && config.privateKey.trim().length > 0
+      ? config.privateKey
+      : undefined;
+
+  if (privateKeyPath !== undefined && privateKey === undefined) {
+    if (looksLikeInlinePrivateKey(privateKeyPath)) {
+      privateKey = privateKeyPath;
+      privateKeyPath = undefined;
+    } else if (looksLikePublicSshKey(privateKeyPath)) {
+      throw new Error(
+        "ssh_connection_key contains a public SSH key. Provide a private key (OpenSSH PEM) or a readable private key path.",
+      );
+    } else {
+      const decodedPrivateKey = tryDecodeBase64ToPrivateKey(privateKeyPath);
+
+      if (decodedPrivateKey !== null) {
+        privateKey = decodedPrivateKey;
+        privateKeyPath = undefined;
+      }
+    }
+  }
+
+  if (privateKey !== undefined && looksLikePublicSshKey(privateKey.trim())) {
+    throw new Error(
+      "ssh_connection_key contains a public SSH key. Provide a private key (OpenSSH PEM).",
+    );
+  }
+
+  await ensureReadablePrivateKey(privateKeyPath);
 
   return {
     host: config.host,
@@ -85,10 +161,8 @@ async function validateVpsSshConfig(config: VpsSshConfig): Promise<VpsSshConfig>
     port: config.port,
     password:
       config.password !== undefined && config.password.length > 0 ? config.password : undefined,
-    privateKeyPath:
-      config.privateKeyPath !== undefined && config.privateKeyPath.length > 0
-        ? config.privateKeyPath
-        : undefined,
+    privateKeyPath,
+    privateKey,
   };
 }
 
@@ -184,33 +258,58 @@ async function runSshCommandWithConfig(
 
   const normalizedConfig = await validateVpsSshConfig(config);
   const maxBuffer = getSshMaxBufferBytes();
-  const sshArgs = [...getBaseSshArgs(normalizedConfig)];
+  let tempPrivateKeyDir: string | null = null;
 
-  if (normalizedConfig.password !== undefined) {
-    return runSshCommandWithPassword(
-      [
-        "-o",
-        "PubkeyAuthentication=no",
-        "-o",
-        "PreferredAuthentications=password",
-        "-o",
-        "NumberOfPasswordPrompts=1",
-        ...sshArgs,
-        command,
-      ],
-      normalizedConfig.password,
-    );
+  try {
+    let configForCommand = normalizedConfig;
+
+    if (
+      normalizedConfig.privateKey !== undefined &&
+      (normalizedConfig.privateKeyPath === undefined ||
+        normalizedConfig.privateKeyPath.length === 0)
+    ) {
+      tempPrivateKeyDir = await mkdtemp(join(tmpdir(), "vps-ssh-key-"));
+      const tempPrivateKeyPath = join(tempPrivateKeyDir, "id_key");
+      await writeFile(tempPrivateKeyPath, normalizedConfig.privateKey, "utf8");
+      await chmod(tempPrivateKeyPath, 0o600);
+      configForCommand = {
+        ...normalizedConfig,
+        privateKeyPath: tempPrivateKeyPath,
+      };
+    }
+
+    const sshArgs = [...getBaseSshArgs(configForCommand)];
+
+    if (configForCommand.password !== undefined) {
+      return await runSshCommandWithPassword(
+        [
+          "-o",
+          "PubkeyAuthentication=no",
+          "-o",
+          "PreferredAuthentications=password",
+          "-o",
+          "NumberOfPasswordPrompts=1",
+          ...sshArgs,
+          command,
+        ],
+        configForCommand.password,
+      );
+    }
+
+    const { stdout, stderr } = await execFileAsync("ssh", [...sshArgs, command], {
+      timeout: 20_000,
+      maxBuffer,
+    });
+
+    return {
+      stdout,
+      stderr,
+    };
+  } finally {
+    if (tempPrivateKeyDir !== null) {
+      await rm(tempPrivateKeyDir, { recursive: true, force: true });
+    }
   }
-
-  const { stdout, stderr } = await execFileAsync("ssh", [...sshArgs, command], {
-    timeout: 20_000,
-    maxBuffer,
-  });
-
-  return {
-    stdout,
-    stderr,
-  };
 }
 
 export async function runVpsSshCommandWithConfig(
