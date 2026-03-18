@@ -11,6 +11,30 @@ import {
 } from "./controllers/features/telegram";
 import { requireAdminSecret, syncVpsConnectionsNow } from "./controllers/features/vps";
 
+function getTrustProxyValue(): boolean | number {
+  const rawValue = process.env.TRUST_PROXY?.trim().toLowerCase();
+
+  if (rawValue === undefined || rawValue.length === 0) {
+    return process.env.NODE_ENV === "production" ? 1 : false;
+  }
+
+  if (rawValue === "true") {
+    return true;
+  }
+
+  if (rawValue === "false") {
+    return false;
+  }
+
+  const parsedNumber = Number.parseInt(rawValue, 10);
+
+  if (Number.isFinite(parsedNumber) && parsedNumber >= 0) {
+    return parsedNumber;
+  }
+
+  return process.env.NODE_ENV === "production" ? 1 : false;
+}
+
 export function createApp() {
   const app = express();
   const logger = pino({
@@ -24,6 +48,7 @@ export function createApp() {
       censor: "[REDACTED]",
     },
   });
+  app.set("trust proxy", getTrustProxyValue());
 
   app.use(
     pinoHttp({
