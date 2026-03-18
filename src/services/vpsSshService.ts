@@ -9,6 +9,8 @@ import { join } from "node:path";
 const execFileAsync = promisify(execFile);
 const DEFAULT_SSH_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 const DEFAULT_SSH_BINARY_CANDIDATES = ["ssh", "/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"];
+const DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 30;
+const DEFAULT_SSH_EXEC_TIMEOUT_MS = 30_000;
 
 export interface VpsSshConfig {
   host: string;
@@ -56,6 +58,38 @@ function getSshMaxBufferBytes(): number {
   }
 
   return parsedMaxBuffer;
+}
+
+function getSshConnectTimeoutSeconds(): number {
+  const rawValue = process.env.VPS_SSH_CONNECT_TIMEOUT_SECONDS?.trim();
+
+  if (rawValue === undefined || rawValue.length === 0) {
+    return DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 120) {
+    throw new Error("VPS_SSH_CONNECT_TIMEOUT_SECONDS must be between 1 and 120.");
+  }
+
+  return parsed;
+}
+
+function getSshExecTimeoutMs(): number {
+  const rawValue = process.env.VPS_SSH_EXEC_TIMEOUT_MS?.trim();
+
+  if (rawValue === undefined || rawValue.length === 0) {
+    return DEFAULT_SSH_EXEC_TIMEOUT_MS;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 5_000 || parsed > 300_000) {
+    throw new Error("VPS_SSH_EXEC_TIMEOUT_MS must be between 5000 and 300000.");
+  }
+
+  return parsed;
 }
 
 function getSshBinaryCandidates(): string[] {
@@ -265,15 +299,16 @@ async function getVpsSshConfigFromEnv(): Promise<VpsSshConfig> {
 }
 
 function getBaseSshArgs(config: VpsSshConfig): string[] {
+  const connectTimeoutSeconds = getSshConnectTimeoutSeconds();
   const args: string[] = [
     "-p",
     String(config.port),
     "-o",
     "StrictHostKeyChecking=accept-new",
     "-o",
-    "ConnectTimeout=8",
+    "ConnectTimeout=" + String(connectTimeoutSeconds),
     "-o",
-    "ServerAliveInterval=8",
+    "ServerAliveInterval=" + String(connectTimeoutSeconds),
     "-o",
     "ServerAliveCountMax=1",
   ];
@@ -292,6 +327,7 @@ async function runSshCommandWithPassword(
   password: string,
 ): Promise<VpsSshCommandResult> {
   const maxBuffer = getSshMaxBufferBytes();
+  const execTimeoutMs = getSshExecTimeoutMs();
   const askPassDir = await mkdtemp(join(tmpdir(), "vps-ssh-askpass-"));
   const askPassPath = join(askPassDir, "askpass.sh");
 
@@ -304,7 +340,7 @@ async function runSshCommandWithPassword(
     await chmod(askPassPath, 0o700);
 
     const { stdout, stderr } = await execSshWithFallback(sshArgs, {
-      timeout: 20_000,
+      timeout: execTimeoutMs,
       maxBuffer,
       env: {
         ...process.env,
@@ -335,6 +371,7 @@ async function runSshCommandWithConfig(
 
   const normalizedConfig = await validateVpsSshConfig(config);
   const maxBuffer = getSshMaxBufferBytes();
+  const execTimeoutMs = getSshExecTimeoutMs();
   let tempPrivateKeyDir: string | null = null;
 
   try {
@@ -374,7 +411,7 @@ async function runSshCommandWithConfig(
     }
 
     const { stdout, stderr } = await execSshWithFallback([...sshArgs, command], {
-      timeout: 20_000,
+      timeout: execTimeoutMs,
       maxBuffer,
     });
 
