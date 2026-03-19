@@ -532,6 +532,85 @@ function collectConfigUrlsFromUnknown(value: unknown, acc: Set<string>, depth = 
   }
 }
 
+function parseTrojanPasswordFromConfigUrl(configUrl: string): string | null {
+  try {
+    const parsed = new URL(configUrl);
+
+    if (parsed.protocol !== "trojan:") {
+      return null;
+    }
+
+    const password = decodeURIComponent(parsed.username).trim();
+    return password.length > 0 ? password : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTrojanPasswordsFromUsersKvEntry(userEntry: unknown): string[] {
+  if (typeof userEntry !== "object" || userEntry === null || Array.isArray(userEntry)) {
+    return [];
+  }
+
+  const entryObject = userEntry as Record<string, unknown>;
+  const passwords = new Set<string>();
+  const addPassword = (value: string | null): void => {
+    if (value === null) {
+      return;
+    }
+
+    const trimmed = value.trim();
+    if (trimmed.length > 0) {
+      passwords.add(trimmed);
+    }
+  };
+
+  if (typeof entryObject.passwordBase64 === "string") {
+    addPassword(decodeBase64OrKeepRaw(entryObject.passwordBase64));
+  }
+
+  if (typeof entryObject.directUrl === "string") {
+    addPassword(parseTrojanPasswordFromConfigUrl(entryObject.directUrl));
+  }
+
+  if (typeof entryObject.obfsUrl === "string") {
+    addPassword(parseTrojanPasswordFromConfigUrl(entryObject.obfsUrl));
+  }
+
+  const protocolsRaw = entryObject.protocols;
+
+  if (typeof protocolsRaw === "object" && protocolsRaw !== null && !Array.isArray(protocolsRaw)) {
+    const protocols = protocolsRaw as Record<string, unknown>;
+
+    for (const protocolKey of ["trojan", "trojan_obfuscated"]) {
+      const protocolRaw = protocols[protocolKey];
+
+      if (typeof protocolRaw !== "object" || protocolRaw === null || Array.isArray(protocolRaw)) {
+        continue;
+      }
+
+      const protocolEntry = protocolRaw as Record<string, unknown>;
+
+      if (typeof protocolEntry.secretBase64 === "string") {
+        addPassword(decodeBase64OrKeepRaw(protocolEntry.secretBase64));
+      }
+
+      if (typeof protocolEntry.url === "string") {
+        addPassword(parseTrojanPasswordFromConfigUrl(protocolEntry.url));
+      }
+    }
+  }
+
+  const urlsSet = new Set<string>();
+  collectConfigUrlsFromUnknown(userEntry, urlsSet);
+
+  for (const configUrl of urlsSet.values()) {
+    addPassword(parseTrojanPasswordFromConfigUrl(configUrl));
+  }
+
+  return Array.from(passwords.values());
+}
+
 function parseUsersKvMap(rawValue: unknown): Record<string, unknown> {
   if (typeof rawValue !== "object" || rawValue === null || Array.isArray(rawValue)) {
     return {};
@@ -543,11 +622,17 @@ function parseUsersKvMap(rawValue: unknown): Record<string, unknown> {
 function removeUserFromUsersKvMap(
   usersKvMap: Record<string, unknown>,
   userInternalUuid: string,
-): { nextUsersKvMap: Record<string, unknown>; removedUrls: string[]; removed: boolean } {
+): {
+  nextUsersKvMap: Record<string, unknown>;
+  removedUrls: string[];
+  trojanPasswords: string[];
+  removed: boolean;
+} {
   if (!Object.hasOwn(usersKvMap, userInternalUuid)) {
     return {
       nextUsersKvMap: usersKvMap,
       removedUrls: [],
+      trojanPasswords: [],
       removed: false,
     };
   }
@@ -555,6 +640,7 @@ function removeUserFromUsersKvMap(
   const userEntry = usersKvMap[userInternalUuid];
   const removedUrlsSet = new Set<string>();
   collectConfigUrlsFromUnknown(userEntry, removedUrlsSet);
+  const trojanPasswords = extractTrojanPasswordsFromUsersKvEntry(userEntry);
 
   const nextUsersKvMap = Object.fromEntries(
     Object.entries(usersKvMap).filter(([entryKey]) => entryKey !== userInternalUuid),
@@ -563,6 +649,7 @@ function removeUserFromUsersKvMap(
   return {
     nextUsersKvMap,
     removedUrls: Array.from(removedUrlsSet),
+    trojanPasswords,
     removed: true,
   };
 }
@@ -966,12 +1053,16 @@ async function runUserSync(): Promise<UserSyncResult> {
 
       const canRunSsh = vpsState.sshConfig !== null;
       let canRemoveFromDatabase = !canRunSsh;
+      const trojanPasswords = extractTrojanPasswordsFromUsersKvEntry(
+        vpsState.usersKvMap[user.internalUuid],
+      );
 
       if (vpsState.sshConfig !== null) {
         try {
           await removeVpsXrayUserFromAllProtocols({
             sshConfig: vpsState.sshConfig,
             userInternalUuid: user.internalUuid,
+            trojanPasswords,
           });
 
           const ports = extractVpsPorts(vpsState.configList);

@@ -39,6 +39,7 @@ interface RemoveVpsClientInput {
 interface RemoveVpsUserFromAllProtocolsInput {
   sshConfig: VpsSshConfig;
   userInternalUuid: string;
+  trojanPasswords?: string[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -397,14 +398,28 @@ function upsertShadowsocksClient(input: {
   return true;
 }
 
-function removeTrojanClientByEmail(input: {
+function removeTrojanClient(input: {
   inbound: JsonObject;
   inboundTag: string;
   userInternalUuid: string;
+  trojanPasswords?: string[];
 }): boolean {
   const clients = getTrojanInboundClients(input.inbound, input.inboundTag);
   const initialLength = clients.length;
-  const nextClients = clients.filter((client) => client.email !== input.userInternalUuid);
+  const passwordSet = new Set(
+    (input.trojanPasswords ?? []).map((item) => item.trim()).filter((item) => item.length > 0),
+  );
+  const nextClients = clients.filter((client) => {
+    if (client.email === input.userInternalUuid) {
+      return false;
+    }
+
+    if (passwordSet.size === 0 || typeof client.password !== "string") {
+      return true;
+    }
+
+    return !passwordSet.has(client.password);
+  });
 
   if (nextClients.length === initialLength) {
     return false;
@@ -607,7 +622,7 @@ export async function removeVpsXrayClient(input: RemoveVpsClientInput): Promise<
   let changed = false;
 
   if (parsedProtocol === "trojan" || parsedProtocol === "trojan_obfuscated") {
-    changed = removeTrojanClientByEmail({
+    changed = removeTrojanClient({
       inbound,
       inboundTag,
       userInternalUuid: input.userInternalUuid,
@@ -639,41 +654,67 @@ export async function removeVpsXrayUserFromAllProtocols(
 ): Promise<boolean> {
   const runtimeConfig = getXrayRuntimeConfig();
   const xrayConfig = await readRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath);
-  const candidates: Array<{ protocol: VpsClientProtocol; tag: string }> = [
-    { protocol: "trojan", tag: runtimeConfig.directTag },
-    { protocol: "trojan_obfuscated", tag: runtimeConfig.obfsTag },
-    { protocol: "vless_ws", tag: runtimeConfig.vlessWsTag },
-    { protocol: "shadowsocks", tag: runtimeConfig.shadowsocksTag },
-  ];
+  const candidates: Array<{
+    protocol: VpsClientProtocol;
+    inbound: JsonObject;
+    inboundTag: string;
+  }> = [];
+
+  for (let index = 0; index < xrayConfig.inbounds.length; index += 1) {
+    const inbound = xrayConfig.inbounds[index];
+    const protocolRaw = inbound.protocol;
+    const inboundTag = getInboundTagValue(inbound) ?? "inbound-" + String(index + 1);
+
+    if (protocolRaw === "trojan") {
+      candidates.push({
+        protocol: "trojan",
+        inbound,
+        inboundTag,
+      });
+      continue;
+    }
+
+    if (protocolRaw === "vless") {
+      candidates.push({
+        protocol: "vless_ws",
+        inbound,
+        inboundTag,
+      });
+      continue;
+    }
+
+    if (protocolRaw === "shadowsocks") {
+      candidates.push({
+        protocol: "shadowsocks",
+        inbound,
+        inboundTag,
+      });
+    }
+  }
 
   let changed = false;
 
   for (const candidate of candidates) {
-    const inbound = getInboundByTag(xrayConfig, candidate.tag, false);
-
-    if (inbound === null) {
-      continue;
-    }
-
     try {
       let currentChanged = false;
 
-      if (candidate.protocol === "trojan" || candidate.protocol === "trojan_obfuscated") {
-        currentChanged = removeTrojanClientByEmail({
-          inbound,
-          inboundTag: candidate.tag,
+      if (candidate.protocol === "trojan") {
+        currentChanged = removeTrojanClient({
+          inbound: candidate.inbound,
+          inboundTag: candidate.inboundTag,
           userInternalUuid: input.userInternalUuid,
+          trojanPasswords: input.trojanPasswords,
         });
       } else if (candidate.protocol === "vless_ws") {
         currentChanged = removeVlessClient({
-          inbound,
-          inboundTag: candidate.tag,
+          inbound: candidate.inbound,
+          inboundTag: candidate.inboundTag,
           userInternalUuid: input.userInternalUuid,
         });
       } else {
         currentChanged = removeShadowsocksClient({
-          inbound,
-          inboundTag: candidate.tag,
+          inbound: candidate.inbound,
+          inboundTag: candidate.inboundTag,
           userInternalUuid: input.userInternalUuid,
         });
       }
