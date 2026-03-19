@@ -505,6 +505,14 @@ function buildReadAccessLogsCommand(accessLogPath: string, tailLines: number): s
     " " +
     shellQuote(accessLogPath) +
     " 2>/dev/null || true; " +
+    "elif command -v sudo >/dev/null 2>&1 && sudo -n test -r " +
+    shellQuote(accessLogPath) +
+    " >/dev/null 2>&1; then " +
+    "sudo -n tail -n " +
+    String(tailLines) +
+    " " +
+    shellQuote(accessLogPath) +
+    " 2>/dev/null || true; " +
     "elif command -v journalctl >/dev/null 2>&1; then " +
     "journalctl -u xray --no-pager -n " +
     String(tailLines) +
@@ -604,6 +612,106 @@ function parseLogDate(line: string): Date | null {
   return null;
 }
 
+function parseJsonLineObject(line: string): Record<string, unknown> | null {
+  const trimmed = line.trim();
+
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractUuidFromUnknown(rawValue: unknown): string | null {
+  if (typeof rawValue !== "string") {
+    return null;
+  }
+
+  const match = rawValue.match(UUID_PATTERN);
+  return match === null ? null : match[0].toLowerCase();
+}
+
+function extractIpFromUnknown(rawValue: unknown): string | null {
+  if (typeof rawValue !== "string") {
+    return null;
+  }
+
+  return extractIpv4(rawValue);
+}
+
+function extractUserInternalUuidFromLogLine(line: string): string | null {
+  const jsonObject = parseJsonLineObject(line);
+
+  if (jsonObject !== null) {
+    const candidateKeys = [
+      "email",
+      "user",
+      "userId",
+      "user_id",
+      "client",
+      "clientId",
+      "client_id",
+      "uid",
+      "tag",
+    ];
+
+    for (const key of candidateKeys) {
+      const candidate = extractUuidFromUnknown(jsonObject[key]);
+
+      if (candidate !== null) {
+        return candidate;
+      }
+    }
+  }
+
+  const rawMatch = line.match(UUID_PATTERN);
+  return rawMatch === null ? null : rawMatch[0].toLowerCase();
+}
+
+function extractSourceIpFromLogLine(line: string): string | null {
+  const jsonObject = parseJsonLineObject(line);
+
+  if (jsonObject !== null) {
+    const candidateKeys = [
+      "source",
+      "src",
+      "client",
+      "clientIp",
+      "client_ip",
+      "remote",
+      "remoteAddr",
+      "remote_addr",
+      "peer",
+    ];
+
+    for (const key of candidateKeys) {
+      const candidate = extractIpFromUnknown(jsonObject[key]);
+
+      if (candidate !== null) {
+        return candidate;
+      }
+    }
+  }
+
+  const fromMatch = line.match(/\bfrom\s+((?:\d{1,3}\.){3}\d{1,3})(?::\d+)?\b/iu);
+
+  if (fromMatch !== null) {
+    return fromMatch[1];
+  }
+
+  return extractIpv4(line);
+}
+
 function parseUserIpSetsFromLogs(
   logOutput: string,
   currentWindowMinutes: number,
@@ -618,14 +726,12 @@ function parseUserIpSetsFromLogs(
   const monthWindowStart = now - 30 * 24 * 60 * 60 * 1000;
 
   for (const line of logOutput.split(/\r?\n/u)) {
-    const userIdMatch = line.match(UUID_PATTERN);
-    const ip = extractIpv4(line);
+    const userInternalUuid = extractUserInternalUuidFromLogLine(line);
+    const ip = extractSourceIpFromLogLine(line);
 
-    if (userIdMatch === null || ip === null) {
+    if (userInternalUuid === null || ip === null) {
       continue;
     }
-
-    const userInternalUuid = userIdMatch[0].toLowerCase();
     const logDate = parseLogDate(line);
     const logTs = logDate?.getTime();
     const inCurrentWindow = logTs === undefined || logTs >= currentWindowStart;
@@ -1172,6 +1278,21 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         if (metrics.speedCurlStderrLength > 0) {
           console.log("[vps-sync][debug] speed curl stderr sample:", metrics.speedCurlStderrSample);
         }
+      }
+
+      if (
+        metrics.activeIps.size > 0 &&
+        metrics.userTrafficBytes.size > 0 &&
+        metrics.userCurrentIps.size === 0
+      ) {
+        console.warn(
+          "[vps-sync][warn] active users detected in stats but user IPs were not parsed from logs:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "activeIps=" + String(metrics.activeIps.size),
+          "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
+          "hint=check xray access logs include user/email and source IP",
+        );
       }
 
       const knownUserIds = parseUsersKvMapKeys(row.users_kv_map);
