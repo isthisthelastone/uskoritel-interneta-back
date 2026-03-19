@@ -39,6 +39,10 @@ const userVpsTrafficMonthlyStateRowSchema = z.object({
   month_key: z.string().min(1),
   month_consumed_bytes: z.union([z.number(), z.string()]),
 });
+const userConnectionsRowSchema = z.object({
+  internal_uuid: z.uuid(),
+  connections_by_server: z.unknown().nullable().optional(),
+});
 
 interface UserAggregate {
   currentIps: Set<string>;
@@ -280,6 +284,31 @@ function parseUsersKvMapKeys(usersKvMap: unknown): string[] {
   }
 
   return Object.keys(usersKvMap).filter((key) => UUID_PATTERN.test(key));
+}
+
+function parseConnectionsByServerMap(rawValue: unknown): Record<string, number> {
+  if (typeof rawValue !== "object" || rawValue === null || Array.isArray(rawValue)) {
+    return {};
+  }
+
+  const nextMap: Record<string, number> = {};
+
+  for (const [rawKey, rawMetric] of Object.entries(rawValue)) {
+    const parsedMetric =
+      typeof rawMetric === "number"
+        ? rawMetric
+        : typeof rawMetric === "string"
+          ? Number.parseFloat(rawMetric)
+          : NaN;
+
+    if (!Number.isFinite(parsedMetric) || parsedMetric <= 0) {
+      continue;
+    }
+
+    nextMap[rawKey] = Math.trunc(parsedMetric);
+  }
+
+  return nextMap;
 }
 
 function parsePortFromConfigUrl(configUrl: string): number | null {
@@ -889,13 +918,20 @@ function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number
           continue;
         }
 
-        if (typeof valueRaw !== "number" || !Number.isFinite(valueRaw) || valueRaw < 0) {
+        const parsedValue =
+          typeof valueRaw === "number"
+            ? valueRaw
+            : typeof valueRaw === "string"
+              ? Number.parseFloat(valueRaw)
+              : NaN;
+
+        if (!Number.isFinite(parsedValue) || parsedValue < 0) {
           continue;
         }
 
         const userInternalUuid = uuidMatch[0].toLowerCase();
         const current = userTrafficBytes.get(userInternalUuid) ?? 0;
-        userTrafficBytes.set(userInternalUuid, current + valueRaw);
+        userTrafficBytes.set(userInternalUuid, current + parsedValue);
       }
     }
   }
@@ -1615,21 +1651,54 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     }
   }
 
+  const userIdsToUpdate = Array.from(userAggregates.keys());
+  const existingConnectionsByUser = new Map<string, Record<string, number>>();
+
+  if (userIdsToUpdate.length > 0) {
+    const { data: existingUsersData, error: existingUsersError } = await supabase
+      .from("users")
+      .select("internal_uuid, connections_by_server")
+      .in("internal_uuid", userIdsToUpdate);
+
+    if (existingUsersError !== null) {
+      throw new Error(
+        "Failed to fetch existing user connections_by_server: " + existingUsersError.message,
+      );
+    }
+
+    for (const rawRow of existingUsersData) {
+      const parsedRow = userConnectionsRowSchema.parse(rawRow);
+      existingConnectionsByUser.set(
+        parsedRow.internal_uuid,
+        parseConnectionsByServerMap(parsedRow.connections_by_server),
+      );
+    }
+  }
+
   let updatedUsers = 0;
 
   for (const [userId, aggregate] of userAggregates.entries()) {
     const monthTrafficBytes = monthTrafficBytesByUser.get(userId) ?? 0;
     const currentServerCount = (recentActiveVpsByUser.get(userId) ?? new Set<string>()).size;
     const monthServerCount = (monthActiveVpsByUser.get(userId) ?? new Set<string>()).size;
+    const currentConnections = Math.max(aggregate.currentIps.size, currentServerCount);
+    const existingConnectionsByServer = existingConnectionsByUser.get(userId) ?? {};
+    const freshConnectionsByServer = userConnectionsByServer.get(userId) ?? {};
+    const nextConnectionsByServer =
+      Object.keys(freshConnectionsByServer).length > 0
+        ? freshConnectionsByServer
+        : currentConnections > 0
+          ? existingConnectionsByServer
+          : {};
     const userUpdatePayload: {
       number_of_connections: number;
       number_of_connections_last_month: number;
       traffic_consumed_mb?: number;
       connections_by_server: Record<string, number>;
     } = {
-      number_of_connections: Math.max(aggregate.currentIps.size, currentServerCount),
+      number_of_connections: currentConnections,
       number_of_connections_last_month: Math.max(aggregate.monthIps.size, monthServerCount),
-      connections_by_server: userConnectionsByServer.get(userId) ?? {},
+      connections_by_server: nextConnectionsByServer,
     };
 
     if (monthTrafficBytesByUser.has(userId)) {
