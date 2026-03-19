@@ -454,11 +454,11 @@ function buildDistinctActiveIpCommand(ports: number[]): string {
     "if command -v ss >/dev/null 2>&1; then " +
     "ss -Htan state established '( " +
     ssPortsClause +
-    " )' | awk '{print $5}'; " +
+    " )' | awk '{print $4\" \"$5}'; " +
     "else " +
     'netstat -tan 2>/dev/null | awk \'$6 == "ESTABLISHED" && (' +
     netstatPortsClause +
-    ") {print $5}'; " +
+    ') {print $4" "$5}\'; ' +
     "fi"
   );
 }
@@ -571,18 +571,46 @@ function extractIpv4(value: string): string | null {
   return match === null ? null : match[0];
 }
 
-function parseDistinctIps(stdout: string): Set<string> {
-  const ips = new Set<string>();
+function extractPortFromEndpoint(value: string): number | null {
+  const match = value.match(/:(\d{1,5})$/u);
 
-  for (const rawLine of stdout.split(/\r?\n/u)) {
-    const ip = extractIpv4(rawLine);
-
-    if (ip !== null) {
-      ips.add(ip);
-    }
+  if (match === null) {
+    return null;
   }
 
-  return ips;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
+}
+
+function parseDistinctActiveSocketKeys(stdout: string): Set<string> {
+  const socketKeys = new Set<string>();
+
+  for (const rawLine of stdout.split(/\r?\n/u)) {
+    const trimmed = rawLine.trim();
+
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    const endpoints = trimmed.split(/\s+/u);
+    const localEndpoint = endpoints[0];
+    const remoteEndpoint = endpoints.length > 1 ? endpoints[1] : endpoints[0];
+    const sourcePort = extractPortFromEndpoint(localEndpoint);
+    const ip = extractIpv4(remoteEndpoint);
+
+    if (ip === null) {
+      continue;
+    }
+
+    if (sourcePort === null) {
+      socketKeys.add(ip);
+      continue;
+    }
+
+    socketKeys.add(ip + ":" + String(sourcePort));
+  }
+
+  return socketKeys;
 }
 
 function parseLogDate(line: string): Date | null {
@@ -754,6 +782,18 @@ function parseUserIpSetsFromLogs(
     userCurrentIps,
     userMonthIps,
   };
+}
+
+function countUniqueIpsFromUserCurrentMap(userCurrentIps: Map<string, Set<string>>): number {
+  const uniqueIps = new Set<string>();
+
+  for (const ips of userCurrentIps.values()) {
+    for (const ip of ips.values()) {
+      uniqueIps.add(ip);
+    }
+  }
+
+  return uniqueIps.size;
 }
 
 function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number> {
@@ -996,7 +1036,7 @@ async function collectVpsMetrics(
       ])
     : [skippedSpeedtestResult, skippedSpeedtestResult];
 
-  const activeIps = parseDistinctIps(activeIpsResult.stdout);
+  const activeIps = parseDistinctActiveSocketKeys(activeIpsResult.stdout);
   const statsCommandFailed = statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
   const statsBinaryNotFound = statsResult.stdout.includes("__XRAY_BINARY_NOT_FOUND__");
   const userTrafficBytes = parseUserTrafficBytesFromStats(statsResult.stdout);
@@ -1228,12 +1268,16 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const sshConfig = buildVpsSshConfig(row);
       const ports = extractVpsPorts(row.config_list);
       const metrics = await collectVpsMetrics(sshConfig, ports, row.disabled !== true);
+      const activeIpsFromLogsCount = countUniqueIpsFromUserCurrentMap(metrics.userCurrentIps);
+      const effectiveActiveIpsCount = Math.max(metrics.activeIps.size, activeIpsFromLogsCount);
       if (verbose || metrics.userTrafficBytes.size === 0) {
         console.log(
           "[vps-sync][debug] vps metrics:",
           "internalUuid=" + row.internal_uuid,
           "domain=" + row.domain,
           "activeIps=" + String(metrics.activeIps.size),
+          "activeIpsFromLogs=" + String(activeIpsFromLogsCount),
+          "effectiveActiveIps=" + String(effectiveActiveIpsCount),
           "currentSpeedMbPerSec=" + metrics.currentSpeedMbPerSecond.toFixed(2),
           "speedSource=" + metrics.speedSource,
           "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
@@ -1387,7 +1431,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const { error: updateVpsError } = await supabase
         .from("vps")
         .update({
-          number_of_connections: metrics.activeIps.size,
+          number_of_connections: effectiveActiveIpsCount,
           current_speed: metrics.currentSpeedMbPerSecond,
           connection: true,
           disabled: false,
@@ -1401,7 +1445,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       nodeSummaries.push({
         internalUuid: row.internal_uuid,
         domain: row.domain,
-        activeIpCount: metrics.activeIps.size,
+        activeIpCount: effectiveActiveIpsCount,
         abusiveUsers,
       });
     } catch (error) {
