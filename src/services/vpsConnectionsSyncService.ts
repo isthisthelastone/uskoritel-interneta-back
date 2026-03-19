@@ -84,6 +84,12 @@ interface UserVpsTrafficMonthlyStateRow {
   monthConsumedBytes: number;
 }
 
+interface MonthTrafficComputationResult {
+  monthBytesByUser: Map<string, number>;
+  recentActiveVpsByUser: Map<string, Set<string>>;
+  monthActiveVpsByUser: Map<string, Set<string>>;
+}
+
 interface AbuseEvent {
   internalUuid: string;
   userInternalUuid: string;
@@ -853,6 +859,47 @@ function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number
     }
   }
 
+  if (userTrafficBytes.size === 0) {
+    const parsedStatsObject = parseJsonObjectFromText(statsOutput);
+    const statRowsRaw = parsedStatsObject?.stat;
+
+    if (Array.isArray(statRowsRaw)) {
+      for (const statRowRaw of statRowsRaw) {
+        if (typeof statRowRaw !== "object" || statRowRaw === null || Array.isArray(statRowRaw)) {
+          continue;
+        }
+
+        const statRow = statRowRaw as Record<string, unknown>;
+        const nameRaw = statRow.name;
+        const valueRaw = statRow.value;
+
+        if (typeof nameRaw !== "string") {
+          continue;
+        }
+
+        const metricMatch = nameRaw.match(/user>>>(.*?)>>>traffic>>>(uplink|downlink)/iu);
+
+        if (metricMatch === null) {
+          continue;
+        }
+
+        const uuidMatch = metricMatch[1].match(UUID_PATTERN);
+
+        if (uuidMatch === null) {
+          continue;
+        }
+
+        if (typeof valueRaw !== "number" || !Number.isFinite(valueRaw) || valueRaw < 0) {
+          continue;
+        }
+
+        const userInternalUuid = uuidMatch[0].toLowerCase();
+        const current = userTrafficBytes.get(userInternalUuid) ?? 0;
+        userTrafficBytes.set(userInternalUuid, current + valueRaw);
+      }
+    }
+  }
+
   return userTrafficBytes;
 }
 
@@ -1081,11 +1128,15 @@ async function computeCalendarMonthTrafficByUser(params: {
   vpsInternalUuids: string[];
   perVpsUserTotals: Map<string, number>;
   now: Date;
-}): Promise<Map<string, number>> {
+}): Promise<MonthTrafficComputationResult> {
   const verbose = isVerboseSyncLoggingEnabled();
 
   if (params.vpsInternalUuids.length === 0) {
-    return new Map<string, number>();
+    return {
+      monthBytesByUser: new Map<string, number>(),
+      recentActiveVpsByUser: new Map<string, Set<string>>(),
+      monthActiveVpsByUser: new Map<string, Set<string>>(),
+    };
   }
 
   const supabase = getSupabaseAdminClient();
@@ -1127,6 +1178,7 @@ async function computeCalendarMonthTrafficByUser(params: {
     month_key: string;
     month_consumed_bytes: number;
   }> = [];
+  const recentActiveVpsByUser = new Map<string, Set<string>>();
 
   for (const [key, currentTotalBytes] of params.perVpsUserTotals.entries()) {
     const separatorIndex = key.indexOf("::");
@@ -1145,6 +1197,13 @@ async function computeCalendarMonthTrafficByUser(params: {
         : currentTotalBytes >= existing.lastTotalBytes
           ? currentTotalBytes - existing.lastTotalBytes
           : currentTotalBytes;
+
+    if (deltaBytes > 0) {
+      const existingRecentSet = recentActiveVpsByUser.get(userInternalUuid) ?? new Set<string>();
+      existingRecentSet.add(vpsInternalUuid);
+      recentActiveVpsByUser.set(userInternalUuid, existingRecentSet);
+    }
+
     const nextMonthConsumedBytes =
       existing !== undefined && existing.monthKey === currentMonthKey
         ? existing.monthConsumedBytes + deltaBytes
@@ -1190,14 +1249,19 @@ async function computeCalendarMonthTrafficByUser(params: {
   }
 
   const monthBytesByUser = new Map<string, number>();
+  const monthActiveVpsByUser = new Map<string, Set<string>>();
 
   for (const row of stateMap.values()) {
-    if (row.monthKey !== currentMonthKey) {
+    if (row.monthKey !== currentMonthKey || row.monthConsumedBytes <= 0) {
       continue;
     }
 
     const currentBytes = monthBytesByUser.get(row.userInternalUuid) ?? 0;
     monthBytesByUser.set(row.userInternalUuid, currentBytes + row.monthConsumedBytes);
+
+    const existingMonthSet = monthActiveVpsByUser.get(row.userInternalUuid) ?? new Set<string>();
+    existingMonthSet.add(row.vpsInternalUuid);
+    monthActiveVpsByUser.set(row.userInternalUuid, existingMonthSet);
   }
 
   if (verbose) {
@@ -1212,7 +1276,11 @@ async function computeCalendarMonthTrafficByUser(params: {
     );
   }
 
-  return monthBytesByUser;
+  return {
+    monthBytesByUser,
+    recentActiveVpsByUser,
+    monthActiveVpsByUser,
+  };
 }
 
 async function dropAbusiveUserConnections(
@@ -1497,11 +1565,36 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     }
   }
 
-  const monthTrafficBytesByUser = await computeCalendarMonthTrafficByUser({
+  const monthTraffic = await computeCalendarMonthTrafficByUser({
     vpsInternalUuids: parsedRows.map((row) => row.internal_uuid),
     perVpsUserTotals,
     now: syncNow,
   });
+  const monthTrafficBytesByUser = monthTraffic.monthBytesByUser;
+  const recentActiveVpsByUser = monthTraffic.recentActiveVpsByUser;
+  const monthActiveVpsByUser = monthTraffic.monthActiveVpsByUser;
+
+  for (const [userId, recentVpsSet] of recentActiveVpsByUser.entries()) {
+    const previousConnectionsByServerMap = userConnectionsByServer.get(userId) ?? {};
+    const nextConnectionsByServerMap = { ...previousConnectionsByServerMap };
+
+    for (const vpsInternalUuid of recentVpsSet.values()) {
+      const currentValue = nextConnectionsByServerMap[vpsInternalUuid] ?? 0;
+
+      if (currentValue <= 0) {
+        nextConnectionsByServerMap[vpsInternalUuid] = 1;
+      }
+    }
+
+    userConnectionsByServer.set(userId, nextConnectionsByServerMap);
+
+    if (!userAggregates.has(userId)) {
+      userAggregates.set(userId, {
+        currentIps: new Set<string>(),
+        monthIps: new Set<string>(),
+      });
+    }
+  }
 
   if (verbose) {
     console.log(
@@ -1509,6 +1602,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       "aggregatedUsers=" + String(userAggregates.size),
       "perVpsUserTotals=" + String(perVpsUserTotals.size),
       "monthUsers=" + String(monthTrafficBytesByUser.size),
+      "recentActiveUsersByStats=" + String(recentActiveVpsByUser.size),
     );
   }
 
@@ -1525,14 +1619,16 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
   for (const [userId, aggregate] of userAggregates.entries()) {
     const monthTrafficBytes = monthTrafficBytesByUser.get(userId) ?? 0;
+    const currentServerCount = (recentActiveVpsByUser.get(userId) ?? new Set<string>()).size;
+    const monthServerCount = (monthActiveVpsByUser.get(userId) ?? new Set<string>()).size;
     const userUpdatePayload: {
       number_of_connections: number;
       number_of_connections_last_month: number;
       traffic_consumed_mb?: number;
       connections_by_server: Record<string, number>;
     } = {
-      number_of_connections: aggregate.currentIps.size,
-      number_of_connections_last_month: aggregate.monthIps.size,
+      number_of_connections: Math.max(aggregate.currentIps.size, currentServerCount),
+      number_of_connections_last_month: Math.max(aggregate.monthIps.size, monthServerCount),
       connections_by_server: userConnectionsByServer.get(userId) ?? {},
     };
 

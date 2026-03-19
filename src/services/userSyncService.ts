@@ -966,14 +966,8 @@ async function runUserSync(): Promise<UserSyncResult> {
 
   const usersToUpdateConnectionStats = new Set<string>();
 
-  for (const user of users) {
-    if (
-      user.numberOfConnections > 0 ||
-      Object.keys(user.connectionsByServer).length > 0 ||
-      liveUserCurrentIps.has(user.internalUuid)
-    ) {
-      usersToUpdateConnectionStats.add(user.internalUuid);
-    }
+  for (const userInternalUuid of liveUserCurrentIps.keys()) {
+    usersToUpdateConnectionStats.add(userInternalUuid);
   }
 
   let connectionStatsUpdatedUsers = 0;
