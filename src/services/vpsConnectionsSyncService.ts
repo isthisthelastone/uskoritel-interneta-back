@@ -311,6 +311,198 @@ function parseConnectionsByServerMap(rawValue: unknown): Record<string, number> 
   return nextMap;
 }
 
+function decodeBase64Strict(rawValue: string): string | null {
+  try {
+    const decoded = Buffer.from(rawValue, "base64").toString("utf8").trim();
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseSecretCandidatesFromConfigUrl(configUrl: string): string[] {
+  const parsedSecrets = new Set<string>();
+
+  try {
+    const parsed = new URL(configUrl);
+    const scheme = parsed.protocol.toLowerCase();
+
+    if (scheme === "trojan:") {
+      const secret = decodeURIComponent(parsed.username).trim();
+
+      if (secret.length > 0) {
+        parsedSecrets.add(secret);
+      }
+    } else if (scheme === "vless:") {
+      const secret = decodeURIComponent(parsed.username).trim();
+
+      if (secret.length > 0) {
+        parsedSecrets.add(secret);
+      }
+    } else if (scheme === "ss:") {
+      if (parsed.password.length > 0) {
+        const password = decodeURIComponent(parsed.password).trim();
+
+        if (password.length > 0) {
+          parsedSecrets.add(password);
+        }
+      } else {
+        const rawUsername = decodeURIComponent(parsed.username).trim();
+        const decodedUsername = decodeBase64Strict(rawUsername);
+        const usernameCandidate = decodedUsername ?? rawUsername;
+        const separatorIndex = usernameCandidate.indexOf(":");
+
+        if (separatorIndex > -1 && separatorIndex < usernameCandidate.length - 1) {
+          const password = usernameCandidate.slice(separatorIndex + 1).trim();
+
+          if (password.length > 0) {
+            parsedSecrets.add(password);
+          }
+        }
+      }
+    }
+  } catch {
+    return [];
+  }
+
+  return Array.from(parsedSecrets.values());
+}
+
+function buildStatsMetricUserResolver(
+  usersKvMap: unknown,
+): (metricIdentity: string) => string | null {
+  const knownUserIds = new Set(parseUsersKvMapKeys(usersKvMap).map((key) => key.toLowerCase()));
+  const aliasToUser = new Map<string, string>();
+  const addAlias = (userInternalUuid: string, rawAlias: unknown): void => {
+    if (typeof rawAlias !== "string") {
+      return;
+    }
+
+    const trimmed = rawAlias.trim();
+
+    if (trimmed.length === 0) {
+      return;
+    }
+
+    aliasToUser.set(trimmed, userInternalUuid);
+    aliasToUser.set(trimmed.toLowerCase(), userInternalUuid);
+  };
+
+  for (const userInternalUuid of knownUserIds.values()) {
+    addAlias(userInternalUuid, userInternalUuid);
+  }
+
+  if (typeof usersKvMap !== "object" || usersKvMap === null || Array.isArray(usersKvMap)) {
+    return (metricIdentity: string): string | null => {
+      const rawIdentity = metricIdentity.trim();
+
+      if (rawIdentity.length === 0) {
+        return null;
+      }
+
+      const uuidMatch = rawIdentity.match(UUID_PATTERN);
+
+      if (uuidMatch !== null) {
+        return uuidMatch[0].toLowerCase();
+      }
+
+      return null;
+    };
+  }
+
+  for (const [rawUserId, rawEntry] of Object.entries(usersKvMap)) {
+    const userUuidMatch = rawUserId.match(UUID_PATTERN);
+
+    if (userUuidMatch === null) {
+      continue;
+    }
+
+    const userInternalUuid = userUuidMatch[0].toLowerCase();
+    addAlias(userInternalUuid, userInternalUuid);
+
+    if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) {
+      continue;
+    }
+
+    const entry = rawEntry as Record<string, unknown>;
+
+    if (typeof entry.passwordBase64 === "string") {
+      addAlias(userInternalUuid, decodeBase64Strict(entry.passwordBase64));
+    }
+
+    for (const urlKey of ["directUrl", "obfsUrl"]) {
+      const rawUrl = entry[urlKey];
+
+      if (typeof rawUrl !== "string") {
+        continue;
+      }
+
+      for (const secret of parseSecretCandidatesFromConfigUrl(rawUrl)) {
+        addAlias(userInternalUuid, secret);
+      }
+    }
+
+    const protocolsRaw = entry.protocols;
+
+    if (typeof protocolsRaw !== "object" || protocolsRaw === null || Array.isArray(protocolsRaw)) {
+      continue;
+    }
+
+    for (const protocolEntryRaw of Object.values(protocolsRaw as Record<string, unknown>)) {
+      if (
+        typeof protocolEntryRaw !== "object" ||
+        protocolEntryRaw === null ||
+        Array.isArray(protocolEntryRaw)
+      ) {
+        continue;
+      }
+
+      const protocolEntry = protocolEntryRaw as Record<string, unknown>;
+      const secretBase64 = protocolEntry.secretBase64;
+      const configUrl = protocolEntry.url;
+
+      if (typeof secretBase64 === "string") {
+        addAlias(userInternalUuid, decodeBase64Strict(secretBase64));
+      }
+
+      if (typeof configUrl === "string") {
+        for (const secret of parseSecretCandidatesFromConfigUrl(configUrl)) {
+          addAlias(userInternalUuid, secret);
+        }
+      }
+    }
+  }
+
+  return (metricIdentity: string): string | null => {
+    const rawIdentity = metricIdentity.trim();
+
+    if (rawIdentity.length === 0) {
+      return null;
+    }
+
+    const byAlias = aliasToUser.get(rawIdentity) ?? aliasToUser.get(rawIdentity.toLowerCase());
+
+    if (byAlias !== undefined) {
+      return byAlias;
+    }
+
+    const uuidMatch = rawIdentity.match(UUID_PATTERN);
+
+    if (uuidMatch !== null) {
+      const metricUuid = uuidMatch[0].toLowerCase();
+      const byUuidAlias = aliasToUser.get(metricUuid);
+
+      if (byUuidAlias !== undefined) {
+        return byUuidAlias;
+      }
+
+      return metricUuid;
+    }
+
+    return null;
+  };
+}
+
 function parsePortFromConfigUrl(configUrl: string): number | null {
   try {
     const parsed = new URL(configUrl);
@@ -831,7 +1023,71 @@ function countUniqueIpsFromUserCurrentMap(userCurrentIps: Map<string, Set<string
   return uniqueIps.size;
 }
 
-function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number> {
+function parseUserTrafficBytesFromStatsJson(
+  statsOutput: string,
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
+): Map<string, number> {
+  const userTrafficBytes = new Map<string, number>();
+  const parsedStatsObject = parseJsonObjectFromText(statsOutput);
+  const statRowsRaw = parsedStatsObject?.stat;
+
+  if (!Array.isArray(statRowsRaw)) {
+    return userTrafficBytes;
+  }
+
+  for (const statRowRaw of statRowsRaw) {
+    if (typeof statRowRaw !== "object" || statRowRaw === null || Array.isArray(statRowRaw)) {
+      continue;
+    }
+
+    const statRow = statRowRaw as Record<string, unknown>;
+    const nameRaw = statRow.name;
+    const valueRaw = statRow.value;
+
+    if (typeof nameRaw !== "string") {
+      continue;
+    }
+
+    const metricMatch = nameRaw.match(/user>>>(.*?)>>>traffic>>>(uplink|downlink)/iu);
+
+    if (metricMatch === null) {
+      continue;
+    }
+
+    const resolvedUserInternalUuid = resolveUserInternalUuid(metricMatch[1]);
+
+    if (resolvedUserInternalUuid === null) {
+      continue;
+    }
+
+    const parsedValue =
+      typeof valueRaw === "number"
+        ? valueRaw
+        : typeof valueRaw === "string"
+          ? Number.parseFloat(valueRaw)
+          : NaN;
+
+    if (!Number.isFinite(parsedValue) || parsedValue < 0) {
+      continue;
+    }
+
+    const current = userTrafficBytes.get(resolvedUserInternalUuid) ?? 0;
+    userTrafficBytes.set(resolvedUserInternalUuid, current + parsedValue);
+  }
+
+  return userTrafficBytes;
+}
+
+function parseUserTrafficBytesFromStats(
+  statsOutput: string,
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
+): Map<string, number> {
+  const fromJson = parseUserTrafficBytesFromStatsJson(statsOutput, resolveUserInternalUuid);
+
+  if (fromJson.size > 0) {
+    return fromJson;
+  }
+
   const userTrafficBytes = new Map<string, number>();
   let pendingUserInternalUuid: string | null = null;
 
@@ -845,8 +1101,7 @@ function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number
     const metricMatch = line.match(/user>>>(.*?)>>>traffic>>>(uplink|downlink)/iu);
 
     if (metricMatch !== null) {
-      const uuidMatch = metricMatch[1].match(UUID_PATTERN);
-      pendingUserInternalUuid = uuidMatch === null ? null : uuidMatch[0].toLowerCase();
+      pendingUserInternalUuid = resolveUserInternalUuid(metricMatch[1]);
     }
 
     const valueMatch = line.match(/\bvalue:\s*(\d+)\b/iu);
@@ -872,67 +1127,18 @@ function parseUserTrafficBytesFromStats(statsOutput: string): Map<string, number
     let inlineMatch = inlinePattern.exec(statsOutput);
 
     while (inlineMatch !== null) {
-      const uuidMatch = inlineMatch[1].match(UUID_PATTERN);
+      const resolvedUserInternalUuid = resolveUserInternalUuid(inlineMatch[1]);
 
-      if (uuidMatch !== null) {
-        const userInternalUuid = uuidMatch[0].toLowerCase();
+      if (resolvedUserInternalUuid !== null) {
         const value = Number.parseInt(inlineMatch[2], 10);
 
         if (Number.isFinite(value) && value >= 0) {
-          const current = userTrafficBytes.get(userInternalUuid) ?? 0;
-          userTrafficBytes.set(userInternalUuid, current + value);
+          const current = userTrafficBytes.get(resolvedUserInternalUuid) ?? 0;
+          userTrafficBytes.set(resolvedUserInternalUuid, current + value);
         }
       }
 
       inlineMatch = inlinePattern.exec(statsOutput);
-    }
-  }
-
-  if (userTrafficBytes.size === 0) {
-    const parsedStatsObject = parseJsonObjectFromText(statsOutput);
-    const statRowsRaw = parsedStatsObject?.stat;
-
-    if (Array.isArray(statRowsRaw)) {
-      for (const statRowRaw of statRowsRaw) {
-        if (typeof statRowRaw !== "object" || statRowRaw === null || Array.isArray(statRowRaw)) {
-          continue;
-        }
-
-        const statRow = statRowRaw as Record<string, unknown>;
-        const nameRaw = statRow.name;
-        const valueRaw = statRow.value;
-
-        if (typeof nameRaw !== "string") {
-          continue;
-        }
-
-        const metricMatch = nameRaw.match(/user>>>(.*?)>>>traffic>>>(uplink|downlink)/iu);
-
-        if (metricMatch === null) {
-          continue;
-        }
-
-        const uuidMatch = metricMatch[1].match(UUID_PATTERN);
-
-        if (uuidMatch === null) {
-          continue;
-        }
-
-        const parsedValue =
-          typeof valueRaw === "number"
-            ? valueRaw
-            : typeof valueRaw === "string"
-              ? Number.parseFloat(valueRaw)
-              : NaN;
-
-        if (!Number.isFinite(parsedValue) || parsedValue < 0) {
-          continue;
-        }
-
-        const userInternalUuid = uuidMatch[0].toLowerCase();
-        const current = userTrafficBytes.get(userInternalUuid) ?? 0;
-        userTrafficBytes.set(userInternalUuid, current + parsedValue);
-      }
     }
   }
 
@@ -1092,6 +1298,7 @@ async function collectVpsMetrics(
   sshConfig: VpsSshConfig,
   ports: number[],
   shouldRunSpeedtest: boolean,
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
 ): Promise<PerVpsMetrics> {
   const activeIpsCommand = buildDistinctActiveIpCommand(ports);
   const statsCommand = buildStatsQueryCommand(getXrayStatsServer());
@@ -1122,7 +1329,10 @@ async function collectVpsMetrics(
   const activeIps = parseDistinctActiveSocketKeys(activeIpsResult.stdout);
   const statsCommandFailed = statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
   const statsBinaryNotFound = statsResult.stdout.includes("__XRAY_BINARY_NOT_FOUND__");
-  const userTrafficBytes = parseUserTrafficBytesFromStats(statsResult.stdout);
+  const userTrafficBytes = parseUserTrafficBytesFromStats(
+    statsResult.stdout,
+    resolveUserInternalUuid,
+  );
   const userIpSets = parseUserIpSetsFromLogs(logsResult.stdout, getCurrentWindowMinutes());
   const speedFromIperf = parseIperfSpeedMbPerSecond(speedIperfResult.stdout);
   const speedFromCurl = parseCurlSpeedMbPerSecond(speedCurlResult.stdout);
@@ -1371,7 +1581,13 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     try {
       const sshConfig = buildVpsSshConfig(row);
       const ports = extractVpsPorts(row.config_list);
-      const metrics = await collectVpsMetrics(sshConfig, ports, row.disabled !== true);
+      const resolveUserInternalUuid = buildStatsMetricUserResolver(row.users_kv_map);
+      const metrics = await collectVpsMetrics(
+        sshConfig,
+        ports,
+        row.disabled !== true,
+        resolveUserInternalUuid,
+      );
       const activeIpsFromLogsCount = countUniqueIpsFromUserCurrentMap(metrics.userCurrentIps);
       const effectiveActiveIpsCount = Math.max(metrics.activeIps.size, activeIpsFromLogsCount);
       if (verbose || metrics.userTrafficBytes.size === 0) {
