@@ -330,6 +330,88 @@ function formatAdminServerStatus(server: { connection: boolean; disabled: boolea
   return "🟢 UP";
 }
 
+function splitTelegramTextIntoChunks(text: string, maxLength: number): string[] {
+  if (text.length <= maxLength) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let cursor = 0;
+
+  while (cursor < text.length) {
+    const remaining = text.length - cursor;
+    if (remaining <= maxLength) {
+      chunks.push(text.slice(cursor));
+      break;
+    }
+
+    const nextSlice = text.slice(cursor, cursor + maxLength);
+    const lastNewline = nextSlice.lastIndexOf("\n");
+    const lastSpace = nextSlice.lastIndexOf(" ");
+    let splitIndex = Math.max(lastNewline, lastSpace);
+
+    if (splitIndex < Math.floor(maxLength * 0.6)) {
+      splitIndex = maxLength;
+    }
+
+    if (splitIndex <= 0) {
+      splitIndex = maxLength;
+    }
+
+    chunks.push(text.slice(cursor, cursor + splitIndex));
+    cursor += splitIndex;
+  }
+
+  return chunks;
+}
+
+function buildAdminServerDetailsText(server: {
+  internalUuid: string;
+  nickname: string | null;
+  country: string;
+  countryEmoji: string;
+  apiAddress: string;
+  domain: string;
+  sshKey: string | null;
+  sshConnectionKey: string | null;
+  isUnblock: boolean;
+  password: string | null;
+  optionalPasssword: string | null;
+  numberOfConnections: number;
+  currentSpeed: number;
+  connection: boolean;
+  disabled: boolean;
+  usersKvCount: number;
+  usersKvMapKeys: string[];
+  configList: string[];
+  createdAt: string;
+  updatedAt: string;
+}): string {
+  return [
+    "🖥️ Сервер",
+    "internal_uuid: " + server.internalUuid,
+    "nickname: " + (server.nickname ?? "—"),
+    "country: " + server.country + " " + server.countryEmoji,
+    "api_address: " + server.apiAddress,
+    "domain: " + server.domain,
+    "ssh_key: " + (server.sshKey ?? "—"),
+    "ssh_connection_key: " + (server.sshConnectionKey ?? "—"),
+    "isUnblock: " + (server.isUnblock ? "true" : "false"),
+    "password: " + (server.password ?? "—"),
+    "optional_passsword: " + (server.optionalPasssword ?? "null"),
+    "number_of_connections: " + String(server.numberOfConnections),
+    "current_speed: " + server.currentSpeed.toFixed(2) + " MB/s",
+    "connection: " + (server.connection ? "true" : "false"),
+    "disabled: " + (server.disabled ? "true" : "false"),
+    "users_kv_count: " + String(server.usersKvCount),
+    "users_kv_map_keys: " + (server.usersKvMapKeys.join(", ") || "—"),
+    "config_list_count: " + String(server.configList.length),
+    "config_list: " + (server.configList.join(" | ") || "—"),
+    "created_at: " + server.createdAt,
+    "updated_at: " + server.updatedAt,
+  ].join("\n");
+}
+
 function buildHowToPlatformsInlineRows(): Array<Array<{ text: string; callbackData: string }>> {
   return [
     [{ text: "🍎 iOS", callbackData: "howto:ios" }],
@@ -1068,31 +1150,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
         if (adminAction?.kind === "servers_detail") {
           const server = await getAdminVpsServerByInternalUuid(adminAction.internalUuid);
           const serverText =
-            server === null
-              ? "Сервер не найден."
-              : [
-                  "🖥️ Сервер",
-                  "internal_uuid: " + server.internalUuid,
-                  "nickname: " + (server.nickname ?? "—"),
-                  "country: " + server.country + " " + server.countryEmoji,
-                  "api_address: " + server.apiAddress,
-                  "domain: " + server.domain,
-                  "ssh_key: " + (server.sshKey ?? "—"),
-                  "ssh_connection_key: " + (server.sshConnectionKey ?? "—"),
-                  "isUnblock: " + (server.isUnblock ? "true" : "false"),
-                  "password: " + (server.password ?? "—"),
-                  "optional_passsword: " + (server.optionalPasssword ?? "null"),
-                  "number_of_connections: " + String(server.numberOfConnections),
-                  "current_speed: " + server.currentSpeed.toFixed(2) + " MB/s",
-                  "connection: " + (server.connection ? "true" : "false"),
-                  "disabled: " + (server.disabled ? "true" : "false"),
-                  "users_kv_count: " + String(server.usersKvCount),
-                  "users_kv_map_keys: " + (server.usersKvMapKeys.join(", ") || "—"),
-                  "config_list_count: " + String(server.configList.length),
-                  "config_list: " + (server.configList.join(" | ") || "—"),
-                  "created_at: " + server.createdAt,
-                  "updated_at: " + server.updatedAt,
-                ].join("\n");
+            server === null ? "Сервер не найден." : buildAdminServerDetailsText(server);
 
           const serverActionsRows =
             server === null
@@ -1123,11 +1181,14 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                   [{ text: "⬅️ Назад к серверам", callbackData: "admin:servers" }],
                 ];
 
+          const serverTextChunks =
+            server === null ? [serverText] : splitTelegramTextIntoChunks(serverText, 3900);
           const serverDetailsResult = await sendTelegramInlineMenuMessage({
             chatId: callbackChatId,
-            text: serverText,
+            text: serverTextChunks[0] ?? serverText,
             inlineKeyboardRows: serverActionsRows,
           });
+          let serverDetailsSent = serverDetailsResult.ok;
 
           if (!serverDetailsResult.ok) {
             console.error(
@@ -1135,13 +1196,30 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
               serverDetailsResult.statusCode,
               serverDetailsResult.error,
             );
+          } else if (serverTextChunks.length > 1) {
+            for (let chunkIndex = 1; chunkIndex < serverTextChunks.length; chunkIndex += 1) {
+              const continuationResult = await sendTelegramTextMessage({
+                chatId: callbackChatId,
+                text: serverTextChunks[chunkIndex] ?? "",
+              });
+
+              if (!continuationResult.ok) {
+                serverDetailsSent = false;
+                console.error(
+                  "Failed to send admin server details chunk:",
+                  "index=" + String(chunkIndex),
+                  continuationResult.statusCode,
+                  continuationResult.error,
+                );
+              }
+            }
           }
 
           res.status(200).json({
             ok: true,
             processed: true,
             callbackHandled: true,
-            sent: serverDetailsResult.ok,
+            sent: serverDetailsSent,
           });
           return;
         }

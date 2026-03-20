@@ -90,6 +90,11 @@ interface SafeSshCommandResult {
   failed: boolean;
 }
 
+interface SshConnectivityProbeResult {
+  ok: boolean;
+  details: string;
+}
+
 interface UserVpsTrafficMonthlyStateRow {
   vpsInternalUuid: string;
   userInternalUuid: string;
@@ -1312,6 +1317,32 @@ async function runVpsSshCommandSafe(
   }
 }
 
+async function probeSshConnectivity(
+  row: z.infer<typeof vpsSyncRowSchema>,
+): Promise<SshConnectivityProbeResult> {
+  try {
+    const sshConfig = buildVpsSshConfig(row);
+    const probeResult = await runVpsSshCommandSafe(sshConfig, "printf '__SSH_HEALTH_OK__\\n'");
+
+    if (!probeResult.failed) {
+      return {
+        ok: true,
+        details: toLogSample(probeResult.stdout),
+      };
+    }
+
+    return {
+      ok: false,
+      details: toLogSample([probeResult.stderr, probeResult.stdout].join("\n")),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      details: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function collectVpsMetrics(
   sshConfig: VpsSshConfig,
   ports: number[],
@@ -1733,6 +1764,39 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         }
       }
 
+      if (metrics.statsCommandFailed && !metrics.statsBinaryNotFound) {
+        console.warn(
+          "[vps-sync][warn] stats query failed but SSH node sync is still considered connected:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "statsStderrSample=" +
+            (metrics.statsStderrSample.length > 0 ? metrics.statsStderrSample : "—"),
+          "hint=check xray api/stats service and permissions",
+        );
+      }
+
+      if (metrics.logsCommandFailed) {
+        console.warn(
+          "[vps-sync][warn] access logs read failed but SSH node sync is still considered connected:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "logsStderrSample=" +
+            (metrics.logsStderrSample.length > 0 ? metrics.logsStderrSample : "—"),
+          "hint=check xray access log path and file permissions",
+        );
+      }
+
+      if (metrics.activeIpsCommandFailed) {
+        console.warn(
+          "[vps-sync][warn] active ip socket query failed but SSH node sync is still considered connected:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "activeIpsStderrSample=" +
+            (metrics.activeIpsStderrSample.length > 0 ? metrics.activeIpsStderrSample : "—"),
+          "hint=check ss/netstat availability and permissions",
+        );
+      }
+
       if (
         metrics.activeIps.size > 0 &&
         metrics.userTrafficBytes.size > 0 &&
@@ -1922,8 +1986,38 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         "domain=" + row.domain,
         "message=" + errorMessage,
       );
+      const sshProbe = await probeSshConnectivity(row);
 
-      if (isLikelyConnectivityFailure(errorMessage)) {
+      if (sshProbe.ok) {
+        const { error: markConnectedError } = await supabase
+          .from("vps")
+          .update({
+            connection: true,
+            disabled: false,
+          })
+          .eq("internal_uuid", row.internal_uuid);
+
+        if (markConnectedError !== null) {
+          console.error(
+            "[vps-sync] failed to keep VPS marked as connected after successful SSH probe:",
+            row.internal_uuid,
+            markConnectedError.message,
+          );
+        } else if (row.connection === false) {
+          console.log(
+            "[vps-sync] node connectivity restored by SSH probe fallback:",
+            "internalUuid=" + row.internal_uuid,
+            "domain=" + row.domain,
+          );
+        }
+
+        console.warn(
+          "[vps-sync][warn] node sync failed but SSH probe succeeded; keeping connection=true:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "probeDetails=" + sshProbe.details,
+        );
+      } else if (isLikelyConnectivityFailure(errorMessage)) {
         const { error: markDisconnectedError } = await supabase
           .from("vps")
           .update({
@@ -1937,12 +2031,20 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
             row.internal_uuid,
             markDisconnectedError.message,
           );
+        } else {
+          console.warn(
+            "[vps-sync][warn] marked VPS connection=false after failed SSH probe and connectivity-like failure:",
+            "internalUuid=" + row.internal_uuid,
+            "domain=" + row.domain,
+            "probeDetails=" + sshProbe.details,
+          );
         }
       } else {
         console.warn(
           "[vps-sync] keeping existing connection status because failure does not look like SSH connectivity issue:",
           "internalUuid=" + row.internal_uuid,
           "domain=" + row.domain,
+          "probeDetails=" + sshProbe.details,
         );
       }
 
