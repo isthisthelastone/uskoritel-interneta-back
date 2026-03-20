@@ -41,6 +41,7 @@ const userVpsTrafficMonthlyStateRowSchema = z.object({
 });
 const userConnectionsRowSchema = z.object({
   internal_uuid: z.uuid(),
+  number_of_connections: z.union([z.number(), z.string()]).nullable().optional(),
   connections_by_server: z.unknown().nullable().optional(),
 });
 
@@ -798,19 +799,8 @@ function extractIpv4(value: string): string | null {
   return match === null ? null : match[0];
 }
 
-function extractPortFromEndpoint(value: string): number | null {
-  const match = value.match(/:(\d{1,5})$/u);
-
-  if (match === null) {
-    return null;
-  }
-
-  const parsed = Number.parseInt(match[1], 10);
-  return Number.isFinite(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
-}
-
 function parseDistinctActiveSocketKeys(stdout: string): Set<string> {
-  const socketKeys = new Set<string>();
+  const ips = new Set<string>();
 
   for (const rawLine of stdout.split(/\r?\n/u)) {
     const trimmed = rawLine.trim();
@@ -820,24 +810,17 @@ function parseDistinctActiveSocketKeys(stdout: string): Set<string> {
     }
 
     const endpoints = trimmed.split(/\s+/u);
-    const localEndpoint = endpoints[0];
     const remoteEndpoint = endpoints.length > 1 ? endpoints[1] : endpoints[0];
-    const sourcePort = extractPortFromEndpoint(localEndpoint);
     const ip = extractIpv4(remoteEndpoint);
 
     if (ip === null) {
       continue;
     }
 
-    if (sourcePort === null) {
-      socketKeys.add(ip);
-      continue;
-    }
-
-    socketKeys.add(ip + ":" + String(sourcePort));
+    ips.add(ip);
   }
 
-  return socketKeys;
+  return ips;
 }
 
 function parseLogDate(line: string): Date | null {
@@ -887,13 +870,17 @@ function parseJsonLineObject(line: string): Record<string, unknown> | null {
   }
 }
 
-function extractUuidFromUnknown(rawValue: unknown): string | null {
+function normalizeMetricIdentityToken(rawValue: string): string {
+  return rawValue.trim().replaceAll(/^['"]+|['",;]+$/gu, "");
+}
+
+function extractLogMetricIdentityFromUnknown(rawValue: unknown): string | null {
   if (typeof rawValue !== "string") {
     return null;
   }
 
-  const match = rawValue.match(UUID_PATTERN);
-  return match === null ? null : match[0].toLowerCase();
+  const normalized = normalizeMetricIdentityToken(rawValue);
+  return normalized.length > 0 ? normalized : null;
 }
 
 function extractIpFromUnknown(rawValue: unknown): string | null {
@@ -904,7 +891,7 @@ function extractIpFromUnknown(rawValue: unknown): string | null {
   return extractIpv4(rawValue);
 }
 
-function extractUserInternalUuidFromLogLine(line: string): string | null {
+function extractUserMetricIdentityFromLogLine(line: string): string | null {
   const jsonObject = parseJsonLineObject(line);
 
   if (jsonObject !== null) {
@@ -918,14 +905,29 @@ function extractUserInternalUuidFromLogLine(line: string): string | null {
       "client_id",
       "uid",
       "tag",
+      "password",
+      "secret",
+      "id",
     ];
 
     for (const key of candidateKeys) {
-      const candidate = extractUuidFromUnknown(jsonObject[key]);
+      const candidate = extractLogMetricIdentityFromUnknown(jsonObject[key]);
 
       if (candidate !== null) {
-        return candidate;
+        return candidate.toLowerCase();
       }
+    }
+  }
+
+  const taggedMetricMatch = line.match(
+    /\b(?:email|user|client|uid|tag|id|password|secret)\s*[:=]\s*["']?([^"'\s,;]+)/iu,
+  );
+
+  if (taggedMetricMatch !== null) {
+    const normalized = normalizeMetricIdentityToken(taggedMetricMatch[1]).toLowerCase();
+
+    if (normalized.length > 0) {
+      return normalized;
     }
   }
 
@@ -970,6 +972,7 @@ function extractSourceIpFromLogLine(line: string): string | null {
 function parseUserIpSetsFromLogs(
   logOutput: string,
   currentWindowMinutes: number,
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
 ): {
   userCurrentIps: Map<string, Set<string>>;
   userMonthIps: Map<string, Set<string>>;
@@ -981,10 +984,16 @@ function parseUserIpSetsFromLogs(
   const monthWindowStart = now - 30 * 24 * 60 * 60 * 1000;
 
   for (const line of logOutput.split(/\r?\n/u)) {
-    const userInternalUuid = extractUserInternalUuidFromLogLine(line);
+    const userMetricIdentity = extractUserMetricIdentityFromLogLine(line);
     const ip = extractSourceIpFromLogLine(line);
 
-    if (userInternalUuid === null || ip === null) {
+    if (userMetricIdentity === null || ip === null) {
+      continue;
+    }
+
+    const userInternalUuid = resolveUserInternalUuid(userMetricIdentity);
+
+    if (userInternalUuid === null) {
       continue;
     }
     const logDate = parseLogDate(line);
@@ -1333,7 +1342,11 @@ async function collectVpsMetrics(
     statsResult.stdout,
     resolveUserInternalUuid,
   );
-  const userIpSets = parseUserIpSetsFromLogs(logsResult.stdout, getCurrentWindowMinutes());
+  const userIpSets = parseUserIpSetsFromLogs(
+    logsResult.stdout,
+    getCurrentWindowMinutes(),
+    resolveUserInternalUuid,
+  );
   const speedFromIperf = parseIperfSpeedMbPerSecond(speedIperfResult.stdout);
   const speedFromCurl = parseCurlSpeedMbPerSecond(speedCurlResult.stdout);
   const currentSpeedMbPerSecond = speedFromIperf ?? speedFromCurl ?? 0;
@@ -1589,7 +1602,8 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         resolveUserInternalUuid,
       );
       const activeIpsFromLogsCount = countUniqueIpsFromUserCurrentMap(metrics.userCurrentIps);
-      const effectiveActiveIpsCount = Math.max(metrics.activeIps.size, activeIpsFromLogsCount);
+      const effectiveActiveIpsCount =
+        metrics.activeIps.size > 0 ? metrics.activeIps.size : activeIpsFromLogsCount;
       if (verbose || metrics.userTrafficBytes.size === 0) {
         console.log(
           "[vps-sync][debug] vps metrics:",
@@ -1612,6 +1626,17 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "statsCommandFailed=" + String(metrics.statsCommandFailed),
           "statsBinaryNotFound=" + String(metrics.statsBinaryNotFound),
         );
+
+        if (metrics.activeIps.size > 0 && activeIpsFromLogsCount > metrics.activeIps.size) {
+          console.log(
+            "[vps-sync][debug] active IP discrepancy:",
+            "internalUuid=" + row.internal_uuid,
+            "domain=" + row.domain,
+            "socketBased=" + String(metrics.activeIps.size),
+            "logBased=" + String(activeIpsFromLogsCount),
+            "used=socketBased",
+          );
+        }
 
         if (metrics.statsStdoutLength > 0) {
           console.log("[vps-sync][debug] stats stdout sample:", metrics.statsStdoutSample);
@@ -1659,21 +1684,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         );
       }
 
-      const knownUserIds = parseUsersKvMapKeys(row.users_kv_map);
       const abusiveUsers: string[] = [];
-
-      for (const userId of knownUserIds) {
-        if (!userAggregates.has(userId)) {
-          userAggregates.set(userId, {
-            currentIps: new Set<string>(),
-            monthIps: new Set<string>(),
-          });
-        }
-
-        if (!userConnectionsByServer.has(userId)) {
-          userConnectionsByServer.set(userId, {});
-        }
-      }
 
       for (const [userId, bytes] of metrics.userTrafficBytes.entries()) {
         if (!metrics.statsCommandFailed && !metrics.statsBinaryNotFound) {
@@ -1869,11 +1880,12 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
   const userIdsToUpdate = Array.from(userAggregates.keys());
   const existingConnectionsByUser = new Map<string, Record<string, number>>();
+  const existingNumberOfConnectionsByUser = new Map<string, number>();
 
   if (userIdsToUpdate.length > 0) {
     const { data: existingUsersData, error: existingUsersError } = await supabase
       .from("users")
-      .select("internal_uuid, connections_by_server")
+      .select("internal_uuid, number_of_connections, connections_by_server")
       .in("internal_uuid", userIdsToUpdate);
 
     if (existingUsersError !== null) {
@@ -1884,6 +1896,19 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
     for (const rawRow of existingUsersData) {
       const parsedRow = userConnectionsRowSchema.parse(rawRow);
+      const existingConnectionCountRaw = parsedRow.number_of_connections;
+      const existingConnectionCount =
+        typeof existingConnectionCountRaw === "number"
+          ? existingConnectionCountRaw
+          : typeof existingConnectionCountRaw === "string"
+            ? Number.parseFloat(existingConnectionCountRaw)
+            : 0;
+      existingNumberOfConnectionsByUser.set(
+        parsedRow.internal_uuid,
+        Number.isFinite(existingConnectionCount) && existingConnectionCount > 0
+          ? Math.trunc(existingConnectionCount)
+          : 0,
+      );
       existingConnectionsByUser.set(
         parsedRow.internal_uuid,
         parseConnectionsByServerMap(parsedRow.connections_by_server),
@@ -1897,15 +1922,22 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
     const monthTrafficBytes = monthTrafficBytesByUser.get(userId) ?? 0;
     const currentServerCount = (recentActiveVpsByUser.get(userId) ?? new Set<string>()).size;
     const monthServerCount = (monthActiveVpsByUser.get(userId) ?? new Set<string>()).size;
-    const currentConnections = Math.max(aggregate.currentIps.size, currentServerCount);
+    const rawCurrentConnections = Math.max(aggregate.currentIps.size, currentServerCount);
     const existingConnectionsByServer = existingConnectionsByUser.get(userId) ?? {};
+    const existingNumberOfConnections = existingNumberOfConnectionsByUser.get(userId) ?? 0;
     const freshConnectionsByServer = userConnectionsByServer.get(userId) ?? {};
-    const nextConnectionsByServer =
-      Object.keys(freshConnectionsByServer).length > 0
-        ? freshConnectionsByServer
-        : currentConnections > 0
-          ? existingConnectionsByServer
-          : {};
+    const hasFreshConnectionsMap = Object.keys(freshConnectionsByServer).length > 0;
+    const currentConnections =
+      rawCurrentConnections > 0
+        ? rawCurrentConnections
+        : hasFreshConnectionsMap
+          ? 0
+          : existingNumberOfConnections;
+    const nextConnectionsByServer = hasFreshConnectionsMap
+      ? freshConnectionsByServer
+      : currentConnections > 0
+        ? existingConnectionsByServer
+        : {};
     const userUpdatePayload: {
       number_of_connections: number;
       number_of_connections_last_month: number;

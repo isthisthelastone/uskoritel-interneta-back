@@ -2967,26 +2967,6 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
       if (countriesAction.kind === "country" || countriesAction.kind === "country_ref") {
         try {
-          if (countriesAction.kind === "country_ref") {
-            const routeInfo = await getVpsRouteInfoByInternalUuid(countriesAction.internalUuid);
-
-            if (routeInfo !== null && routeInfo.isUnblock) {
-              const sent = await sendUnblockVpsConfigMessage({
-                chatId: callbackChatId,
-                internalUuid: countriesAction.internalUuid,
-                userInternalUuid: telegramUser.internal_uuid,
-              });
-
-              res.status(200).json({
-                ok: true,
-                processed: true,
-                callbackHandled: true,
-                sent,
-              });
-              return;
-            }
-          }
-
           const countryToList =
             countriesAction.kind === "country_ref"
               ? await getVpsCountryByInternalUuid(countriesAction.internalUuid)

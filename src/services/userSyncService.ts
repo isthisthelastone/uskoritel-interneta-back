@@ -54,6 +54,7 @@ interface UserSyncVpsState {
   usersKvMap: Record<string, unknown>;
   configList: string[];
   sshConfig: VpsSshConfig | null;
+  resolveUserInternalUuid: (metricIdentity: string) => string | null;
   liveUserIps: Map<string, Set<string>>;
   changed: boolean;
 }
@@ -101,6 +102,15 @@ function decodeBase64OrKeepRaw(rawValue: string): string {
   const normalizedSource = normalizedRaw.replace(/=+$/u, "");
 
   return normalizedDecoded === normalizedSource ? decoded : normalizedRaw;
+}
+
+function decodeBase64Strict(rawValue: string): string | null {
+  try {
+    const decoded = Buffer.from(rawValue, "base64").toString("utf8").trim();
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseSshKey(sshKey: string): { user: string; host: string | null; port: number | null } {
@@ -265,15 +275,6 @@ function parseJsonLineObject(line: string): Record<string, unknown> | null {
   }
 }
 
-function extractUuidFromUnknown(rawValue: unknown): string | null {
-  if (typeof rawValue !== "string") {
-    return null;
-  }
-
-  const match = rawValue.match(UUID_PATTERN);
-  return match === null ? null : match[0].toLowerCase();
-}
-
 function extractIpv4(value: string): string | null {
   const match = value.match(IPV4_PATTERN);
   return match === null ? null : match[0];
@@ -287,7 +288,20 @@ function extractIpFromUnknown(rawValue: unknown): string | null {
   return extractIpv4(rawValue);
 }
 
-function extractUserInternalUuidFromLogLine(line: string): string | null {
+function normalizeMetricIdentityToken(rawValue: string): string {
+  return rawValue.trim().replaceAll(/^['"]+|['",;]+$/gu, "");
+}
+
+function extractLogMetricIdentityFromUnknown(rawValue: unknown): string | null {
+  if (typeof rawValue !== "string") {
+    return null;
+  }
+
+  const normalized = normalizeMetricIdentityToken(rawValue);
+  return normalized.length > 0 ? normalized : null;
+}
+
+function extractUserMetricIdentityFromLogLine(line: string): string | null {
   const jsonObject = parseJsonLineObject(line);
 
   if (jsonObject !== null) {
@@ -301,14 +315,29 @@ function extractUserInternalUuidFromLogLine(line: string): string | null {
       "client_id",
       "uid",
       "tag",
+      "password",
+      "secret",
+      "id",
     ];
 
     for (const key of candidateKeys) {
-      const candidate = extractUuidFromUnknown(jsonObject[key]);
+      const candidate = extractLogMetricIdentityFromUnknown(jsonObject[key]);
 
       if (candidate !== null) {
-        return candidate;
+        return candidate.toLowerCase();
       }
+    }
+  }
+
+  const taggedMetricMatch = line.match(
+    /\b(?:email|user|client|uid|tag|id|password|secret)\s*[:=]\s*["']?([^"'\s,;]+)/iu,
+  );
+
+  if (taggedMetricMatch !== null) {
+    const normalized = normalizeMetricIdentityToken(taggedMetricMatch[1]).toLowerCase();
+
+    if (normalized.length > 0) {
+      return normalized;
     }
   }
 
@@ -380,16 +409,23 @@ function parseLogDate(line: string): Date | null {
 function parseCurrentUserIpsFromLogs(
   logOutput: string,
   currentWindowMinutes: number,
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
 ): Map<string, Set<string>> {
   const userCurrentIps = new Map<string, Set<string>>();
   const now = Date.now();
   const currentWindowStart = now - currentWindowMinutes * 60 * 1000;
 
   for (const line of logOutput.split(/\r?\n/u)) {
-    const userInternalUuid = extractUserInternalUuidFromLogLine(line);
+    const metricIdentity = extractUserMetricIdentityFromLogLine(line);
     const ip = extractSourceIpFromLogLine(line);
 
-    if (userInternalUuid === null || ip === null) {
+    if (metricIdentity === null || ip === null) {
+      continue;
+    }
+
+    const userInternalUuid = resolveUserInternalUuid(metricIdentity);
+
+    if (userInternalUuid === null) {
       continue;
     }
 
@@ -409,14 +445,24 @@ function parseCurrentUserIpsFromLogs(
   return userCurrentIps;
 }
 
-function parseUserIpsFromLogs(logOutput: string, userInternalUuid: string): string[] {
+function parseUserIpsFromLogsWithResolver(
+  logOutput: string,
+  userInternalUuid: string,
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
+): string[] {
   const normalizedUserUuid = userInternalUuid.toLowerCase();
   const ips = new Set<string>();
 
   for (const line of logOutput.split(/\r?\n/u)) {
-    const parsedUserInternalUuid = extractUserInternalUuidFromLogLine(line);
+    const metricIdentity = extractUserMetricIdentityFromLogLine(line);
 
-    if (parsedUserInternalUuid === null || parsedUserInternalUuid !== normalizedUserUuid) {
+    if (metricIdentity === null) {
+      continue;
+    }
+
+    const resolvedUserInternalUuid = resolveUserInternalUuid(metricIdentity);
+
+    if (resolvedUserInternalUuid === null || resolvedUserInternalUuid !== normalizedUserUuid) {
       continue;
     }
 
@@ -619,6 +665,158 @@ function parseUsersKvMap(rawValue: unknown): Record<string, unknown> {
   return { ...(rawValue as Record<string, unknown>) };
 }
 
+function parseUsersKvMapKeys(usersKvMap: Record<string, unknown>): string[] {
+  return Object.keys(usersKvMap).filter((key) => UUID_PATTERN.test(key));
+}
+
+function parseSecretCandidatesFromConfigUrl(configUrl: string): string[] {
+  const parsedSecrets = new Set<string>();
+
+  try {
+    const parsed = new URL(configUrl);
+    const scheme = parsed.protocol.toLowerCase();
+
+    if (scheme === "trojan:" || scheme === "vless:") {
+      const secret = decodeURIComponent(parsed.username).trim();
+
+      if (secret.length > 0) {
+        parsedSecrets.add(secret);
+      }
+    } else if (scheme === "ss:") {
+      if (parsed.password.length > 0) {
+        const password = decodeURIComponent(parsed.password).trim();
+
+        if (password.length > 0) {
+          parsedSecrets.add(password);
+        }
+      } else {
+        const rawUsername = decodeURIComponent(parsed.username).trim();
+        const decodedUsername = decodeBase64Strict(rawUsername);
+        const usernameCandidate = decodedUsername ?? rawUsername;
+        const separatorIndex = usernameCandidate.indexOf(":");
+
+        if (separatorIndex > -1 && separatorIndex < usernameCandidate.length - 1) {
+          const password = usernameCandidate.slice(separatorIndex + 1).trim();
+
+          if (password.length > 0) {
+            parsedSecrets.add(password);
+          }
+        }
+      }
+    }
+  } catch {
+    return [];
+  }
+
+  return Array.from(parsedSecrets.values());
+}
+
+function buildLogMetricUserResolver(
+  usersKvMap: Record<string, unknown>,
+): (metricIdentity: string) => string | null {
+  const knownUserIds = new Set(parseUsersKvMapKeys(usersKvMap).map((key) => key.toLowerCase()));
+  const aliasToUser = new Map<string, string>();
+  const addAlias = (userInternalUuid: string, rawAlias: unknown): void => {
+    if (typeof rawAlias !== "string") {
+      return;
+    }
+
+    const trimmed = rawAlias.trim();
+
+    if (trimmed.length === 0) {
+      return;
+    }
+
+    aliasToUser.set(trimmed, userInternalUuid);
+    aliasToUser.set(trimmed.toLowerCase(), userInternalUuid);
+  };
+
+  for (const userInternalUuid of knownUserIds.values()) {
+    addAlias(userInternalUuid, userInternalUuid);
+  }
+
+  for (const [rawUserId, rawEntry] of Object.entries(usersKvMap)) {
+    const userUuidMatch = rawUserId.match(UUID_PATTERN);
+
+    if (userUuidMatch === null) {
+      continue;
+    }
+
+    const userInternalUuid = userUuidMatch[0].toLowerCase();
+    addAlias(userInternalUuid, userInternalUuid);
+
+    if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) {
+      continue;
+    }
+
+    const entry = rawEntry as Record<string, unknown>;
+
+    if (typeof entry.passwordBase64 === "string") {
+      addAlias(userInternalUuid, decodeBase64Strict(entry.passwordBase64));
+    }
+
+    for (const urlKey of ["directUrl", "obfsUrl"]) {
+      const rawUrl = entry[urlKey];
+
+      if (typeof rawUrl !== "string") {
+        continue;
+      }
+
+      for (const secret of parseSecretCandidatesFromConfigUrl(rawUrl)) {
+        addAlias(userInternalUuid, secret);
+      }
+    }
+
+    const protocolsRaw = entry.protocols;
+
+    if (typeof protocolsRaw === "object" && protocolsRaw !== null && !Array.isArray(protocolsRaw)) {
+      for (const protocolEntryRaw of Object.values(protocolsRaw as Record<string, unknown>)) {
+        if (
+          typeof protocolEntryRaw !== "object" ||
+          protocolEntryRaw === null ||
+          Array.isArray(protocolEntryRaw)
+        ) {
+          continue;
+        }
+
+        const protocolEntry = protocolEntryRaw as Record<string, unknown>;
+
+        if (typeof protocolEntry.secretBase64 === "string") {
+          addAlias(userInternalUuid, decodeBase64Strict(protocolEntry.secretBase64));
+        }
+
+        if (typeof protocolEntry.url === "string") {
+          for (const secret of parseSecretCandidatesFromConfigUrl(protocolEntry.url)) {
+            addAlias(userInternalUuid, secret);
+          }
+        }
+      }
+    }
+  }
+
+  return (metricIdentity: string): string | null => {
+    const rawIdentity = metricIdentity.trim();
+
+    if (rawIdentity.length === 0) {
+      return null;
+    }
+
+    const byAlias = aliasToUser.get(rawIdentity) ?? aliasToUser.get(rawIdentity.toLowerCase());
+
+    if (byAlias !== undefined) {
+      return byAlias;
+    }
+
+    const uuidMatch = rawIdentity.match(UUID_PATTERN);
+
+    if (uuidMatch !== null) {
+      return uuidMatch[0].toLowerCase();
+    }
+
+    return null;
+  };
+}
+
 function removeUserFromUsersKvMap(
   usersKvMap: Record<string, unknown>,
   userInternalUuid: string,
@@ -787,10 +985,15 @@ async function dropUserConnectionsOnServer(
   sshConfig: VpsSshConfig,
   userInternalUuid: string,
   ports: number[],
+  resolveUserInternalUuid: (metricIdentity: string) => string | null,
 ): Promise<number> {
   const readLogsCommand = buildReadAccessLogsCommand(getXrayAccessLogPath(), getXrayLogTailLines());
   const logsResult = await runVpsSshCommandWithConfig(sshConfig, readLogsCommand);
-  const userIps = parseUserIpsFromLogs(logsResult.stdout, userInternalUuid);
+  const userIps = parseUserIpsFromLogsWithResolver(
+    logsResult.stdout,
+    userInternalUuid,
+    resolveUserInternalUuid,
+  );
 
   if (userIps.length === 0) {
     return 0;
@@ -890,20 +1093,27 @@ async function runUserSync(): Promise<UserSyncResult> {
 
   const vpsStates: UserSyncVpsState[] = vpsResult.data.map((rawRow) => {
     const row = userSyncVpsRowSchema.parse(rawRow);
+    const usersKvMap = parseUsersKvMap(row.users_kv_map);
     return {
       row,
-      usersKvMap: parseUsersKvMap(row.users_kv_map),
+      usersKvMap,
       configList: row.config_list,
       sshConfig: null,
+      resolveUserInternalUuid: buildLogMetricUserResolver(usersKvMap),
       liveUserIps: new Map<string, Set<string>>(),
       changed: false,
     };
   });
 
+  let eligibleServersCount = 0;
+  let successfulServersCount = 0;
+
   for (const vpsState of vpsStates) {
     if (vpsState.row.disabled === true || vpsState.row.connection === false) {
       continue;
     }
+
+    eligibleServersCount += 1;
 
     try {
       const sshConfig = buildVpsSshConfig(vpsState.row);
@@ -913,7 +1123,12 @@ async function runUserSync(): Promise<UserSyncResult> {
         getXrayLogTailLines(),
       );
       const logsResult = await runVpsSshCommandWithConfig(sshConfig, readLogsCommand);
-      vpsState.liveUserIps = parseCurrentUserIpsFromLogs(logsResult.stdout, currentWindowMinutes);
+      vpsState.liveUserIps = parseCurrentUserIpsFromLogs(
+        logsResult.stdout,
+        currentWindowMinutes,
+        vpsState.resolveUserInternalUuid,
+      );
+      successfulServersCount += 1;
 
       if (verbose) {
         let serverUserCount = 0;
@@ -965,12 +1180,27 @@ async function runUserSync(): Promise<UserSyncResult> {
   }
 
   const usersToUpdateConnectionStats = new Set<string>();
+  const canResetMissingUsersToZero =
+    eligibleServersCount > 0 && successfulServersCount === eligibleServersCount;
 
   for (const userInternalUuid of liveUserCurrentIps.keys()) {
     usersToUpdateConnectionStats.add(userInternalUuid);
   }
 
+  if (canResetMissingUsersToZero) {
+    for (const user of users) {
+      if (expiredUserIds.has(user.internalUuid)) {
+        continue;
+      }
+
+      if (user.numberOfConnections > 0 || Object.keys(user.connectionsByServer).length > 0) {
+        usersToUpdateConnectionStats.add(user.internalUuid);
+      }
+    }
+  }
+
   let connectionStatsUpdatedUsers = 0;
+  const effectiveConnectionCountByUser = new Map<string, number>();
 
   for (const userInternalUuid of usersToUpdateConnectionStats.values()) {
     if (expiredUserIds.has(userInternalUuid)) {
@@ -984,8 +1214,19 @@ async function runUserSync(): Promise<UserSyncResult> {
     }
 
     const nextCurrentIps = liveUserCurrentIps.get(userInternalUuid) ?? new Set<string>();
-    const nextConnectionsByServer = liveConnectionsByServer.get(userInternalUuid) ?? {};
-    const nextNumberOfConnections = nextCurrentIps.size;
+    const hasFreshLiveMap = liveUserCurrentIps.has(userInternalUuid);
+    const nextConnectionsByServerRaw = liveConnectionsByServer.get(userInternalUuid) ?? {};
+    const nextConnectionsByServer = hasFreshLiveMap
+      ? nextConnectionsByServerRaw
+      : canResetMissingUsersToZero
+        ? {}
+        : existingUser.connectionsByServer;
+    const nextNumberOfConnections = hasFreshLiveMap
+      ? nextCurrentIps.size
+      : canResetMissingUsersToZero
+        ? 0
+        : existingUser.numberOfConnections;
+    effectiveConnectionCountByUser.set(userInternalUuid, nextNumberOfConnections);
     const prevConnectionsByServer = existingUser.connectionsByServer;
     const sameConnectionCount = existingUser.numberOfConnections === nextNumberOfConnections;
     const prevKeys = Object.keys(prevConnectionsByServer).sort();
@@ -1028,8 +1269,11 @@ async function runUserSync(): Promise<UserSyncResult> {
       return false;
     }
 
-    const liveIps = liveUserCurrentIps.get(user.internalUuid);
-    return liveIps !== undefined && liveIps.size > userIpLimit;
+    const currentConnections = effectiveConnectionCountByUser.get(user.internalUuid);
+    const resolvedCurrentConnections =
+      currentConnections === undefined ? user.numberOfConnections : currentConnections;
+
+    return resolvedCurrentConnections > userIpLimit;
   });
 
   let cleanedUsers = 0;
@@ -1064,7 +1308,12 @@ async function runUserSync(): Promise<UserSyncResult> {
           const droppedForUser =
             knownIps.size > 0
               ? await dropUserConnectionsByKnownIpsOnServer(vpsState.sshConfig, knownIps, ports)
-              : await dropUserConnectionsOnServer(vpsState.sshConfig, user.internalUuid, ports);
+              : await dropUserConnectionsOnServer(
+                  vpsState.sshConfig,
+                  user.internalUuid,
+                  ports,
+                  vpsState.resolveUserInternalUuid,
+                );
           droppedIps += droppedForUser;
           canRemoveFromDatabase = true;
 
@@ -1243,6 +1492,9 @@ async function runUserSync(): Promise<UserSyncResult> {
       "expiredSetSize=" + String(expiredUserIds.size),
       "connectionStatsUpdatedUsers=" + String(connectionStatsUpdatedUsers),
       "currentWindowMinutes=" + String(currentWindowMinutes),
+      "serversEligible=" + String(eligibleServersCount),
+      "serversLiveReadOk=" + String(successfulServersCount),
+      "canResetMissingUsersToZero=" + String(canResetMissingUsersToZero),
     );
   }
 

@@ -51,6 +51,26 @@ function trimButtonLabel(value: string): string {
   return value.slice(0, TELEGRAM_INLINE_BUTTON_TEXT_MAX_LENGTH - 1).trimEnd() + "…";
 }
 
+function buildUnblockShortName(rawNickname: string | null, fallbackInternalUuid: string): string {
+  const nickname = rawNickname?.trim() ?? "";
+
+  if (nickname.length > 0) {
+    const taggedMatch = nickname.match(/#\s*(\d+)/iu);
+
+    if (taggedMatch !== null) {
+      return "UNBLOCK #" + taggedMatch[1];
+    }
+
+    const numericMatch = nickname.match(/(\d+)/u);
+
+    if (numericMatch !== null) {
+      return "UNBLOCK #" + numericMatch[1];
+    }
+  }
+
+  return "UNBLOCK #" + fallbackInternalUuid.slice(0, 4).toUpperCase();
+}
+
 export function buildVpsButtonText(input: {
   nickname: string | null;
   internalUuid: string;
@@ -59,17 +79,10 @@ export function buildVpsButtonText(input: {
   currentSpeed: number;
   numberOfConnections: number;
 }): string {
-  const displayName = input.nickname ?? "VPS " + input.internalUuid.slice(0, 8).toUpperCase();
-
-  if (input.isUnblock === true) {
-    const unblockLabel =
-      input.countryEmoji !== undefined && input.countryEmoji.length > 0
-        ? displayName + " " + input.countryEmoji
-        : displayName;
-
-    return trimButtonLabel(unblockLabel);
-  }
-
+  const displayName =
+    input.isUnblock === true
+      ? buildUnblockShortName(input.nickname, input.internalUuid)
+      : (input.nickname ?? "VPS " + input.internalUuid.slice(0, 8).toUpperCase());
   const speed = Number.isFinite(input.currentSpeed) ? Math.max(0, input.currentSpeed) : 0;
   const connections = Number.isFinite(input.numberOfConnections)
     ? Math.max(0, Math.round(input.numberOfConnections))
