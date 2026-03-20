@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
 import { runVpsSshCommandWithConfig, type VpsSshConfig } from "./vpsSshService";
+import { backfillVpsXrayUserClientsFromUsersKvMap } from "./vpsXrayService";
 
 const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_USER_IP_LIMIT = 5;
@@ -55,6 +56,14 @@ interface PerVpsMetrics {
   userCurrentIps: Map<string, Set<string>>;
   userMonthIps: Map<string, Set<string>>;
   userTrafficBytes: Map<string, number>;
+  activeIpsStdoutLength: number;
+  activeIpsStderrLength: number;
+  activeIpsStderrSample: string;
+  activeIpsCommandFailed: boolean;
+  logsStdoutLength: number;
+  logsStderrLength: number;
+  logsStderrSample: string;
+  logsCommandFailed: boolean;
   currentSpeedMbPerSecond: number;
   speedSource: "iperf3" | "curl" | "none";
   speedIperfStdoutLength: number;
@@ -1324,10 +1333,21 @@ async function collectVpsMetrics(
     failed: false,
   };
   const [activeIpsResult, statsResult, logsResult] = await Promise.all([
-    runVpsSshCommandWithConfig(sshConfig, activeIpsCommand),
-    runVpsSshCommandWithConfig(sshConfig, statsCommand),
-    runVpsSshCommandWithConfig(sshConfig, readLogsCommand),
+    runVpsSshCommandSafe(sshConfig, activeIpsCommand),
+    runVpsSshCommandSafe(sshConfig, statsCommand),
+    runVpsSshCommandSafe(sshConfig, readLogsCommand),
   ]);
+  const allCoreCommandsFailed = activeIpsResult.failed && statsResult.failed && logsResult.failed;
+
+  if (allCoreCommandsFailed) {
+    throw new Error(
+      "[ssh-connectivity] failed all core sync commands: " +
+        [activeIpsResult.stderr, statsResult.stderr, logsResult.stderr]
+          .filter((part) => part.trim().length > 0)
+          .join(" | "),
+    );
+  }
+
   const [speedIperfResult, speedCurlResult] = shouldRunSpeedtest
     ? await Promise.all([
         runVpsSshCommandSafe(sshConfig, youtubeIperfSpeedCommand),
@@ -1336,7 +1356,8 @@ async function collectVpsMetrics(
     : [skippedSpeedtestResult, skippedSpeedtestResult];
 
   const activeIps = parseDistinctActiveSocketKeys(activeIpsResult.stdout);
-  const statsCommandFailed = statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
+  const statsCommandFailed =
+    statsResult.failed || statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
   const statsBinaryNotFound = statsResult.stdout.includes("__XRAY_BINARY_NOT_FOUND__");
   const userTrafficBytes = parseUserTrafficBytesFromStats(
     statsResult.stdout,
@@ -1358,6 +1379,14 @@ async function collectVpsMetrics(
     userCurrentIps: userIpSets.userCurrentIps,
     userMonthIps: userIpSets.userMonthIps,
     userTrafficBytes,
+    activeIpsStdoutLength: activeIpsResult.stdout.length,
+    activeIpsStderrLength: activeIpsResult.stderr.length,
+    activeIpsStderrSample: toLogSample(activeIpsResult.stderr),
+    activeIpsCommandFailed: activeIpsResult.failed,
+    logsStdoutLength: logsResult.stdout.length,
+    logsStderrLength: logsResult.stderr.length,
+    logsStderrSample: toLogSample(logsResult.stderr),
+    logsCommandFailed: logsResult.failed,
     currentSpeedMbPerSecond,
     speedSource,
     speedIperfStdoutLength: speedIperfResult.stdout.length,
@@ -1381,6 +1410,27 @@ async function collectVpsMetrics(
 
 function buildUserVpsTrafficStateKey(vpsInternalUuid: string, userInternalUuid: string): string {
   return vpsInternalUuid + "::" + userInternalUuid;
+}
+
+function isLikelyConnectivityFailure(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  const connectivityIndicators = [
+    "[ssh-connectivity]",
+    "ssh: connect to host",
+    "connection timed out",
+    "operation timed out",
+    "econnrefused",
+    "ehostunreach",
+    "enetunreach",
+    "etimedout",
+    "no route to host",
+    "connection refused",
+    "permission denied (publickey)",
+    "could not resolve hostname",
+    "connection reset by peer",
+  ];
+
+  return connectivityIndicators.some((indicator) => normalized.includes(indicator));
 }
 
 async function computeCalendarMonthTrafficByUser(params: {
@@ -1595,7 +1645,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const sshConfig = buildVpsSshConfig(row);
       const ports = extractVpsPorts(row.config_list);
       const resolveUserInternalUuid = buildStatsMetricUserResolver(row.users_kv_map);
-      const metrics = await collectVpsMetrics(
+      let metrics = await collectVpsMetrics(
         sshConfig,
         ports,
         row.disabled !== true,
@@ -1612,6 +1662,12 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "activeIps=" + String(metrics.activeIps.size),
           "activeIpsFromLogs=" + String(activeIpsFromLogsCount),
           "effectiveActiveIps=" + String(effectiveActiveIpsCount),
+          "activeIpsCommandFailed=" + String(metrics.activeIpsCommandFailed),
+          "activeIpsStdoutLength=" + String(metrics.activeIpsStdoutLength),
+          "activeIpsStderrLength=" + String(metrics.activeIpsStderrLength),
+          "logsCommandFailed=" + String(metrics.logsCommandFailed),
+          "logsStdoutLength=" + String(metrics.logsStdoutLength),
+          "logsStderrLength=" + String(metrics.logsStderrLength),
           "currentSpeedMbPerSec=" + metrics.currentSpeedMbPerSecond.toFixed(2),
           "speedSource=" + metrics.speedSource,
           "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
@@ -1644,6 +1700,14 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
         if (metrics.statsStderrLength > 0) {
           console.log("[vps-sync][debug] stats stderr sample:", metrics.statsStderrSample);
+        }
+
+        if (metrics.activeIpsStderrLength > 0) {
+          console.log("[vps-sync][debug] activeIps stderr sample:", metrics.activeIpsStderrSample);
+        }
+
+        if (metrics.logsStderrLength > 0) {
+          console.log("[vps-sync][debug] logs stderr sample:", metrics.logsStderrSample);
         }
 
         if (metrics.speedIperfStdoutLength > 0) {
@@ -1682,6 +1746,69 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "trafficUsersParsed=" + String(metrics.userTrafficBytes.size),
           "hint=check xray access logs include user/email and source IP",
         );
+      }
+
+      const unresolvedLiveUsers = Array.from(metrics.userCurrentIps.keys()).filter(
+        (userInternalUuid) => !metrics.userTrafficBytes.has(userInternalUuid),
+      );
+
+      if (unresolvedLiveUsers.length > 0) {
+        try {
+          const backfillResult = await backfillVpsXrayUserClientsFromUsersKvMap({
+            sshConfig,
+            usersKvMap: row.users_kv_map,
+            onlyUsers: unresolvedLiveUsers,
+          });
+
+          if (verbose || backfillResult.changed || backfillResult.touchedUsers > 0) {
+            console.log(
+              "[vps-sync][debug] traffic backfill attempt:",
+              "internalUuid=" + row.internal_uuid,
+              "domain=" + row.domain,
+              "unresolvedLiveUsers=" + String(unresolvedLiveUsers.length),
+              "changed=" + String(backfillResult.changed),
+              "touchedUsers=" + String(backfillResult.touchedUsers),
+              "touchedCredentials=" + String(backfillResult.touchedCredentials),
+            );
+          }
+
+          if (backfillResult.changed) {
+            const refreshedStatsResult = await runVpsSshCommandSafe(
+              sshConfig,
+              buildStatsQueryCommand(getXrayStatsServer()),
+            );
+            const refreshedStatsCommandFailed =
+              refreshedStatsResult.failed ||
+              refreshedStatsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
+            const refreshedStatsBinaryNotFound = refreshedStatsResult.stdout.includes(
+              "__XRAY_BINARY_NOT_FOUND__",
+            );
+            const refreshedTrafficByUser = parseUserTrafficBytesFromStats(
+              refreshedStatsResult.stdout,
+              resolveUserInternalUuid,
+            );
+
+            if (!refreshedStatsCommandFailed && refreshedTrafficByUser.size > 0) {
+              metrics = {
+                ...metrics,
+                userTrafficBytes: refreshedTrafficByUser,
+                statsStdoutLength: refreshedStatsResult.stdout.length,
+                statsStderrLength: refreshedStatsResult.stderr.length,
+                statsStdoutSample: toLogSample(refreshedStatsResult.stdout),
+                statsStderrSample: toLogSample(refreshedStatsResult.stderr),
+                statsCommandFailed: refreshedStatsCommandFailed,
+                statsBinaryNotFound: refreshedStatsBinaryNotFound,
+              };
+            }
+          }
+        } catch (error) {
+          console.error(
+            "[vps-sync] failed to backfill xray clients for traffic stats:",
+            "internalUuid=" + row.internal_uuid,
+            "domain=" + row.domain,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
       }
 
       const abusiveUsers: string[] = [];
@@ -1773,6 +1900,14 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         throw new Error("Failed to update VPS number_of_connections: " + updateVpsError.message);
       }
 
+      if (row.connection === false) {
+        console.log(
+          "[vps-sync] node connectivity restored:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+        );
+      }
+
       nodeSummaries.push({
         internalUuid: row.internal_uuid,
         domain: row.domain,
@@ -1788,18 +1923,26 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         "message=" + errorMessage,
       );
 
-      const { error: markDisconnectedError } = await supabase
-        .from("vps")
-        .update({
-          connection: false,
-        })
-        .eq("internal_uuid", row.internal_uuid);
+      if (isLikelyConnectivityFailure(errorMessage)) {
+        const { error: markDisconnectedError } = await supabase
+          .from("vps")
+          .update({
+            connection: false,
+          })
+          .eq("internal_uuid", row.internal_uuid);
 
-      if (markDisconnectedError !== null) {
-        console.error(
-          "[vps-sync] failed to mark VPS as disconnected:",
-          row.internal_uuid,
-          markDisconnectedError.message,
+        if (markDisconnectedError !== null) {
+          console.error(
+            "[vps-sync] failed to mark VPS as disconnected:",
+            row.internal_uuid,
+            markDisconnectedError.message,
+          );
+        }
+      } else {
+        console.warn(
+          "[vps-sync] keeping existing connection status because failure does not look like SSH connectivity issue:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
         );
       }
 

@@ -42,6 +42,18 @@ interface RemoveVpsUserFromAllProtocolsInput {
   trojanPasswords?: string[];
 }
 
+interface BackfillVpsXrayUserClientsFromUsersKvMapInput {
+  sshConfig: VpsSshConfig;
+  usersKvMap: unknown;
+  onlyUsers?: string[];
+}
+
+export interface BackfillVpsXrayUserClientsFromUsersKvMapResult {
+  changed: boolean;
+  touchedUsers: number;
+  touchedCredentials: number;
+}
+
 type JsonObject = Record<string, unknown>;
 
 interface XrayConfigDocument extends JsonObject {
@@ -56,6 +68,208 @@ const xrayConfigDocumentSchema = z
 
 function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
+}
+
+function decodeBase64Strict(rawValue: string): string | null {
+  try {
+    const decoded = Buffer.from(rawValue, "base64").toString("utf8").trim();
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseProtocolSecretFromConfigUrl(
+  configUrl: string,
+): { protocol: VpsClientProtocol; secret: string } | null {
+  try {
+    const parsed = new URL(configUrl);
+    const scheme = parsed.protocol.toLowerCase();
+
+    if (scheme === "trojan:") {
+      const secret = decodeURIComponent(parsed.username).trim();
+
+      if (secret.length === 0) {
+        return null;
+      }
+
+      const fragment = decodeURIComponent(parsed.hash.slice(1)).toLowerCase();
+      const isObfs =
+        fragment.includes("obfs") ||
+        fragment.includes("trojan_obfuscated") ||
+        fragment.includes("trojan-obfuscated");
+
+      return {
+        protocol: isObfs ? "trojan_obfuscated" : "trojan",
+        secret,
+      };
+    }
+
+    if (scheme === "vless:") {
+      const secret = decodeURIComponent(parsed.username).trim();
+
+      if (secret.length === 0) {
+        return null;
+      }
+
+      return {
+        protocol: "vless_ws",
+        secret,
+      };
+    }
+
+    if (scheme === "ss:") {
+      if (parsed.password.length > 0) {
+        const secret = decodeURIComponent(parsed.password).trim();
+
+        if (secret.length === 0) {
+          return null;
+        }
+
+        return {
+          protocol: "shadowsocks",
+          secret,
+        };
+      }
+
+      const rawUsername = decodeURIComponent(parsed.username).trim();
+      const decodedUsername = decodeBase64Strict(rawUsername);
+      const usernameCandidate = decodedUsername ?? rawUsername;
+      const separatorIndex = usernameCandidate.indexOf(":");
+
+      if (separatorIndex > -1 && separatorIndex < usernameCandidate.length - 1) {
+        const secret = usernameCandidate.slice(separatorIndex + 1).trim();
+
+        if (secret.length > 0) {
+          return {
+            protocol: "shadowsocks",
+            secret,
+          };
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function parseUsersKvMapProtocolSecrets(
+  usersKvMap: unknown,
+): Map<string, Partial<Record<VpsClientProtocol, string>>> {
+  const result = new Map<string, Partial<Record<VpsClientProtocol, string>>>();
+
+  if (typeof usersKvMap !== "object" || usersKvMap === null || Array.isArray(usersKvMap)) {
+    return result;
+  }
+
+  const usersMap = usersKvMap as Record<string, unknown>;
+  const uuidPattern =
+    /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
+
+  for (const [rawUserUuid, rawEntry] of Object.entries(usersMap)) {
+    const uuidMatch = rawUserUuid.match(uuidPattern);
+
+    if (uuidMatch === null) {
+      continue;
+    }
+
+    const userInternalUuid = uuidMatch[0].toLowerCase();
+    const protocolSecrets: Partial<Record<VpsClientProtocol, string>> = {};
+
+    if (typeof rawEntry === "object" && rawEntry !== null && !Array.isArray(rawEntry)) {
+      const entry = rawEntry as Record<string, unknown>;
+      const protocolsRaw = entry.protocols;
+
+      if (
+        typeof protocolsRaw === "object" &&
+        protocolsRaw !== null &&
+        !Array.isArray(protocolsRaw)
+      ) {
+        const protocols = protocolsRaw as Record<string, unknown>;
+
+        for (const protocol of vpsClientProtocolSchema.options) {
+          const protocolRaw = protocols[protocol];
+
+          if (
+            typeof protocolRaw !== "object" ||
+            protocolRaw === null ||
+            Array.isArray(protocolRaw)
+          ) {
+            continue;
+          }
+
+          const protocolEntry = protocolRaw as Record<string, unknown>;
+          const secretBase64 = protocolEntry.secretBase64;
+
+          if (typeof secretBase64 === "string") {
+            const decoded = decodeBase64Strict(secretBase64);
+
+            if (decoded !== null && decoded.length > 0) {
+              protocolSecrets[protocol] = decoded;
+              continue;
+            }
+          }
+
+          const protocolUrl = protocolEntry.url;
+
+          if (typeof protocolUrl === "string") {
+            const parsedFromUrl = parseProtocolSecretFromConfigUrl(protocolUrl);
+
+            if (parsedFromUrl !== null && parsedFromUrl.protocol === protocol) {
+              protocolSecrets[protocol] = parsedFromUrl.secret;
+            }
+          }
+        }
+      }
+
+      if (protocolSecrets.trojan === undefined || protocolSecrets.trojan_obfuscated === undefined) {
+        const legacyPasswordBase64 = entry.passwordBase64;
+        const decodedLegacyPassword =
+          typeof legacyPasswordBase64 === "string"
+            ? decodeBase64Strict(legacyPasswordBase64)
+            : null;
+
+        if (decodedLegacyPassword !== null && decodedLegacyPassword.length > 0) {
+          if (protocolSecrets.trojan === undefined && typeof entry.directUrl === "string") {
+            protocolSecrets.trojan = decodedLegacyPassword;
+          }
+
+          if (
+            protocolSecrets.trojan_obfuscated === undefined &&
+            typeof entry.obfsUrl === "string"
+          ) {
+            protocolSecrets.trojan_obfuscated = decodedLegacyPassword;
+          }
+        }
+      }
+
+      for (const rawValue of Object.values(entry)) {
+        if (typeof rawValue !== "string") {
+          continue;
+        }
+
+        const parsedFromUrl = parseProtocolSecretFromConfigUrl(rawValue);
+
+        if (parsedFromUrl === null || parsedFromUrl.secret.length === 0) {
+          continue;
+        }
+
+        if (protocolSecrets[parsedFromUrl.protocol] === undefined) {
+          protocolSecrets[parsedFromUrl.protocol] = parsedFromUrl.secret;
+        }
+      }
+    }
+
+    if (Object.keys(protocolSecrets).length === 0) {
+      continue;
+    }
+
+    result.set(userInternalUuid, protocolSecrets);
+  }
+
+  return result;
 }
 
 function getXrayRuntimeConfig(): {
@@ -288,7 +502,13 @@ function upsertTrojanClientByEmail(input: {
   password: string;
 }): boolean {
   const clients = getTrojanInboundClients(input.inbound, input.inboundTag);
-  const existingIndex = clients.findIndex((client) => client.email === input.userInternalUuid);
+  const existingIndex = clients.findIndex((client) => {
+    if (client.email === input.userInternalUuid) {
+      return true;
+    }
+
+    return typeof client.password === "string" && client.password === input.password;
+  });
 
   if (existingIndex === -1) {
     clients.push({
@@ -324,7 +544,10 @@ function upsertVlessClient(input: {
 }): boolean {
   const clients = getVlessInboundClients(input.inbound, input.inboundTag);
   const existingIndex = clients.findIndex(
-    (client) => client.email === input.userInternalUuid || client.id === input.userInternalUuid,
+    (client) =>
+      client.email === input.userInternalUuid ||
+      client.id === input.clientId ||
+      client.id === input.userInternalUuid,
   );
 
   if (existingIndex === -1) {
@@ -359,7 +582,13 @@ function upsertShadowsocksClient(input: {
 }): boolean {
   const settings = getInboundSettings(input.inbound, input.inboundTag);
   const clients = getShadowsocksInboundClients(input.inbound, input.inboundTag);
-  const existingIndex = clients.findIndex((client) => client.email === input.userInternalUuid);
+  const existingIndex = clients.findIndex((client) => {
+    if (client.email === input.userInternalUuid) {
+      return true;
+    }
+
+    return typeof client.password === "string" && client.password === input.password;
+  });
   const methodFromSettings =
     typeof settings.method === "string" && settings.method.trim().length > 0
       ? settings.method
@@ -733,6 +962,122 @@ export async function removeVpsXrayUserFromAllProtocols(
 
   await writeRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath, xrayConfig);
   return true;
+}
+
+export async function backfillVpsXrayUserClientsFromUsersKvMap(
+  input: BackfillVpsXrayUserClientsFromUsersKvMapInput,
+): Promise<BackfillVpsXrayUserClientsFromUsersKvMapResult> {
+  const runtimeConfig = getXrayRuntimeConfig();
+  const xrayConfig = await readRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath);
+  const usersProtocolSecrets = parseUsersKvMapProtocolSecrets(input.usersKvMap);
+
+  if (usersProtocolSecrets.size === 0) {
+    return {
+      changed: false,
+      touchedUsers: 0,
+      touchedCredentials: 0,
+    };
+  }
+
+  const onlyUsersSet =
+    input.onlyUsers !== undefined && input.onlyUsers.length > 0
+      ? new Set(input.onlyUsers.map((user) => user.toLowerCase()))
+      : null;
+  const inboundTargets: Partial<
+    Record<VpsClientProtocol, { inbound: JsonObject; inboundTag: string }>
+  > = {};
+
+  for (const protocol of vpsClientProtocolSchema.options) {
+    const inboundTarget = resolveInboundForProtocol({
+      config: xrayConfig,
+      runtimeConfig,
+      protocol,
+      required: false,
+    });
+
+    if (inboundTarget !== null) {
+      inboundTargets[protocol] = inboundTarget;
+    }
+  }
+
+  let changed = false;
+  let touchedUsers = 0;
+  let touchedCredentials = 0;
+
+  for (const [userInternalUuid, protocolSecrets] of usersProtocolSecrets.entries()) {
+    if (onlyUsersSet !== null && !onlyUsersSet.has(userInternalUuid)) {
+      continue;
+    }
+
+    let touchedUser = false;
+
+    for (const protocol of vpsClientProtocolSchema.options) {
+      const secret = protocolSecrets[protocol];
+
+      if (secret === undefined || secret.trim().length === 0) {
+        continue;
+      }
+
+      const inboundTarget = inboundTargets[protocol];
+
+      if (inboundTarget === undefined) {
+        continue;
+      }
+
+      let currentChanged = false;
+
+      if (protocol === "trojan" || protocol === "trojan_obfuscated") {
+        currentChanged = upsertTrojanClientByEmail({
+          inbound: inboundTarget.inbound,
+          inboundTag: inboundTarget.inboundTag,
+          userInternalUuid,
+          password: secret,
+        });
+      } else if (protocol === "vless_ws") {
+        const parsedClientId = z.uuid().safeParse(secret);
+
+        if (!parsedClientId.success) {
+          continue;
+        }
+
+        currentChanged = upsertVlessClient({
+          inbound: inboundTarget.inbound,
+          inboundTag: inboundTarget.inboundTag,
+          userInternalUuid,
+          clientId: parsedClientId.data,
+        });
+      } else {
+        currentChanged = upsertShadowsocksClient({
+          inbound: inboundTarget.inbound,
+          inboundTag: inboundTarget.inboundTag,
+          userInternalUuid,
+          password: secret,
+          defaultMethod: runtimeConfig.shadowsocksMethod,
+        });
+      }
+
+      touchedCredentials += 1;
+
+      if (currentChanged) {
+        changed = true;
+        touchedUser = true;
+      }
+    }
+
+    if (touchedUser) {
+      touchedUsers += 1;
+    }
+  }
+
+  if (changed) {
+    await writeRemoteXrayConfig(input.sshConfig, runtimeConfig.configPath, xrayConfig);
+  }
+
+  return {
+    changed,
+    touchedUsers,
+    touchedCredentials,
+  };
 }
 
 export async function ensureVpsTrojanClient(input: EnsureVpsTrojanClientInput): Promise<boolean> {
