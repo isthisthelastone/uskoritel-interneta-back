@@ -16,6 +16,8 @@ const DEFAULT_SYNC_SPEEDTEST_IPERF_PORT = 5200;
 const DEFAULT_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS = 5;
 const DEFAULT_UNBLOCK_SSH_USER = "unluckypleasure";
 const DEFAULT_ACTIVE_CONNECTION_PORTS = [443, 8443, 8388, 8000, 9000];
+const SSH_CONNECTIVITY_PROBE_ATTEMPTS = 5;
+const SSH_CONNECTIVITY_PROBE_DELAY_MS = 600;
 const UUID_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
 const IPV4_PATTERN = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/u;
@@ -95,6 +97,11 @@ interface SafeSshCommandResult {
 interface SshConnectivityProbeResult {
   ok: boolean;
   details: string;
+  attempts: Array<{
+    attempt: number;
+    ok: boolean;
+    details: string;
+  }>;
 }
 
 interface UserVpsTrafficMonthlyStateRow {
@@ -134,7 +141,6 @@ export interface VpsConnectionsSyncResult {
 }
 
 let syncIntervalTimer: NodeJS.Timeout | null = null;
-const connectivityFailureStreakByNode = new Map<string, number>();
 
 function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
@@ -684,22 +690,6 @@ function getSpeedtestIperfDurationSeconds(): number {
   return parsed;
 }
 
-function getConnectivityFailureThreshold(): number {
-  const rawThreshold = process.env.VPS_CONNECTIVITY_FAILURE_THRESHOLD?.trim();
-
-  if (rawThreshold === undefined || rawThreshold.length === 0) {
-    return 3;
-  }
-
-  const parsed = Number.parseInt(rawThreshold, 10);
-
-  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 10) {
-    throw new Error("VPS_CONNECTIVITY_FAILURE_THRESHOLD must be between 1 and 10.");
-  }
-
-  return parsed;
-}
-
 function getExtraActivePorts(): number[] {
   const rawPorts = process.env.VPS_SYNC_EXTRA_ACTIVE_PORTS?.trim();
 
@@ -724,6 +714,31 @@ function getExtraActivePorts(): number[] {
   }
 
   return Array.from(result.values());
+}
+
+async function sleepMs(delayMs: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
+function formatSshProbeAttemptsSummary(attempts: SshConnectivityProbeResult["attempts"]): string {
+  if (attempts.length === 0) {
+    return "no-attempts";
+  }
+
+  return attempts
+    .map((attempt) => {
+      return (
+        "#" +
+        String(attempt.attempt) +
+        ":" +
+        (attempt.ok ? "ok" : "fail") +
+        ":" +
+        (attempt.details.length > 0 ? attempt.details : "empty")
+      );
+    })
+    .join(" | ");
 }
 
 function isVerboseSyncLoggingEnabled(): boolean {
@@ -1438,23 +1453,49 @@ async function probeSshConnectivity(
 ): Promise<SshConnectivityProbeResult> {
   try {
     const sshConfig = buildVpsSshConfig(row);
-    const probeResult = await runVpsSshCommandSafe(sshConfig, "printf '__SSH_HEALTH_OK__\\n'");
+    const attempts: SshConnectivityProbeResult["attempts"] = [];
 
-    if (!probeResult.failed) {
-      return {
-        ok: true,
-        details: toLogSample(probeResult.stdout),
-      };
+    for (let attempt = 1; attempt <= SSH_CONNECTIVITY_PROBE_ATTEMPTS; attempt += 1) {
+      const probeResult = await runVpsSshCommandSafe(sshConfig, "printf '__SSH_HEALTH_OK__\\n'");
+      const details = toLogSample([probeResult.stderr, probeResult.stdout].join("\n"));
+      const ok = !probeResult.failed;
+      attempts.push({
+        attempt,
+        ok,
+        details,
+      });
+
+      if (ok) {
+        return {
+          ok: true,
+          details,
+          attempts,
+        };
+      }
+
+      if (attempt < SSH_CONNECTIVITY_PROBE_ATTEMPTS) {
+        await sleepMs(SSH_CONNECTIVITY_PROBE_DELAY_MS);
+      }
     }
 
+    const lastDetails = attempts[attempts.length - 1]?.details ?? "";
     return {
       ok: false,
-      details: toLogSample([probeResult.stderr, probeResult.stdout].join("\n")),
+      details: lastDetails,
+      attempts,
     };
   } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
     return {
       ok: false,
-      details: error instanceof Error ? error.message : String(error),
+      details,
+      attempts: [
+        {
+          attempt: 1,
+          ok: false,
+          details,
+        },
+      ],
     };
   }
 }
@@ -2094,8 +2135,6 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         throw new Error("Failed to update VPS number_of_connections: " + updateVpsError.message);
       }
 
-      connectivityFailureStreakByNode.delete(row.internal_uuid);
-
       if (row.connection === false) {
         console.log(
           "[vps-sync] node connectivity restored:",
@@ -2119,9 +2158,9 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         "message=" + errorMessage,
       );
       const sshProbe = await probeSshConnectivity(row);
+      const sshProbeAttemptsSummary = formatSshProbeAttemptsSummary(sshProbe.attempts);
 
       if (sshProbe.ok) {
-        connectivityFailureStreakByNode.delete(row.internal_uuid);
         const { error: markConnectedError } = await supabase
           .from("vps")
           .update({
@@ -2148,53 +2187,40 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "[vps-sync][warn] node sync failed but SSH probe succeeded; keeping connection=true:",
           "internalUuid=" + row.internal_uuid,
           "domain=" + row.domain,
+          "probeAttempts=" + sshProbeAttemptsSummary,
           "probeDetails=" + sshProbe.details,
         );
       } else if (isLikelyConnectivityFailure(errorMessage)) {
-        const nextStreak = (connectivityFailureStreakByNode.get(row.internal_uuid) ?? 0) + 1;
-        connectivityFailureStreakByNode.set(row.internal_uuid, nextStreak);
-        const threshold = getConnectivityFailureThreshold();
+        const { error: markDisconnectedError } = await supabase
+          .from("vps")
+          .update({
+            connection: false,
+          })
+          .eq("internal_uuid", row.internal_uuid);
 
-        if (nextStreak >= threshold) {
-          const { error: markDisconnectedError } = await supabase
-            .from("vps")
-            .update({
-              connection: false,
-            })
-            .eq("internal_uuid", row.internal_uuid);
-
-          if (markDisconnectedError !== null) {
-            console.error(
-              "[vps-sync] failed to mark VPS as disconnected:",
-              row.internal_uuid,
-              markDisconnectedError.message,
-            );
-          } else {
-            console.warn(
-              "[vps-sync][warn] marked VPS connection=false after repeated failed SSH probes and connectivity-like failures:",
-              "internalUuid=" + row.internal_uuid,
-              "domain=" + row.domain,
-              "probeDetails=" + sshProbe.details,
-              "streak=" + String(nextStreak),
-              "threshold=" + String(threshold),
-            );
-          }
+        if (markDisconnectedError !== null) {
+          console.error(
+            "[vps-sync] failed to mark VPS as disconnected:",
+            row.internal_uuid,
+            markDisconnectedError.message,
+          );
         } else {
           console.warn(
-            "[vps-sync][warn] connectivity-like failure with failed SSH probe, but keeping previous connection status until threshold reached:",
+            "[vps-sync][warn] marked VPS connection=false after 5/5 failed SSH probes and connectivity-like failure:",
             "internalUuid=" + row.internal_uuid,
             "domain=" + row.domain,
+            "rootError=" + errorMessage,
+            "probeAttempts=" + sshProbeAttemptsSummary,
             "probeDetails=" + sshProbe.details,
-            "streak=" + String(nextStreak),
-            "threshold=" + String(threshold),
           );
         }
       } else {
-        connectivityFailureStreakByNode.delete(row.internal_uuid);
         console.warn(
           "[vps-sync] keeping existing connection status because failure does not look like SSH connectivity issue:",
           "internalUuid=" + row.internal_uuid,
           "domain=" + row.domain,
+          "rootError=" + errorMessage,
+          "probeAttempts=" + sshProbeAttemptsSummary,
           "probeDetails=" + sshProbe.details,
         );
       }
