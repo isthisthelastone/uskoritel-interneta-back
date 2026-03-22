@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isIP } from "node:net";
 import { getSupabaseAdminClient } from "../lib/supabaseAdmin";
 import { runVpsSshCommandWithConfig, type VpsSshConfig } from "./vpsSshService";
 import { backfillVpsXrayUserClientsFromUsersKvMap } from "./vpsXrayService";
@@ -14,6 +15,7 @@ const DEFAULT_SYNC_SPEEDTEST_TARGET_URL = "http://speedtest.myloc.de/files/100mb
 const DEFAULT_SYNC_SPEEDTEST_IPERF_PORT = 5200;
 const DEFAULT_SYNC_SPEEDTEST_IPERF_DURATION_SECONDS = 5;
 const DEFAULT_UNBLOCK_SSH_USER = "unluckypleasure";
+const DEFAULT_ACTIVE_CONNECTION_PORTS = [443, 8443, 8388, 8000, 9000];
 const UUID_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
 const IPV4_PATTERN = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/u;
@@ -132,6 +134,7 @@ export interface VpsConnectionsSyncResult {
 }
 
 let syncIntervalTimer: NodeJS.Timeout | null = null;
+const connectivityFailureStreakByNode = new Map<string, number>();
 
 function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
@@ -551,8 +554,17 @@ function extractVpsPorts(configList: string[]): number[] {
   }
 
   if (portSet.size === 0) {
-    portSet.add(443);
-    portSet.add(8443);
+    for (const defaultPort of DEFAULT_ACTIVE_CONNECTION_PORTS) {
+      portSet.add(defaultPort);
+    }
+  } else {
+    for (const defaultPort of DEFAULT_ACTIVE_CONNECTION_PORTS) {
+      portSet.add(defaultPort);
+    }
+  }
+
+  for (const extraPort of getExtraActivePorts()) {
+    portSet.add(extraPort);
   }
 
   return Array.from(portSet.values()).sort((a, b) => a - b);
@@ -672,6 +684,48 @@ function getSpeedtestIperfDurationSeconds(): number {
   return parsed;
 }
 
+function getConnectivityFailureThreshold(): number {
+  const rawThreshold = process.env.VPS_CONNECTIVITY_FAILURE_THRESHOLD?.trim();
+
+  if (rawThreshold === undefined || rawThreshold.length === 0) {
+    return 3;
+  }
+
+  const parsed = Number.parseInt(rawThreshold, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 10) {
+    throw new Error("VPS_CONNECTIVITY_FAILURE_THRESHOLD must be between 1 and 10.");
+  }
+
+  return parsed;
+}
+
+function getExtraActivePorts(): number[] {
+  const rawPorts = process.env.VPS_SYNC_EXTRA_ACTIVE_PORTS?.trim();
+
+  if (rawPorts === undefined || rawPorts.length === 0) {
+    return [];
+  }
+
+  const result = new Set<number>();
+
+  for (const token of rawPorts.split(/[,\s]+/u)) {
+    const trimmed = token.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+      continue;
+    }
+
+    result.add(parsed);
+  }
+
+  return Array.from(result.values());
+}
+
 function isVerboseSyncLoggingEnabled(): boolean {
   return process.env.VPS_SYNC_VERBOSE?.trim().toLowerCase() === "true";
 }
@@ -697,8 +751,14 @@ function buildDistinctActiveIpCommand(ports: number[]): string {
     "ss -Htan state established '( " +
     ssPortsClause +
     " )' | awk '{print $4\" \"$5}'; " +
+    "ss -Huan '( " +
+    ssPortsClause +
+    ' )\' 2>/dev/null | awk \'$5 != "*:*" {print $4" "$5}\'; ' +
     "else " +
     'netstat -tan 2>/dev/null | awk \'$6 == "ESTABLISHED" && (' +
+    netstatPortsClause +
+    ') {print $4" "$5}\'; ' +
+    'netstat -uan 2>/dev/null | awk \'$5 != "*:*" && $5 != "0.0.0.0:*" && $5 != ":::*" && (' +
     netstatPortsClause +
     ') {print $4" "$5}\'; ' +
     "fi"
@@ -813,6 +873,62 @@ function extractIpv4(value: string): string | null {
   return match === null ? null : match[0];
 }
 
+function normalizeCandidateIp(rawValue: string): string | null {
+  const trimmed = rawValue.trim().replaceAll(/^\[|\]$/gu, "");
+  const withoutZone = trimmed.includes("%") ? trimmed.split("%", 1)[0] : trimmed;
+
+  if (withoutZone.length === 0) {
+    return null;
+  }
+
+  const mappedIpv4Match = withoutZone.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/iu);
+  if (mappedIpv4Match !== null && isIP(mappedIpv4Match[1]) === 4) {
+    return mappedIpv4Match[1];
+  }
+
+  const ipVersion = isIP(withoutZone);
+  if (ipVersion === 4) {
+    return withoutZone;
+  }
+
+  if (ipVersion === 6) {
+    return withoutZone.toLowerCase();
+  }
+
+  return null;
+}
+
+function extractIpFromEndpoint(endpoint: string): string | null {
+  const trimmed = endpoint.trim();
+
+  if (trimmed.length === 0 || trimmed === "*:*") {
+    return null;
+  }
+
+  const direct = normalizeCandidateIp(trimmed);
+  if (direct !== null) {
+    return direct;
+  }
+
+  const bracketMatch = trimmed.match(/^\[([^\]]+)\](?::\d+)?$/u);
+  if (bracketMatch !== null) {
+    return normalizeCandidateIp(bracketMatch[1]);
+  }
+
+  const ipv4Match = extractIpv4(trimmed);
+  if (ipv4Match !== null) {
+    return ipv4Match;
+  }
+
+  const lastColonIndex = trimmed.lastIndexOf(":");
+  if (lastColonIndex > 0 && lastColonIndex < trimmed.length - 1) {
+    const withoutPort = trimmed.slice(0, lastColonIndex);
+    return normalizeCandidateIp(withoutPort);
+  }
+
+  return null;
+}
+
 function parseDistinctActiveSocketKeys(stdout: string): Set<string> {
   const ips = new Set<string>();
 
@@ -825,7 +941,7 @@ function parseDistinctActiveSocketKeys(stdout: string): Set<string> {
 
     const endpoints = trimmed.split(/\s+/u);
     const remoteEndpoint = endpoints.length > 1 ? endpoints[1] : endpoints[0];
-    const ip = extractIpv4(remoteEndpoint);
+    const ip = extractIpFromEndpoint(remoteEndpoint);
 
     if (ip === null) {
       continue;
@@ -1445,23 +1561,38 @@ function buildUserVpsTrafficStateKey(vpsInternalUuid: string, userInternalUuid: 
 
 function isLikelyConnectivityFailure(errorMessage: string): boolean {
   const normalized = errorMessage.toLowerCase();
-  const connectivityIndicators = [
+  const strongConnectivityIndicators = [
     "[ssh-connectivity]",
     "ssh: connect to host",
+    "command failed: ssh",
+    "permission denied (publickey)",
+    "could not resolve hostname",
+    "no route to host",
+  ];
+  const genericConnectivityIndicators = [
     "connection timed out",
     "operation timed out",
     "econnrefused",
     "ehostunreach",
     "enetunreach",
     "etimedout",
-    "no route to host",
     "connection refused",
-    "permission denied (publickey)",
-    "could not resolve hostname",
     "connection reset by peer",
   ];
 
-  return connectivityIndicators.some((indicator) => normalized.includes(indicator));
+  if (strongConnectivityIndicators.some((indicator) => normalized.includes(indicator))) {
+    return true;
+  }
+
+  const looksLikeSshContext =
+    normalized.includes("ssh") ||
+    normalized.includes("runvpssshcommand") ||
+    normalized.includes("vpsssh");
+
+  return (
+    looksLikeSshContext &&
+    genericConnectivityIndicators.some((indicator) => normalized.includes(indicator))
+  );
 }
 
 async function computeCalendarMonthTrafficByUser(params: {
@@ -1683,8 +1814,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         resolveUserInternalUuid,
       );
       const activeIpsFromLogsCount = countUniqueIpsFromUserCurrentMap(metrics.userCurrentIps);
-      const effectiveActiveIpsCount =
-        metrics.activeIps.size > 0 ? metrics.activeIps.size : activeIpsFromLogsCount;
+      const effectiveActiveIpsCount = Math.max(metrics.activeIps.size, activeIpsFromLogsCount);
       if (verbose || metrics.userTrafficBytes.size === 0) {
         console.log(
           "[vps-sync][debug] vps metrics:",
@@ -1721,7 +1851,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
             "domain=" + row.domain,
             "socketBased=" + String(metrics.activeIps.size),
             "logBased=" + String(activeIpsFromLogsCount),
-            "used=socketBased",
+            "used=max(socketBased,logBased)",
           );
         }
 
@@ -1964,6 +2094,8 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         throw new Error("Failed to update VPS number_of_connections: " + updateVpsError.message);
       }
 
+      connectivityFailureStreakByNode.delete(row.internal_uuid);
+
       if (row.connection === false) {
         console.log(
           "[vps-sync] node connectivity restored:",
@@ -1989,6 +2121,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       const sshProbe = await probeSshConnectivity(row);
 
       if (sshProbe.ok) {
+        connectivityFailureStreakByNode.delete(row.internal_uuid);
         const { error: markConnectedError } = await supabase
           .from("vps")
           .update({
@@ -2018,28 +2151,46 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "probeDetails=" + sshProbe.details,
         );
       } else if (isLikelyConnectivityFailure(errorMessage)) {
-        const { error: markDisconnectedError } = await supabase
-          .from("vps")
-          .update({
-            connection: false,
-          })
-          .eq("internal_uuid", row.internal_uuid);
+        const nextStreak = (connectivityFailureStreakByNode.get(row.internal_uuid) ?? 0) + 1;
+        connectivityFailureStreakByNode.set(row.internal_uuid, nextStreak);
+        const threshold = getConnectivityFailureThreshold();
 
-        if (markDisconnectedError !== null) {
-          console.error(
-            "[vps-sync] failed to mark VPS as disconnected:",
-            row.internal_uuid,
-            markDisconnectedError.message,
-          );
+        if (nextStreak >= threshold) {
+          const { error: markDisconnectedError } = await supabase
+            .from("vps")
+            .update({
+              connection: false,
+            })
+            .eq("internal_uuid", row.internal_uuid);
+
+          if (markDisconnectedError !== null) {
+            console.error(
+              "[vps-sync] failed to mark VPS as disconnected:",
+              row.internal_uuid,
+              markDisconnectedError.message,
+            );
+          } else {
+            console.warn(
+              "[vps-sync][warn] marked VPS connection=false after repeated failed SSH probes and connectivity-like failures:",
+              "internalUuid=" + row.internal_uuid,
+              "domain=" + row.domain,
+              "probeDetails=" + sshProbe.details,
+              "streak=" + String(nextStreak),
+              "threshold=" + String(threshold),
+            );
+          }
         } else {
           console.warn(
-            "[vps-sync][warn] marked VPS connection=false after failed SSH probe and connectivity-like failure:",
+            "[vps-sync][warn] connectivity-like failure with failed SSH probe, but keeping previous connection status until threshold reached:",
             "internalUuid=" + row.internal_uuid,
             "domain=" + row.domain,
             "probeDetails=" + sshProbe.details,
+            "streak=" + String(nextStreak),
+            "threshold=" + String(threshold),
           );
         }
       } else {
+        connectivityFailureStreakByNode.delete(row.internal_uuid);
         console.warn(
           "[vps-sync] keeping existing connection status because failure does not look like SSH connectivity issue:",
           "internalUuid=" + row.internal_uuid,
