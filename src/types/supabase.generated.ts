@@ -250,6 +250,7 @@ export type Database = {
           current_speed: number
           disabled: boolean | null
           domain: string
+          improved_number_of_connections: number
           internal_uuid: string
           isUnblock: boolean
           nickname: string | null
@@ -271,6 +272,7 @@ export type Database = {
           current_speed?: number
           disabled?: boolean | null
           domain: string
+          improved_number_of_connections?: number
           internal_uuid?: string
           isUnblock?: boolean
           nickname?: string | null
@@ -292,6 +294,7 @@ export type Database = {
           current_speed?: number
           disabled?: boolean | null
           domain?: string
+          improved_number_of_connections?: number
           internal_uuid?: string
           isUnblock?: boolean
           nickname?: string | null

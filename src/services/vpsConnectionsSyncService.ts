@@ -57,9 +57,17 @@ interface UserAggregate {
 
 interface PerVpsMetrics {
   activeIps: Set<string>;
+  improvedConnectionsTotal: number;
+  improvedConnectionsTcp: number;
+  improvedConnectionsUdp: number;
   userCurrentIps: Map<string, Set<string>>;
   userMonthIps: Map<string, Set<string>>;
   userTrafficBytes: Map<string, number>;
+  improvedConnectionsStdoutLength: number;
+  improvedConnectionsStderrLength: number;
+  improvedConnectionsStdoutSample: string;
+  improvedConnectionsStderrSample: string;
+  improvedConnectionsCommandFailed: boolean;
   activeIpsStdoutLength: number;
   activeIpsStderrLength: number;
   activeIpsStderrSample: string;
@@ -778,6 +786,71 @@ function buildDistinctActiveIpCommand(ports: number[]): string {
     ') {print $4" "$5}\'; ' +
     "fi"
   );
+}
+
+function buildImprovedConnectionsCommand(ports: number[]): string {
+  const ssPortsClause = ports.map((port) => "sport = :" + String(port)).join(" or ");
+  const udpPortRegex = ports
+    .map((port) => String(port).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+
+  return (
+    "TCP_COUNT='0'; UDP_COUNT='0'; TCP_OK='1'; UDP_OK='1'; " +
+    "if command -v ss >/dev/null 2>&1; then " +
+    "TCP_COUNT=$(ss -Htan state established '( " +
+    ssPortsClause +
+    " )' 2>/dev/null | wc -l | tr -d '[:space:]'); " +
+    "else " +
+    "TCP_OK='0'; " +
+    "fi; " +
+    "if command -v conntrack >/dev/null 2>&1; then " +
+    "UDP_COUNT=$(conntrack -L -p udp 2>/dev/null | grep -E 'dport=(" +
+    udpPortRegex +
+    ")($|[^0-9])' | wc -l | tr -d '[:space:]'); " +
+    "elif command -v sudo >/dev/null 2>&1 && sudo -n command -v conntrack >/dev/null 2>&1; then " +
+    "UDP_COUNT=$(sudo -n conntrack -L -p udp 2>/dev/null | grep -E 'dport=(" +
+    udpPortRegex +
+    ")($|[^0-9])' | wc -l | tr -d '[:space:]'); " +
+    "else " +
+    "UDP_OK='0'; " +
+    "fi; " +
+    "case \"$TCP_COUNT\" in ''|*[!0-9]*) TCP_COUNT='0';; esac; " +
+    "case \"$UDP_COUNT\" in ''|*[!0-9]*) UDP_COUNT='0';; esac; " +
+    "TOTAL_COUNT=$((TCP_COUNT + UDP_COUNT)); " +
+    'printf \'__IMPROVED_CONNECTIONS__:%s:%s:%s:%s:%s\\n\' "$TOTAL_COUNT" "$TCP_COUNT" "$UDP_COUNT" "$TCP_OK" "$UDP_OK"'
+  );
+}
+
+function parseImprovedConnectionsResult(stdout: string): {
+  total: number;
+  tcp: number;
+  udp: number;
+  tcpOk: boolean;
+  udpOk: boolean;
+} | null {
+  const match = stdout.match(/__IMPROVED_CONNECTIONS__:(\d+):(\d+):(\d+):([01]):([01])/u);
+
+  if (match === null) {
+    return null;
+  }
+
+  const total = Number.parseInt(match[1], 10);
+  const tcp = Number.parseInt(match[2], 10);
+  const udp = Number.parseInt(match[3], 10);
+  const tcpOk = match[4] === "1";
+  const udpOk = match[5] === "1";
+
+  if (!Number.isFinite(total) || !Number.isFinite(tcp) || !Number.isFinite(udp)) {
+    return null;
+  }
+
+  return {
+    total: Math.max(0, Math.trunc(total)),
+    tcp: Math.max(0, Math.trunc(tcp)),
+    udp: Math.max(0, Math.trunc(udp)),
+    tcpOk,
+    udpOk,
+  };
 }
 
 function buildStatsQueryCommand(statsServer: string): string {
@@ -1507,6 +1580,7 @@ async function collectVpsMetrics(
   resolveUserInternalUuid: (metricIdentity: string) => string | null,
 ): Promise<PerVpsMetrics> {
   const activeIpsCommand = buildDistinctActiveIpCommand(ports);
+  const improvedConnectionsCommand = buildImprovedConnectionsCommand(ports);
   const statsCommand = buildStatsQueryCommand(getXrayStatsServer());
   const readLogsCommand = buildReadAccessLogsCommand(getXrayAccessLogPath(), getXrayLogTailLines());
   const youtubeIperfSpeedCommand = buildYoutubeIperfSpeedCommand(
@@ -1520,8 +1594,9 @@ async function collectVpsMetrics(
     stderr: "",
     failed: false,
   };
-  const [activeIpsResult, statsResult, logsResult] = await Promise.all([
+  const [activeIpsResult, improvedConnectionsResult, statsResult, logsResult] = await Promise.all([
     runVpsSshCommandSafe(sshConfig, activeIpsCommand),
+    runVpsSshCommandSafe(sshConfig, improvedConnectionsCommand),
     runVpsSshCommandSafe(sshConfig, statsCommand),
     runVpsSshCommandSafe(sshConfig, readLogsCommand),
   ]);
@@ -1544,6 +1619,14 @@ async function collectVpsMetrics(
     : [skippedSpeedtestResult, skippedSpeedtestResult];
 
   const activeIps = parseDistinctActiveSocketKeys(activeIpsResult.stdout);
+  const improvedConnectionsParsed = parseImprovedConnectionsResult(
+    improvedConnectionsResult.stdout,
+  );
+  const improvedConnectionsCommandFailed =
+    improvedConnectionsResult.failed || improvedConnectionsParsed === null;
+  const improvedConnectionsTotal = improvedConnectionsParsed?.total ?? 0;
+  const improvedConnectionsTcp = improvedConnectionsParsed?.tcp ?? 0;
+  const improvedConnectionsUdp = improvedConnectionsParsed?.udp ?? 0;
   const statsCommandFailed =
     statsResult.failed || statsResult.stdout.includes("__XRAY_STATSQUERY_FAILED__");
   const statsBinaryNotFound = statsResult.stdout.includes("__XRAY_BINARY_NOT_FOUND__");
@@ -1564,9 +1647,17 @@ async function collectVpsMetrics(
 
   return {
     activeIps,
+    improvedConnectionsTotal,
+    improvedConnectionsTcp,
+    improvedConnectionsUdp,
     userCurrentIps: userIpSets.userCurrentIps,
     userMonthIps: userIpSets.userMonthIps,
     userTrafficBytes,
+    improvedConnectionsStdoutLength: improvedConnectionsResult.stdout.length,
+    improvedConnectionsStderrLength: improvedConnectionsResult.stderr.length,
+    improvedConnectionsStdoutSample: toLogSample(improvedConnectionsResult.stdout),
+    improvedConnectionsStderrSample: toLogSample(improvedConnectionsResult.stderr),
+    improvedConnectionsCommandFailed,
     activeIpsStdoutLength: activeIpsResult.stdout.length,
     activeIpsStderrLength: activeIpsResult.stderr.length,
     activeIpsStderrSample: toLogSample(activeIpsResult.stderr),
@@ -1856,6 +1947,9 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
       );
       const activeIpsFromLogsCount = countUniqueIpsFromUserCurrentMap(metrics.userCurrentIps);
       const effectiveActiveIpsCount = Math.max(metrics.activeIps.size, activeIpsFromLogsCount);
+      const effectiveImprovedConnectionsCount = metrics.improvedConnectionsCommandFailed
+        ? effectiveActiveIpsCount
+        : metrics.improvedConnectionsTotal;
       if (verbose || metrics.userTrafficBytes.size === 0) {
         console.log(
           "[vps-sync][debug] vps metrics:",
@@ -1864,6 +1958,13 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "activeIps=" + String(metrics.activeIps.size),
           "activeIpsFromLogs=" + String(activeIpsFromLogsCount),
           "effectiveActiveIps=" + String(effectiveActiveIpsCount),
+          "improvedConnectionsTotal=" + String(metrics.improvedConnectionsTotal),
+          "improvedConnectionsTcp=" + String(metrics.improvedConnectionsTcp),
+          "improvedConnectionsUdp=" + String(metrics.improvedConnectionsUdp),
+          "effectiveImprovedConnections=" + String(effectiveImprovedConnectionsCount),
+          "improvedConnectionsCommandFailed=" + String(metrics.improvedConnectionsCommandFailed),
+          "improvedConnectionsStdoutLength=" + String(metrics.improvedConnectionsStdoutLength),
+          "improvedConnectionsStderrLength=" + String(metrics.improvedConnectionsStderrLength),
           "activeIpsCommandFailed=" + String(metrics.activeIpsCommandFailed),
           "activeIpsStdoutLength=" + String(metrics.activeIpsStdoutLength),
           "activeIpsStderrLength=" + String(metrics.activeIpsStderrLength),
@@ -1906,6 +2007,20 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
 
         if (metrics.activeIpsStderrLength > 0) {
           console.log("[vps-sync][debug] activeIps stderr sample:", metrics.activeIpsStderrSample);
+        }
+
+        if (metrics.improvedConnectionsStdoutLength > 0) {
+          console.log(
+            "[vps-sync][debug] improved connections stdout sample:",
+            metrics.improvedConnectionsStdoutSample,
+          );
+        }
+
+        if (metrics.improvedConnectionsStderrLength > 0) {
+          console.log(
+            "[vps-sync][debug] improved connections stderr sample:",
+            metrics.improvedConnectionsStderrSample,
+          );
         }
 
         if (metrics.logsStderrLength > 0) {
@@ -1965,6 +2080,24 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
           "activeIpsStderrSample=" +
             (metrics.activeIpsStderrSample.length > 0 ? metrics.activeIpsStderrSample : "—"),
           "hint=check ss/netstat availability and permissions",
+        );
+      }
+
+      if (metrics.improvedConnectionsCommandFailed) {
+        console.warn(
+          "[vps-sync][warn] improved connections metric failed, fallback value will be used:",
+          "internalUuid=" + row.internal_uuid,
+          "domain=" + row.domain,
+          "fallbackImprovedConnections=" + String(effectiveActiveIpsCount),
+          "improvedConnectionsStdoutSample=" +
+            (metrics.improvedConnectionsStdoutSample.length > 0
+              ? metrics.improvedConnectionsStdoutSample
+              : "—"),
+          "improvedConnectionsStderrSample=" +
+            (metrics.improvedConnectionsStderrSample.length > 0
+              ? metrics.improvedConnectionsStderrSample
+              : "—"),
+          "hint=check ss/conntrack availability and permissions",
         );
       }
 
@@ -2125,6 +2258,7 @@ export async function syncVpsCurrentConnections(): Promise<VpsConnectionsSyncRes
         .from("vps")
         .update({
           number_of_connections: effectiveActiveIpsCount,
+          improved_number_of_connections: effectiveImprovedConnectionsCount,
           current_speed: metrics.currentSpeedMbPerSecond,
           connection: true,
           disabled: false,

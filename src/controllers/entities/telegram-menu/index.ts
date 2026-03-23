@@ -36,11 +36,39 @@ function getLoadEmoji(numberOfConnections: number): string {
     return "🟢";
   }
 
-  if (numberOfConnections <= 50) {
+  if (numberOfConnections <= 20) {
     return "🟡";
   }
 
-  return "🟠";
+  if (numberOfConnections <= 25) {
+    return "🟠";
+  }
+
+  return "🔴";
+}
+
+function getLoadSuffix(numberOfConnections: number): string {
+  if (numberOfConnections >= 26) {
+    return " FULL";
+  }
+
+  return "";
+}
+
+function getNormalizedConnections(rawValue: number): number {
+  if (!Number.isFinite(rawValue)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.round(rawValue));
+}
+
+function getLoadIndicator(numberOfConnections: number): string {
+  const normalizedConnections = getNormalizedConnections(numberOfConnections);
+  const loadEmoji = getLoadEmoji(normalizedConnections);
+  const loadSuffix = getLoadSuffix(normalizedConnections);
+
+  return loadEmoji + loadSuffix;
 }
 
 function trimButtonLabel(value: string): string {
@@ -84,11 +112,9 @@ export function buildVpsButtonText(input: {
       ? buildUnblockShortName(input.nickname, input.internalUuid)
       : (input.nickname ?? "VPS " + input.internalUuid.slice(0, 8).toUpperCase());
   const speed = Number.isFinite(input.currentSpeed) ? Math.max(0, input.currentSpeed) : 0;
-  const connections = Number.isFinite(input.numberOfConnections)
-    ? Math.max(0, Math.round(input.numberOfConnections))
-    : 0;
+  const connections = getNormalizedConnections(input.numberOfConnections);
   const speedEmoji = getSpeedEmoji(speed);
-  const loadEmoji = getLoadEmoji(connections);
+  const loadEmoji = getLoadIndicator(connections);
   const line = displayName + " | Скорость " + speedEmoji + " | Люди " + loadEmoji;
 
   return trimButtonLabel(line);
