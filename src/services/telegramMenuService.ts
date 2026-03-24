@@ -7,6 +7,7 @@ export type TelegramMenuKey =
   | "gifts"
   | "settings"
   | "countries"
+  | "support"
   | "admin_panel";
 
 export interface TelegramMenuItem {
@@ -86,9 +87,21 @@ export function buildTelegramMenu(
       sizeFr: 0.5,
       callbackData: "menu:countries",
     },
+    {
+      key: "support",
+      label: "⭐️ Поддержать",
+      sizeFr: 1,
+      callbackData: "menu:support",
+    },
   ];
 
-  const keyboardRows = [[menu[0]], [menu[1], menu[2]], [menu[3], menu[4]], [menu[5], menu[6]]];
+  const keyboardRows = [
+    [menu[0]],
+    [menu[1], menu[2]],
+    [menu[3], menu[4]],
+    [menu[5], menu[6]],
+    [menu[7]],
+  ];
 
   if (isAdmin) {
     const adminButton: TelegramMenuItem = {

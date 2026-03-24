@@ -10,6 +10,7 @@ const telegramMenuKeySchema = z.enum([
   "gifts",
   "settings",
   "countries",
+  "support",
   "admin_panel",
 ]);
 
@@ -43,6 +44,11 @@ const invoicePayloadSchema = z.discriminatedUnion("action", [
     months: subscriptionPlanMonthsSchema,
     tgId: tgIdSchema,
     recipientTgId: tgIdSchema,
+  }),
+  z.object({
+    action: z.literal("support"),
+    tgId: tgIdSchema,
+    amount: z.number().int().positive(),
   }),
 ]);
 
@@ -655,6 +661,14 @@ export function buildGiftInvoicePayload(
     months,
     tgId: String(tgId),
     recipientTgId,
+  });
+}
+
+export function buildSupportInvoicePayload(tgId: number, amount: number): string {
+  return JSON.stringify({
+    action: "support",
+    tgId: String(tgId),
+    amount,
   });
 }
 

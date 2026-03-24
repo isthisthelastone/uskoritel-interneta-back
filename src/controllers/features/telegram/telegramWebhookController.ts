@@ -57,6 +57,7 @@ import {
 import {
   getAdminActionFromCallbackData,
   buildGiftInvoicePayload,
+  buildSupportInvoicePayload,
   buildVpsButtonText,
   buildSubscriptionInvoicePayload,
   buildSubscriptionStatusTextFromDb,
@@ -129,6 +130,7 @@ const telegramUpdateSchema = z.object({
 
 const pendingGiftRecipientInputByTgId = new Map<string, number>();
 const pendingPromoInputByTgId = new Map<string, number>();
+const pendingSupportInputByTgId = new Map<string, number>();
 type PendingAdminUserInputAction = "ban" | "unban" | "disconnect_all";
 interface PendingAdminUserInputState {
   action: PendingAdminUserInputAction;
@@ -137,6 +139,7 @@ interface PendingAdminUserInputState {
 const pendingAdminUserInputByTgId = new Map<string, PendingAdminUserInputState>();
 const pendingGiftRecipientInputTtlMs = 15 * 60 * 1000;
 const pendingPromoInputTtlMs = 15 * 60 * 1000;
+const pendingSupportInputTtlMs = 15 * 60 * 1000;
 const pendingAdminUserInputTtlMs = 15 * 60 * 1000;
 const clearQueueMaxPending = 5;
 const clearQueueSweepLimit = 5000;
@@ -208,6 +211,29 @@ function hasPendingPromoInput(tgId: string): boolean {
 
   if (Date.now() - createdAt > pendingPromoInputTtlMs) {
     pendingPromoInputByTgId.delete(tgId);
+    return false;
+  }
+
+  return true;
+}
+
+function startPendingSupportInput(tgId: string): void {
+  pendingSupportInputByTgId.set(tgId, Date.now());
+}
+
+function clearPendingSupportInput(tgId: string): void {
+  pendingSupportInputByTgId.delete(tgId);
+}
+
+function hasPendingSupportInput(tgId: string): boolean {
+  const createdAt = pendingSupportInputByTgId.get(tgId);
+
+  if (createdAt === undefined) {
+    return false;
+  }
+
+  if (Date.now() - createdAt > pendingSupportInputTtlMs) {
+    pendingSupportInputByTgId.delete(tgId);
     return false;
   }
 
@@ -686,6 +712,8 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             const expectedPrice = await getSubscriptionPriceByMonths(invoicePayload.months);
             isValidPayload =
               expectedPrice !== null && preCheckoutQuery.total_amount === expectedPrice.stars;
+          } else if (invoicePayload.action === "support") {
+            isValidPayload = preCheckoutQuery.total_amount === invoicePayload.amount;
           } else {
             const expectedPurchaseAmount = await resolveSubscriptionPurchaseAmount(
               invoicePayload.tgId,
@@ -817,17 +845,19 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                                 : "Opening guide..."
                       : howToAction !== null
                         ? "Opening guide..."
-                        : menuKey === null
-                          ? "Unknown action."
-                          : menuKey === "subscription_status"
-                            ? "Fetching subscription status..."
-                            : menuKey === "countries"
-                              ? "Loading countries..."
-                              : menuKey === "faq"
-                                ? "Opening FAQ..."
-                                : menuKey === "how_to_use"
-                                  ? "Opening platforms..."
-                                  : "Opening section...",
+                        : menuKey === "support"
+                          ? "Preparing donation..."
+                          : menuKey === null
+                            ? "Unknown action."
+                            : menuKey === "subscription_status"
+                              ? "Fetching subscription status..."
+                              : menuKey === "countries"
+                                ? "Loading countries..."
+                                : menuKey === "faq"
+                                  ? "Opening FAQ..."
+                                  : menuKey === "how_to_use"
+                                    ? "Opening platforms..."
+                                    : "Opening section...",
       showAlert: false,
     });
 
@@ -2881,6 +2911,33 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       return;
     }
 
+    if (menuKey === "support") {
+      startPendingSupportInput(String(callbackQuery.from.id));
+      clearPendingGiftRecipientInput(String(callbackQuery.from.id));
+      clearPendingPromoInput(String(callbackQuery.from.id));
+
+      const supportPromptResult = await sendTelegramTextMessage({
+        chatId: callbackChatId,
+        text: "Вы можете поддержать нас с помощью телеграм старс! Так мы сможем бороться с цензурой более эффективно, введите сумму в Telegram Stars которую хотели бы пожертвовать:",
+      });
+
+      if (!supportPromptResult.ok) {
+        console.error(
+          "Failed to send support donation prompt message:",
+          supportPromptResult.statusCode,
+          supportPromptResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        callbackHandled: true,
+        sent: supportPromptResult.ok,
+      });
+      return;
+    }
+
     if (settingsAction !== null) {
       const protocolTextByAction: Record<typeof settingsAction.kind, string> = {
         whitelist_unblock:
@@ -3483,6 +3540,8 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             if (paymentIsValid && expectedGiftPrice !== null) {
               validatedUsdAmount = expectedGiftPrice.usdt;
             }
+          } else if (paymentPayload.action === "support") {
+            paymentIsValid = message.successful_payment.total_amount === paymentPayload.amount;
           } else {
             const expectedPurchaseAmount = await resolveSubscriptionPurchaseAmount(
               paymentPayload.tgId,
@@ -3525,6 +3584,32 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     try {
+      if (paymentPayload.action === "support") {
+        const supportPaymentSuccessResult = await sendTelegramTextMessage({
+          chatId: message.chat.id,
+          text:
+            "⭐ Спасибо за поддержку!\n" +
+            "Получено: " +
+            String(message.successful_payment.total_amount) +
+            " Telegram Stars.",
+        });
+
+        if (!supportPaymentSuccessResult.ok) {
+          console.error(
+            "Failed to send support payment confirmation:",
+            supportPaymentSuccessResult.statusCode,
+            supportPaymentSuccessResult.error,
+          );
+        }
+
+        res.status(200).json({
+          ok: true,
+          processed: true,
+          paymentApplied: true,
+        });
+        return;
+      }
+
       if (paymentPayload.action === "gift") {
         const referDate = new Date().toISOString().slice(0, 10);
         const giftedRecipient = await addTelegramGift({
@@ -3826,6 +3911,108 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       });
       return;
     }
+  }
+
+  if (
+    message.from !== undefined &&
+    message.text !== undefined &&
+    hasPendingSupportInput(String(message.from.id)) &&
+    !message.text.trim().startsWith("/")
+  ) {
+    const rawAmountInput = message.text.trim();
+
+    if (!/^\d+$/u.test(rawAmountInput)) {
+      const invalidAmountResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Неверный формат. Допустимы только целые числа.",
+      });
+
+      if (!invalidAmountResult.ok) {
+        console.error(
+          "Failed to send invalid support amount message:",
+          invalidAmountResult.statusCode,
+          invalidAmountResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingSupport: true,
+        sent: invalidAmountResult.ok,
+      });
+      return;
+    }
+
+    const amount = Number.parseInt(rawAmountInput, 10);
+
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      const invalidPositiveResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Неверная сумма. Введите целое число больше 0.",
+      });
+
+      if (!invalidPositiveResult.ok) {
+        console.error(
+          "Failed to send invalid positive support amount message:",
+          invalidPositiveResult.statusCode,
+          invalidPositiveResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingSupport: true,
+        sent: invalidPositiveResult.ok,
+      });
+      return;
+    }
+
+    const supportInvoiceResult = await sendTelegramStarsInvoice({
+      chatId: message.chat.id,
+      title: "Поддержка проекта",
+      description: "Пожертвование в Telegram Stars на развитие сервиса.",
+      payload: buildSupportInvoicePayload(message.from.id, amount),
+      amount,
+    });
+
+    if (!supportInvoiceResult.ok) {
+      console.error(
+        "Failed to send support stars invoice:",
+        supportInvoiceResult.statusCode,
+        supportInvoiceResult.error,
+      );
+      const failedResult = await sendTelegramTextMessage({
+        chatId: message.chat.id,
+        text: "Не удалось создать платеж, попробуйте позже.",
+      });
+
+      if (!failedResult.ok) {
+        console.error(
+          "Failed to send support invoice failure message:",
+          failedResult.statusCode,
+          failedResult.error,
+        );
+      }
+
+      res.status(200).json({
+        ok: true,
+        processed: true,
+        pendingSupport: true,
+        sent: failedResult.ok,
+      });
+      return;
+    }
+
+    clearPendingSupportInput(String(message.from.id));
+    res.status(200).json({
+      ok: true,
+      processed: true,
+      pendingSupport: false,
+      invoiceSent: true,
+    });
+    return;
   }
 
   if (
@@ -4137,6 +4324,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     if (message.from !== undefined) {
       clearPendingGiftRecipientInput(String(message.from.id));
       clearPendingPromoInput(String(message.from.id));
+      clearPendingSupportInput(String(message.from.id));
       clearPendingAdminUserInput(String(message.from.id));
     }
 
