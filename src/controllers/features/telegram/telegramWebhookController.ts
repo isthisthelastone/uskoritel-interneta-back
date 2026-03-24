@@ -146,6 +146,8 @@ const clearQueueSweepLimit = 5000;
 const clearQueueOverloadedErrorCode = "CLEAR_QUEUE_OVERLOADED";
 const adminUsersPageSize = 10;
 const supportTelegramHandle = process.env.SUPPORT_TG_USERNAME?.trim() || "@starlinkacc";
+const trialUnblockAccessHours = 6;
+const unblockCountryPattern = /unblock|whitelist|анблок|вайтлист/iu;
 
 interface ClearQueueTask {
   chatId: number;
@@ -268,6 +270,24 @@ function getPendingAdminUserInputAction(tgId: string): PendingAdminUserInputActi
 
 function getBannedUserMessage(): string {
   return "Вы забанены, обратитесь в поддержку: " + supportTelegramHandle;
+}
+
+function isUnblockCountryName(country: string): boolean {
+  return unblockCountryPattern.test(country);
+}
+
+function isTrialUnblockWindowExpired(input: { createdAt: string; hasPurchased: boolean }): boolean {
+  if (input.hasPurchased) {
+    return false;
+  }
+
+  const createdAtMs = Date.parse(input.createdAt);
+
+  if (!Number.isFinite(createdAtMs)) {
+    return true;
+  }
+
+  return Date.now() - createdAtMs > trialUnblockAccessHours * 60 * 60 * 1000;
 }
 
 function formatSubscriptionStatusLabel(status: "live" | "ending" | null): string {
@@ -488,6 +508,15 @@ function buildCountriesProtocolSelectionRows(
   ];
 }
 
+function buildUnblockTrialConfirmRows(
+  internalUuid: string,
+): Array<Array<{ text: string; callbackData: string }>> {
+  return [
+    [{ text: "Я уверен", callbackData: "c:uc:" + internalUuid }],
+    [{ text: "Назад", callbackData: "menu:countries" }],
+  ];
+}
+
 async function sendHowToPlatformsMenu(chatId: number) {
   return sendTelegramInlineMenuMessage({
     chatId,
@@ -502,6 +531,33 @@ async function sendSettingsProtocolsMenu(chatId: number) {
     text: "Наши протоколы:",
     inlineKeyboardRows: buildSettingsProtocolsInlineRows(),
   });
+}
+
+async function sendCountryVpsListMenu(params: { chatId: number; country: string }) {
+  const vpsList = await listVpsByCountry(params.country);
+
+  return vpsList.length === 0
+    ? await sendTelegramTextMessage({
+        chatId: params.chatId,
+        text: "Для страны " + params.country + " серверы пока не добавлены.",
+      })
+    : await sendTelegramInlineMenuMessage({
+        chatId: params.chatId,
+        text: "Серверы в " + params.country + ":",
+        inlineKeyboardRows: vpsList.map((vpsItem) => [
+          {
+            text: buildVpsButtonText({
+              nickname: vpsItem.nickname,
+              internalUuid: vpsItem.internalUuid,
+              countryEmoji: vpsItem.countryEmoji,
+              isUnblock: vpsItem.isUnblock,
+              currentSpeed: vpsItem.currentSpeed,
+              numberOfConnections: vpsItem.numberOfConnections,
+            }),
+            callbackData: "c:v:" + vpsItem.internalUuid,
+          },
+        ]),
+      });
 }
 
 async function sendUnblockVpsConfigMessage(input: {
@@ -836,13 +892,15 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
                         ? "Loading VPS list..."
                         : countriesAction.kind === "country_ref"
                           ? "Loading VPS list..."
-                          : countriesAction.kind === "vps"
-                            ? "Processing server..."
-                            : countriesAction.kind === "vps_protocol"
-                              ? "Generating config..."
-                              : countriesAction.kind === "help_diff"
-                                ? "Opening protocol details..."
-                                : "Opening guide..."
+                          : countriesAction.kind === "unblock_confirm"
+                            ? "Loading VPS list..."
+                            : countriesAction.kind === "vps"
+                              ? "Processing server..."
+                              : countriesAction.kind === "vps_protocol"
+                                ? "Generating config..."
+                                : countriesAction.kind === "help_diff"
+                                  ? "Opening protocol details..."
+                                  : "Opening guide..."
                       : howToAction !== null
                         ? "Opening guide..."
                         : menuKey === "support"
@@ -3130,31 +3188,70 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             return;
           }
 
-          const vpsList = await listVpsByCountry(countryToList);
+          const canAskUnblockConfirm =
+            countriesAction.kind === "country_ref" &&
+            !telegramUser.has_purchased &&
+            isUnblockCountryName(countryToList);
 
-          const vpsListResult =
-            vpsList.length === 0
-              ? await sendTelegramTextMessage({
-                  chatId: callbackChatId,
-                  text: "Для страны " + countryToList + " серверы пока не добавлены.",
-                })
-              : await sendTelegramInlineMenuMessage({
-                  chatId: callbackChatId,
-                  text: "Серверы в " + countryToList + ":",
-                  inlineKeyboardRows: vpsList.map((vpsItem) => [
-                    {
-                      text: buildVpsButtonText({
-                        nickname: vpsItem.nickname,
-                        internalUuid: vpsItem.internalUuid,
-                        countryEmoji: vpsItem.countryEmoji,
-                        isUnblock: vpsItem.isUnblock,
-                        currentSpeed: vpsItem.currentSpeed,
-                        numberOfConnections: vpsItem.numberOfConnections,
-                      }),
-                      callbackData: "c:v:" + vpsItem.internalUuid,
-                    },
-                  ]),
-                });
+          if (canAskUnblockConfirm) {
+            if (
+              isTrialUnblockWindowExpired({
+                createdAt: telegramUser.created_at,
+                hasPurchased: telegramUser.has_purchased,
+              })
+            ) {
+              const blockedResult = await sendTelegramTextMessage({
+                chatId: callbackChatId,
+                text: "чтобы защитить наши сервера и пользователей мы даем доступ к анблоку пробным пользователям только первые 6 часов.",
+              });
+
+              if (!blockedResult.ok) {
+                console.error(
+                  "Failed to send trial unblock timeout message:",
+                  blockedResult.statusCode,
+                  blockedResult.error,
+                );
+              }
+
+              res.status(200).json({
+                ok: true,
+                processed: true,
+                callbackHandled: true,
+                sent: blockedResult.ok,
+              });
+              return;
+            }
+
+            const confirmResult = await sendTelegramInlineMenuMessage({
+              chatId: callbackChatId,
+              text:
+                "Вы уверены, что вам нужны WHITELIST UNBLOCK серверы?\n" +
+                "Эту функцию стоит использовать, если обычные VPN-серверы не работают.\n" +
+                "Выбирайте осознанно: она помогает людям с ограничениями оставаться онлайн.",
+              inlineKeyboardRows: buildUnblockTrialConfirmRows(countriesAction.internalUuid),
+            });
+
+            if (!confirmResult.ok) {
+              console.error(
+                "Failed to send unblock confirmation prompt:",
+                confirmResult.statusCode,
+                confirmResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: confirmResult.ok,
+            });
+            return;
+          }
+
+          const vpsListResult = await sendCountryVpsListMenu({
+            chatId: callbackChatId,
+            country: countryToList,
+          });
 
           if (!vpsListResult.ok) {
             console.error(
@@ -3173,6 +3270,95 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           return;
         } catch (error) {
           console.error("Failed to fetch VPS by country:", error);
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: false,
+          });
+          return;
+        }
+      }
+
+      if (countriesAction.kind === "unblock_confirm") {
+        try {
+          const countryToList = await getVpsCountryByInternalUuid(countriesAction.internalUuid);
+
+          if (countryToList === null) {
+            const notFoundResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "Страна для выбранного сервера не найдена.",
+            });
+
+            if (!notFoundResult.ok) {
+              console.error(
+                "Failed to send missing VPS country message after unblock confirm:",
+                notFoundResult.statusCode,
+                notFoundResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: notFoundResult.ok,
+            });
+            return;
+          }
+
+          if (
+            !telegramUser.has_purchased &&
+            isUnblockCountryName(countryToList) &&
+            isTrialUnblockWindowExpired({
+              createdAt: telegramUser.created_at,
+              hasPurchased: telegramUser.has_purchased,
+            })
+          ) {
+            const blockedResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "чтобы защитить наши сервера и пользователей мы даем доступ к анблоку пробным пользователям только первые 6 часов.",
+            });
+
+            if (!blockedResult.ok) {
+              console.error(
+                "Failed to send trial unblock timeout message after confirm:",
+                blockedResult.statusCode,
+                blockedResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: blockedResult.ok,
+            });
+            return;
+          }
+
+          const vpsListResult = await sendCountryVpsListMenu({
+            chatId: callbackChatId,
+            country: countryToList,
+          });
+
+          if (!vpsListResult.ok) {
+            console.error(
+              "Failed to send VPS list for unblock confirmation:",
+              vpsListResult.statusCode,
+              vpsListResult.error,
+            );
+          }
+
+          res.status(200).json({
+            ok: true,
+            processed: true,
+            callbackHandled: true,
+            sent: vpsListResult.ok,
+          });
+          return;
+        } catch (error) {
+          console.error("Failed to process unblock confirmation action:", error);
           res.status(200).json({
             ok: true,
             processed: true,
@@ -3230,6 +3416,35 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
               processed: true,
               callbackHandled: true,
               sent: protocolMenuResult.ok,
+            });
+            return;
+          }
+
+          if (
+            !telegramUser.has_purchased &&
+            isTrialUnblockWindowExpired({
+              createdAt: telegramUser.created_at,
+              hasPurchased: telegramUser.has_purchased,
+            })
+          ) {
+            const blockedResult = await sendTelegramTextMessage({
+              chatId: callbackChatId,
+              text: "чтобы защитить наши сервера и пользователей мы даем доступ к анблоку пробным пользователям только первые 6 часов.",
+            });
+
+            if (!blockedResult.ok) {
+              console.error(
+                "Failed to send trial unblock timeout message for unblock VPS route:",
+                blockedResult.statusCode,
+                blockedResult.error,
+              );
+            }
+
+            res.status(200).json({
+              ok: true,
+              processed: true,
+              callbackHandled: true,
+              sent: blockedResult.ok,
             });
             return;
           }
@@ -4469,8 +4684,8 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     chatId: message.chat.id,
     text: isStartCommand
       ? userSyncResult.created
-        ? "Поздравляем, вы зарегистрированы! Как новому пользователю, вам начислено 3 дня бесплатной подписки."
-        : "Добро пожаловать в Starlink."
+        ? "Поздравляем, вы зарегистрированы! Как новому пользователю, вам начислен 1 день бесплатной подписки."
+        : "Добро пожаловать в ZOZA."
       : "Главное меню:",
     inlineKeyboardRows: menuPayload.inlineKeyboardRows,
   });

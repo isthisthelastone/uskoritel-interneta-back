@@ -83,6 +83,7 @@ export type GiftsAction =
 export type CountriesAction =
   | { kind: "country"; country: string }
   | { kind: "country_ref"; internalUuid: string }
+  | { kind: "unblock_confirm"; internalUuid: string }
   | { kind: "vps"; internalUuid: string }
   | {
       kind: "vps_protocol";
@@ -564,6 +565,20 @@ export function getCountriesActionFromCallbackData(
 
     return {
       kind: "vps",
+      internalUuid: parsedUuid,
+    };
+  }
+
+  if (data.startsWith("c:uc:")) {
+    const internalUuidRaw = data.slice("c:uc:".length);
+    const parsedUuid = parseCallbackUuid(internalUuidRaw);
+
+    if (parsedUuid === null) {
+      return null;
+    }
+
+    return {
+      kind: "unblock_confirm",
       internalUuid: parsedUuid,
     };
   }

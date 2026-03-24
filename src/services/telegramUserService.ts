@@ -247,7 +247,7 @@ export async function ensureTelegramUser(
   const supabase = getSupabaseAdminClient();
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
-  const trialUntillDate = addDays(today, 3);
+  const trialUntillDate = addDays(today, 1);
   const trialUntill = formatDateOnly(trialUntillDate);
   const { data, error } = await supabase
     .from("users")

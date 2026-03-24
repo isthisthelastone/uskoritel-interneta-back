@@ -6,6 +6,7 @@ import { removeVpsXrayUserFromAllProtocols } from "./vpsXrayService";
 
 const DEFAULT_USER_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_USER_IP_LIMIT = 5;
+const DEFAULT_TRIAL_UNBLOCK_ACCESS_HOURS = 6;
 const DEFAULT_XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log";
 const DEFAULT_XRAY_ACCESS_LOG_TAIL_LINES = 5_000;
 const DEFAULT_USER_IP_CURRENT_WINDOW_MINUTES = 20;
@@ -16,10 +17,12 @@ const IPV4_PATTERN = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\
 
 const userSyncUserRowSchema = z.object({
   internal_uuid: z.uuid(),
+  created_at: z.string(),
   tg_id: z.string().min(1),
   subscription_active: z.boolean(),
   subscription_status: z.enum(["live", "ending"]).nullable(),
   subscription_untill: z.string().nullable(),
+  has_purchased: z.boolean(),
   number_of_connections: z.number().int().nonnegative(),
   connections_by_server: z.record(z.string(), z.number().nonnegative()).optional().default({}),
 });
@@ -41,10 +44,12 @@ const userSyncVpsRowSchema = z.object({
 
 interface UserSyncUserRow {
   internalUuid: string;
+  createdAt: string;
   tgId: string;
   subscriptionActive: boolean;
   subscriptionStatus: "live" | "ending" | null;
   subscriptionUntill: string | null;
+  hasPurchased: boolean;
   numberOfConnections: number;
   connectionsByServer: Record<string, number>;
 }
@@ -66,6 +71,8 @@ interface UserSyncResult {
   expiredUsers: number;
   cleanedUsers: number;
   cleanedServers: number;
+  trialUnblockRestrictedUsers: number;
+  trialUnblockCleanedServers: number;
   overLimitUsers: number;
   droppedUsers: number;
   droppedIps: number;
@@ -865,10 +872,12 @@ function parseUserRow(rawRow: unknown): UserSyncUserRow {
   const parsed = userSyncUserRowSchema.parse(rawRow);
   return {
     internalUuid: parsed.internal_uuid,
+    createdAt: parsed.created_at,
     tgId: parsed.tg_id,
     subscriptionActive: parsed.subscription_active,
     subscriptionStatus: parsed.subscription_status,
     subscriptionUntill: parsed.subscription_untill,
+    hasPurchased: parsed.has_purchased,
     numberOfConnections: parsed.number_of_connections,
     connectionsByServer: parsed.connections_by_server,
   };
@@ -922,6 +931,22 @@ function getCurrentWindowMinutes(): number {
   return parsed;
 }
 
+function getTrialUnblockAccessHours(): number {
+  const rawHours = process.env.USER_SYNC_TRIAL_UNBLOCK_ACCESS_HOURS?.trim();
+
+  if (rawHours === undefined || rawHours.length === 0) {
+    return DEFAULT_TRIAL_UNBLOCK_ACCESS_HOURS;
+  }
+
+  const parsed = Number.parseInt(rawHours, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 168) {
+    throw new Error("USER_SYNC_TRIAL_UNBLOCK_ACCESS_HOURS must be between 1 and 168.");
+  }
+
+  return parsed;
+}
+
 function isUserSyncEnabled(): boolean {
   const raw = process.env.USER_SYNC_ENABLED?.trim().toLowerCase();
 
@@ -948,6 +973,34 @@ function isSubscriptionExpired(user: UserSyncUserRow, todayUtcStart: Date): bool
   }
 
   return parsedUntil.getTime() < todayUtcStart.getTime();
+}
+
+function isTrialUnblockWindowExpired(
+  user: UserSyncUserRow,
+  nowMs: number,
+  trialUnblockAccessHours: number,
+): boolean {
+  if (user.hasPurchased) {
+    return false;
+  }
+
+  if (!user.subscriptionActive || user.subscriptionStatus !== "ending") {
+    return false;
+  }
+
+  const createdAtMs = Date.parse(user.createdAt);
+
+  if (!Number.isFinite(createdAtMs)) {
+    return false;
+  }
+
+  const elapsedMs = nowMs - createdAtMs;
+
+  if (elapsedMs < 0) {
+    return false;
+  }
+
+  return elapsedMs > trialUnblockAccessHours * 60 * 60 * 1000;
 }
 
 function resolveDesiredSubscriptionState(
@@ -1021,16 +1074,18 @@ async function dropUserConnectionsByKnownIpsOnServer(
 async function runUserSync(): Promise<UserSyncResult> {
   const supabase = getSupabaseAdminClient();
   const userIpLimit = getUserIpLimit();
+  const trialUnblockAccessHours = getTrialUnblockAccessHours();
   const verbose = isVerboseUserSyncEnabled();
   const currentWindowMinutes = getCurrentWindowMinutes();
   const todayUtcStart = new Date();
   todayUtcStart.setUTCHours(0, 0, 0, 0);
+  const nowMs = Date.now();
   let failedActions = 0;
 
   const usersResult = await supabase
     .from("users")
     .select(
-      "internal_uuid, tg_id, subscription_active, subscription_status, subscription_untill, number_of_connections, connections_by_server",
+      "internal_uuid, created_at, tg_id, subscription_active, subscription_status, subscription_untill, has_purchased, number_of_connections, connections_by_server",
     );
 
   if (usersResult.error !== null) {
@@ -1080,6 +1135,11 @@ async function runUserSync(): Promise<UserSyncResult> {
   const usersByInternalUuid = new Map(users.map((user) => [user.internalUuid, user]));
   const expiredUsers = users.filter((user) => isSubscriptionExpired(user, todayUtcStart));
   const expiredUserIds = new Set(expiredUsers.map((user) => user.internalUuid));
+  const trialUnblockRestrictedUsers = users.filter(
+    (user) =>
+      !expiredUserIds.has(user.internalUuid) &&
+      isTrialUnblockWindowExpired(user, nowMs, trialUnblockAccessHours),
+  );
 
   const vpsResult = await supabase
     .from("vps")
@@ -1278,6 +1338,7 @@ async function runUserSync(): Promise<UserSyncResult> {
 
   let cleanedUsers = 0;
   let cleanedServers = 0;
+  let trialUnblockCleanedServers = 0;
   let droppedUsers = 0;
   let droppedIps = 0;
 
@@ -1377,6 +1438,81 @@ async function runUserSync(): Promise<UserSyncResult> {
 
     if (userCleaned) {
       cleanedUsers += 1;
+    }
+  }
+
+  for (const user of trialUnblockRestrictedUsers) {
+    for (const vpsState of vpsStates) {
+      if (vpsState.row.isUnblock !== true) {
+        continue;
+      }
+
+      if (!Object.hasOwn(vpsState.usersKvMap, user.internalUuid)) {
+        continue;
+      }
+
+      const canRunSsh = vpsState.sshConfig !== null;
+      let canRemoveFromDatabase = !canRunSsh;
+      const trojanPasswords = extractTrojanPasswordsFromUsersKvEntry(
+        vpsState.usersKvMap[user.internalUuid],
+      );
+
+      if (vpsState.sshConfig !== null) {
+        try {
+          await removeVpsXrayUserFromAllProtocols({
+            sshConfig: vpsState.sshConfig,
+            userInternalUuid: user.internalUuid,
+            trojanPasswords,
+          });
+
+          const ports = extractVpsPorts(vpsState.configList);
+          const knownIps = vpsState.liveUserIps.get(user.internalUuid) ?? new Set<string>();
+          const droppedForUser =
+            knownIps.size > 0
+              ? await dropUserConnectionsByKnownIpsOnServer(vpsState.sshConfig, knownIps, ports)
+              : await dropUserConnectionsOnServer(
+                  vpsState.sshConfig,
+                  user.internalUuid,
+                  ports,
+                  vpsState.resolveUserInternalUuid,
+                );
+          droppedIps += droppedForUser;
+          canRemoveFromDatabase = true;
+
+          if (verbose) {
+            console.log(
+              "[user-sync][debug] cleaned trial-unblock user on unblock server:",
+              "user=" + user.internalUuid,
+              "server=" + vpsState.row.internal_uuid,
+              "droppedIps=" + String(droppedForUser),
+            );
+          }
+        } catch (error) {
+          failedActions += 1;
+          console.error(
+            "[user-sync] failed to clean trial-unblock user on server:",
+            "user=" + user.internalUuid,
+            "server=" + vpsState.row.internal_uuid,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+
+      if (!canRemoveFromDatabase) {
+        continue;
+      }
+
+      const removed = removeUserFromUsersKvMap(vpsState.usersKvMap, user.internalUuid);
+
+      if (!removed.removed) {
+        continue;
+      }
+
+      const nextConfigList = removeUrlsFromConfigList(vpsState.configList, removed.removedUrls);
+      vpsState.usersKvMap = removed.nextUsersKvMap;
+      vpsState.configList = nextConfigList;
+      vpsState.changed = true;
+      trialUnblockCleanedServers += 1;
     }
   }
 
@@ -1487,6 +1623,8 @@ async function runUserSync(): Promise<UserSyncResult> {
       "users=" + String(users.length),
       "subscriptionStatusUpdatedUsers=" + String(subscriptionStatusUpdatedUsers),
       "expired=" + String(expiredUsers.length),
+      "trialUnblockRestrictedUsers=" + String(trialUnblockRestrictedUsers.length),
+      "trialUnblockCleanedServers=" + String(trialUnblockCleanedServers),
       "overLimit=" + String(overLimitUsers.length),
       "vps=" + String(vpsStates.length),
       "expiredSetSize=" + String(expiredUserIds.size),
@@ -1505,6 +1643,8 @@ async function runUserSync(): Promise<UserSyncResult> {
     expiredUsers: expiredUsers.length,
     cleanedUsers,
     cleanedServers,
+    trialUnblockRestrictedUsers: trialUnblockRestrictedUsers.length,
+    trialUnblockCleanedServers,
     overLimitUsers: overLimitUsers.length,
     droppedUsers,
     droppedIps,
@@ -1525,6 +1665,8 @@ async function runUserSyncSafely(trigger: string): Promise<void> {
       "expiredUsers=" + String(result.expiredUsers),
       "cleanedUsers=" + String(result.cleanedUsers),
       "cleanedServers=" + String(result.cleanedServers),
+      "trialUnblockRestrictedUsers=" + String(result.trialUnblockRestrictedUsers),
+      "trialUnblockCleanedServers=" + String(result.trialUnblockCleanedServers),
       "overLimitUsers=" + String(result.overLimitUsers),
       "droppedUsers=" + String(result.droppedUsers),
       "droppedIps=" + String(result.droppedIps),
@@ -1554,12 +1696,14 @@ export function startUserSyncJob(): void {
 
   const intervalMs = getUserSyncIntervalMs();
   const userIpLimit = getUserIpLimit();
+  const trialUnblockAccessHours = getTrialUnblockAccessHours();
   const verbose = isVerboseUserSyncEnabled();
 
   console.log(
     "[user-sync] starting;",
     "intervalMs=" + String(intervalMs),
     "ipLimit=" + String(userIpLimit),
+    "trialUnblockAccessHours=" + String(trialUnblockAccessHours),
     "verbose=" + String(verbose),
   );
 
