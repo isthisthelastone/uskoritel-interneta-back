@@ -39,6 +39,7 @@ import {
   disableAdminVpsServer,
   disconnectTelegramUserConnectionsByNickname,
   enableAdminVpsServer,
+  grantTelegramUserSubscriptionByNickname,
   getAdminUserDetailsByTgId,
   getAdminVpsServerByInternalUuid,
   listAdminUsersPage,
@@ -131,7 +132,7 @@ const telegramUpdateSchema = z.object({
 const pendingGiftRecipientInputByTgId = new Map<string, number>();
 const pendingPromoInputByTgId = new Map<string, number>();
 const pendingSupportInputByTgId = new Map<string, number>();
-type PendingAdminUserInputAction = "ban" | "unban" | "disconnect_all";
+type PendingAdminUserInputAction = "ban" | "unban" | "disconnect_all" | "give_sub";
 interface PendingAdminUserInputState {
   action: PendingAdminUserInputAction;
   createdAt: number;
@@ -145,7 +146,7 @@ const clearQueueMaxPending = 5;
 const clearQueueSweepLimit = 5000;
 const clearQueueOverloadedErrorCode = "CLEAR_QUEUE_OVERLOADED";
 const adminUsersPageSize = 10;
-const supportTelegramHandle = process.env.SUPPORT_TG_USERNAME?.trim() || "@starlinkacc";
+const supportTelegramHandle = process.env.SUPPORT_TG_USERNAME?.trim() || "@zozasupp";
 const trialUnblockAccessHours = 6;
 const unblockCountryPattern = /unblock|whitelist|анблок|вайтлист/iu;
 
@@ -312,6 +313,7 @@ function buildAdminPanelRootKeyboard() {
 function buildAdminUsersMenuKeyboard() {
   return [
     [{ text: "📄 Список пользователей", callbackData: "admin:users:list:1" }],
+    [{ text: "🎁 Дать сабку", callbackData: "admin:users:prompt:give_sub" }],
     [{ text: "⛔ Забанить пользователя", callbackData: "admin:users:prompt:ban" }],
     [{ text: "✅ Разбанить пользователя", callbackData: "admin:users:prompt:unban" }],
     [
@@ -1060,6 +1062,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
             unban: "Введите логин пользователя в Telegram вместе с @ для разбана:",
             disconnect_all:
               "Введите логин пользователя в Telegram вместе с @, чтобы отключить все его соединения:",
+            give_sub: "Введите имя пользователя без '@':",
           };
 
           startPendingAdminUserInput(String(callbackQuery.from.id), adminAction.action);
@@ -2159,7 +2162,7 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           ].join("\n"),
           inlineKeyboardRows: [
             [{ text: "🔄 Продлить подписку", callbackData: "referals:prolong" }],
-            [{ text: "💬 Связаться с поддержкой для вывода", url: "https://t.me/starlinkacc" }],
+            [{ text: "💬 Связаться с поддержкой для вывода", url: "https://t.me/zozasupp" }],
           ],
         });
 
@@ -4014,11 +4017,17 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
     }
 
     const rawNicknameInput = message.text.trim();
+    const normalizedNicknameInput = rawNicknameInput.replace(/^@/u, "");
+    const expectedPattern =
+      adminAction === "give_sub" ? /^[a-zA-Z0-9_]{5,32}$/u : /^@[a-zA-Z0-9_]{5,32}$/u;
 
-    if (!/^@[a-zA-Z0-9_]{5,32}$/u.test(rawNicknameInput)) {
+    if (!expectedPattern.test(rawNicknameInput)) {
       const invalidInputResult = await sendTelegramTextMessage({
         chatId: message.chat.id,
-        text: "Введите корректный логин пользователя в формате @username.",
+        text:
+          adminAction === "give_sub"
+            ? "Введите корректное имя пользователя без '@'."
+            : "Введите корректный логин пользователя в формате @username.",
       });
 
       if (!invalidInputResult.ok) {
@@ -4040,10 +4049,12 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
 
     try {
       let successText = "";
+      const nicknameForAction =
+        adminAction === "give_sub" ? normalizedNicknameInput : rawNicknameInput;
 
       if (adminAction === "ban") {
         const actionResult = await banTelegramUserByNickname({
-          nickname: rawNicknameInput,
+          nickname: nicknameForAction,
         });
         successText =
           "✅ Пользователь забанен и отключен от серверов.\nТГ ID: " +
@@ -4054,12 +4065,21 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
           String(actionResult.disconnectedIps);
       } else if (adminAction === "unban") {
         const actionResult = await unbanTelegramUserByNickname({
-          nickname: rawNicknameInput,
+          nickname: nicknameForAction,
         });
         successText = "✅ Пользователь разбанен.\nТГ ID: " + actionResult.userTgId;
+      } else if (adminAction === "give_sub") {
+        const actionResult = await grantTelegramUserSubscriptionByNickname({
+          nickname: nicknameForAction,
+        });
+        successText =
+          "✅ Подписка успешно выдана.\nТГ ID: " +
+          actionResult.userTgId +
+          "\nПодписка до: " +
+          actionResult.subscriptionUntill;
       } else {
         const actionResult = await disconnectTelegramUserConnectionsByNickname({
-          nickname: rawNicknameInput,
+          nickname: nicknameForAction,
         });
         successText =
           "✅ Соединения пользователя отключены.\nТГ ID: " +
@@ -4100,7 +4120,9 @@ export async function handleTelegramMenuWebhook(req: Request, res: Response): Pr
       const failedResult = await sendTelegramTextMessage({
         chatId: message.chat.id,
         text: userNotFound
-          ? "Пользователь не найден."
+          ? adminAction === "give_sub"
+            ? "Ошибка пользователь не найден, сначала он должен начать пользоваться ботом"
+            : "Пользователь не найден."
           : cannotBanAdmin
             ? "Нельзя забанить администратора."
             : "Не удалось выполнить действие. Проверьте логи и повторите попытку.",

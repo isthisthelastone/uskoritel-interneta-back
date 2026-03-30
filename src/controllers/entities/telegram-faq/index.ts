@@ -4,10 +4,10 @@ export function getFaqMenuInlineKeyboardRows(): TelegramInlineButton[][] {
   return [
     [
       { text: "📧 Связаться по почте", callbackData: "faq:email" },
-      { text: "💬 Вступайте в чат", url: "https://t.me/starlinkpage" },
+      { text: "💬 Вступайте в чат", url: "https://t.me/zozavpn" },
     ],
     [
-      { text: "🛟 Написать в поддержку", url: "https://t.me/starlinkacc" },
+      { text: "🛟 Написать в поддержку", url: "https://t.me/zozasupp" },
       { text: "📜 Правила сервиса", callbackData: "faq:rules" },
     ],
     [

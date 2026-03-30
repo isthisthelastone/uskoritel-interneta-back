@@ -25,7 +25,7 @@ const settingsActionSchema = z.enum([
   "shadowsocks_wifi",
 ]);
 const countriesProtocolSchema = z.enum(["trojan", "trojan_obfuscated", "shadowsocks", "vless_ws"]);
-const adminUsersActionSchema = z.enum(["ban", "unban", "disconnect_all"]);
+const adminUsersActionSchema = z.enum(["ban", "unban", "disconnect_all", "give_sub"]);
 const adminServersActionSchema = z.enum(["enable", "reload", "disable"]);
 export const howToPlatformSchema = z.enum(["ios", "android", "macos", "windows", "android_tv"]);
 export const subscriptionPlanMonthsSchema = z.number().int().positive();

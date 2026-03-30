@@ -150,6 +150,44 @@ function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
 }
 
+function parseDateFromDb(rawValue: string | null): Date | null {
+  if (rawValue === null) {
+    return null;
+  }
+
+  const trimmed = rawValue.trim();
+
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(trimmed)) {
+    const [yearRaw, monthRaw, dayRaw] = trimmed.split("-");
+    const year = Number.parseInt(yearRaw, 10);
+    const month = Number.parseInt(monthRaw, 10);
+    const day = Number.parseInt(dayRaw, 10);
+    const parsedDate = new Date(Date.UTC(year, month - 1, day));
+
+    return Number.isNaN(parsedDate.getTime()) ? null : parsedDate;
+  }
+
+  const parsedDate = new Date(trimmed);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return null;
+  }
+
+  parsedDate.setUTCHours(0, 0, 0, 0);
+  return parsedDate;
+}
+
+function formatDateOnlyUtc(date: Date): string {
+  const year = String(date.getUTCFullYear());
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function decodeBase64OrKeepRaw(rawValue: string): string {
   const normalizedRaw = rawValue.trim();
 
@@ -860,6 +898,42 @@ export async function unbanTelegramUserByNickname(input: {
 
   return {
     userTgId: user.tg_id,
+  };
+}
+
+export async function grantTelegramUserSubscriptionByNickname(input: {
+  nickname: string;
+}): Promise<{ userTgId: string; subscriptionUntill: string }> {
+  const user = await resolveUserByNickname(input.nickname);
+
+  const baseDate =
+    parseDateFromDb(user.subscription_untill) ??
+    (() => {
+      const now = new Date();
+      now.setUTCHours(0, 0, 0, 0);
+      return now;
+    })();
+  const subscriptionUntillDate = new Date(baseDate.getTime());
+  subscriptionUntillDate.setUTCFullYear(subscriptionUntillDate.getUTCFullYear() + 1);
+  const subscriptionUntill = formatDateOnlyUtc(subscriptionUntillDate);
+
+  const supabase = getSupabaseAdminClient();
+  const { error } = await supabase
+    .from("users")
+    .update({
+      subscription_active: true,
+      subscription_status: "live",
+      subscription_untill: subscriptionUntill,
+    })
+    .eq("internal_uuid", user.internal_uuid);
+
+  if (error !== null) {
+    throw new Error("Failed to grant subscription: " + error.message);
+  }
+
+  return {
+    userTgId: user.tg_id,
+    subscriptionUntill,
   };
 }
 
